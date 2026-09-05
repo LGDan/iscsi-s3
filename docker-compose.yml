@@ -38,6 +38,7 @@ services:
         condition: service_completed_successfully
     ports:
       - "3260:3260"
+      - "3261:3261"
     volumes:
       - ./config.docker.toml:/etc/iscsi-s3/config.toml:ro
     environment:
@@ -46,7 +47,7 @@ services:
       RUST_LOG: info,iscsi_s3=debug
     restart: unless-stopped
 
-  # One-shot smoke: discover (best-effort) + login/write/read on both volumes
+  # One-shot smoke against volume 0 (port 3260) and volume 1 (port 3261)
   smoke:
     build: .
     entrypoint: ["smoke_client"]

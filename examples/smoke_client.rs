@@ -1,7 +1,14 @@
-//! Minimal login + write/read smoke test (skips discovery).
+//! Smoke client: login + write/read against per-volume portals.
+//!
+//! Volume N listens on base_port + N (see iscsi-s3 main).
+//!
+//! ```bash
+//! cargo run --example smoke_client -- 127.0.0.1:3260
+//! ```
 
 use iscsi_target::client::IscsiClient;
 use std::env;
+use std::net::TcpStream;
 use std::process::ExitCode;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -13,7 +20,7 @@ const INITIATOR: &str = "iqn.2026-09.local.iscsi-s3:smoke";
 fn wait_for_port(addr: &str, timeout: Duration) -> Result<(), String> {
     let start = Instant::now();
     loop {
-        match std::net::TcpStream::connect(addr) {
+        match TcpStream::connect(addr) {
             Ok(_) => return Ok(()),
             Err(e) => {
                 if start.elapsed() > timeout {
@@ -25,11 +32,22 @@ fn wait_for_port(addr: &str, timeout: Duration) -> Result<(), String> {
     }
 }
 
+fn bump_port(addr: &str, delta: u16) -> Result<String, String> {
+    let (host, port_s) = addr
+        .rsplit_once(':')
+        .ok_or_else(|| format!("bad addr {addr}"))?;
+    let port: u16 = port_s.parse().map_err(|e| format!("{e}"))?;
+    Ok(format!(
+        "{host}:{}",
+        port.checked_add(delta).ok_or("port overflow")?
+    ))
+}
+
 fn round_trip(addr: &str, target: &str) -> Result<(), String> {
     let mut client = IscsiClient::connect(addr).map_err(|e| e.to_string())?;
     client
         .login(INITIATOR, target)
-        .map_err(|e| format!("login {target}: {e}"))?;
+        .map_err(|e| format!("login {target}@{addr}: {e}"))?;
 
     let mut data = vec![0u8; 4096];
     for (i, b) in data.iter_mut().enumerate() {
@@ -47,29 +65,38 @@ fn round_trip(addr: &str, target: &str) -> Result<(), String> {
     }
 
     client.logout().map_err(|e| format!("logout {target}: {e}"))?;
-    println!("ok round-trip {target}");
+    println!("ok round-trip {target} @ {addr}");
     Ok(())
 }
 
 fn main() -> ExitCode {
-    let addr = env::args()
+    let base = env::args()
         .nth(1)
         .unwrap_or_else(|| "127.0.0.1:3260".to_string());
 
-    if let Err(e) = wait_for_port(&addr, Duration::from_secs(60)) {
-        eprintln!("error: {e}");
-        return ExitCode::FAILURE;
-    }
-
-    // Discovery is best-effort; multi-target discovery in iscsi-target 1.0 has
-    // a login-phase bug, so we always continue with known IQNs.
-    println!("using known IQNs {DISK0}, {DISK1}");
-
-    for target in [DISK0, DISK1] {
-        if let Err(e) = round_trip(&addr, target) {
+    let addr0 = base.clone();
+    let addr1 = match bump_port(&base, 1) {
+        Ok(a) => a,
+        Err(e) => {
             eprintln!("error: {e}");
             return ExitCode::FAILURE;
         }
+    };
+
+    for addr in [&addr0, &addr1] {
+        if let Err(e) = wait_for_port(addr, Duration::from_secs(60)) {
+            eprintln!("error: {e}");
+            return ExitCode::FAILURE;
+        }
+    }
+
+    if let Err(e) = round_trip(&addr0, DISK0) {
+        eprintln!("error: {e}");
+        return ExitCode::FAILURE;
+    }
+    if let Err(e) = round_trip(&addr1, DISK1) {
+        eprintln!("error: {e}");
+        return ExitCode::FAILURE;
     }
 
     println!("smoke client passed");

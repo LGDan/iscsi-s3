@@ -11,26 +11,19 @@ echo "==> docker compose up --build"
 docker compose down -v --remove-orphans >/dev/null 2>&1 || true
 docker compose up -d --build minio createbuckets iscsi-s3
 
-echo "==> waiting for minio healthy + iscsi-s3 running"
+echo "==> waiting for minio healthy + iscsi-s3 listening"
 for i in $(seq 1 180); do
   minio_id=$(docker compose ps -q minio 2>/dev/null || true)
-  iscsi_id=$(docker compose ps -q iscsi-s3 2>/dev/null || true)
   minio_h=starting
-  iscsi_st=starting
   if [[ -n "$minio_id" ]]; then
     minio_h=$(docker inspect --format='{{if .State.Health}}{{.State.Health.Status}}{{else}}{{.State.Status}}{{end}}' "$minio_id" 2>/dev/null || echo starting)
   fi
-  if [[ -n "$iscsi_id" ]]; then
-    iscsi_st=$(docker inspect --format='{{.State.Status}}' "$iscsi_id" 2>/dev/null || echo starting)
-  fi
-  if [[ "$minio_h" == "healthy" && "$iscsi_st" == "running" ]]; then
-    if docker compose logs iscsi-s3 2>/dev/null | grep -q "iSCSI server listening"; then
-      echo "minio=$minio_h iscsi-s3=$iscsi_st"
-      break
-    fi
+  if [[ "$minio_h" == "healthy" ]] && docker compose logs iscsi-s3 2>/dev/null | grep -q "iSCSI target listening"; then
+    echo "minio=$minio_h iscsi-s3=listening"
+    break
   fi
   if [[ "$i" -eq 180 ]]; then
-    echo "timeout (minio=$minio_h iscsi-s3=$iscsi_st)"
+    echo "timeout (minio=$minio_h)"
     docker compose ps
     docker compose logs --tail=100
     exit 1

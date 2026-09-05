@@ -330,6 +330,7 @@ impl BlockStore for S3ChunkStore {
     }
 
     fn write_at(&self, offset: u64, data: &[u8]) -> Result<(), StoreError> {
+        let started = std::time::Instant::now();
         let capacity = self.capacity.load(Ordering::SeqCst);
         check_range(capacity, offset, data.len())?;
         let chunk_size = self.chunk_size as usize;
@@ -340,15 +341,29 @@ impl BlockStore for S3ChunkStore {
             let within = (abs % self.chunk_size) as usize;
             let take = (chunk_size - within).min(data.len() - done);
             let _guard = self.stripe(chunk_idx).lock();
+            let t0 = std::time::Instant::now();
             let mut chunk = if within == 0 && take == chunk_size {
                 vec![0u8; chunk_size]
             } else {
                 self.get_chunk(chunk_idx)?
             };
+            let t1 = std::time::Instant::now();
             chunk[within..within + take].copy_from_slice(&data[done..done + take]);
             self.put_chunk(chunk_idx, &chunk)?;
+            tracing::info!(
+                chunk_idx,
+                get_ms = t1.duration_since(t0).as_millis(),
+                put_ms = t0.elapsed().as_millis(),
+                "s3 write_at chunk"
+            );
             done += take;
         }
+        tracing::info!(
+            offset,
+            len = data.len(),
+            total_ms = started.elapsed().as_millis(),
+            "s3 write_at done"
+        );
         Ok(())
     }
 

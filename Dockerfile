@@ -14,6 +14,6 @@ COPY --from=builder /app/target/release/iscsi-s3 /usr/local/bin/iscsi-s3
 COPY --from=builder /app/target/release/examples/smoke_client /usr/local/bin/smoke_client
 RUN useradd --system --create-home --uid 10001 iscsi
 USER iscsi
-EXPOSE 3260
+EXPOSE 3260 3261
 ENTRYPOINT ["iscsi-s3"]
 CMD ["--config", "/etc/iscsi-s3/config.toml", "--log", "info,iscsi_s3=info"]
