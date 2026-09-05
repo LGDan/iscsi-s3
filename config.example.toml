@@ -1,0 +1,27 @@
+bind = "0.0.0.0:3260"
+
+[s3]
+bucket = "iscsi"
+region = "us-east-1"
+endpoint = "http://127.0.0.1:9000"
+force_path_style = true
+# Optional; otherwise use AWS_* env / default credential chain:
+# access_key_id = "minioadmin"
+# secret_access_key = "minioadmin"
+
+[cache]
+max_bytes = "256MiB"
+
+[[volumes]]
+name = "disk0"
+iqn = "iqn.2026-09.local.iscsi-s3:disk0"
+prefix = "disks/disk0"
+capacity = "10GiB"
+# block_size = 512
+# chunk_size = "4MiB"
+
+[[volumes]]
+name = "disk1"
+iqn = "iqn.2026-09.local.iscsi-s3:disk1"
+prefix = "disks/disk1"
+capacity = "50GiB"

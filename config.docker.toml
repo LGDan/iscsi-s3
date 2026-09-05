@@ -1,0 +1,27 @@
+# Docker Compose / container defaults (MinIO service hostname)
+bind = "0.0.0.0:3260"
+
+[s3]
+bucket = "iscsi"
+region = "us-east-1"
+endpoint = "http://minio:9000"
+force_path_style = true
+access_key_id = "minioadmin"
+secret_access_key = "minioadmin"
+
+[cache]
+max_bytes = "64MiB"
+
+[[volumes]]
+name = "disk0"
+iqn = "iqn.2026-09.local.iscsi-s3:disk0"
+prefix = "disks/disk0"
+capacity = "64MiB"
+chunk_size = "64KiB"
+
+[[volumes]]
+name = "disk1"
+iqn = "iqn.2026-09.local.iscsi-s3:disk1"
+prefix = "disks/disk1"
+capacity = "32MiB"
+chunk_size = "64KiB"

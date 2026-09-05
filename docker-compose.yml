@@ -1,0 +1,61 @@
+services:
+  minio:
+    image: minio/minio:latest
+    command: server /data --console-address ":9001"
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    volumes:
+      - minio-data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 3s
+      timeout: 5s
+      retries: 20
+      start_period: 5s
+
+  createbuckets:
+    image: minio/mc:latest
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: >
+      /bin/sh -c "
+      set -e;
+      mc alias set local http://minio:9000 minioadmin minioadmin;
+      mc mb -p local/iscsi || true;
+      mc anonymous set none local/iscsi;
+      echo bucket-ready;
+      "
+
+  iscsi-s3:
+    build: .
+    depends_on:
+      createbuckets:
+        condition: service_completed_successfully
+    ports:
+      - "3260:3260"
+    volumes:
+      - ./config.docker.toml:/etc/iscsi-s3/config.toml:ro
+    environment:
+      AWS_ACCESS_KEY_ID: minioadmin
+      AWS_SECRET_ACCESS_KEY: minioadmin
+      RUST_LOG: info,iscsi_s3=debug
+    restart: unless-stopped
+
+  # One-shot smoke: discover (best-effort) + login/write/read on both volumes
+  smoke:
+    build: .
+    entrypoint: ["smoke_client"]
+    command: ["iscsi-s3:3260"]
+    depends_on:
+      - iscsi-s3
+    profiles:
+      - test
+    restart: "no"
+
+volumes:
+  minio-data:
