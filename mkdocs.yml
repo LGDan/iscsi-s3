@@ -1,0 +1,69 @@
+site_name: iscsi-s3
+site_description: Userspace iSCSI target backed by S3 chunk objects
+site_url: ""
+repo_url: https://github.com/dan/iscsi-http
+edit_uri: ""
+
+docs_dir: docs
+site_dir: site
+
+# GitHub browses docs/README.md; the site uses index.md as the homepage.
+exclude_docs: |
+  README.md
+
+theme:
+  name: material
+  palette:
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      primary: blue grey
+      accent: light blue
+      toggle:
+        icon: material/brightness-7
+        name: Switch to dark mode
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      primary: blue grey
+      accent: light blue
+      toggle:
+        icon: material/brightness-4
+        name: Switch to light mode
+  features:
+    - navigation.sections
+    - navigation.expand
+    - navigation.top
+    - search.highlight
+    - content.code.copy
+    - toc.follow
+
+markdown_extensions:
+  - admonition
+  - pymdownx.details
+  - pymdownx.superfences
+  - pymdownx.highlight:
+      anchor_linenums: true
+  - pymdownx.inlinehilite
+  - tables
+  - toc:
+      permalink: true
+
+plugins:
+  - search
+
+validation:
+  links:
+    absolute_links: ignore
+    unrecognized_links: ignore
+    anchors: warn
+
+nav:
+  - Home: index.md
+  - Users:
+      - Getting started: users/getting-started.md
+      - Configuration: users/configuration.md
+      - Tutorials: users/tutorials.md
+  - Developers:
+      - Getting started: developers/getting-started.md
+      - Architecture: developers/architecture.md
+      - Testing: developers/testing.md
+  - Examples: examples.md
