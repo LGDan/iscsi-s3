@@ -26,6 +26,10 @@ pub enum ConfigError {
 pub struct Config {
     #[serde(default = "default_bind")]
     pub bind: String,
+    /// Host (or host:port) advertised in SendTargets. When unset, the target
+    /// uses the socket's local address (often a container/NAT IP).
+    #[serde(default)]
+    pub advertise: Option<String>,
     #[serde(default)]
     pub s3: S3Config,
     #[serde(default)]
@@ -106,6 +110,10 @@ pub struct Cli {
     #[arg(long)]
     pub bind: Option<String>,
 
+    /// Address clients should use (host or host:port) in SendTargets.
+    #[arg(long)]
+    pub advertise: Option<String>,
+
     /// S3 bucket override
     #[arg(long)]
     pub bucket: Option<String>,
@@ -133,6 +141,8 @@ struct CliOverrides {
     #[serde(skip_serializing_if = "Option::is_none")]
     bind: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    advertise: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     s3: Option<CliS3Overrides>,
 }
 
@@ -152,6 +162,7 @@ impl Config {
     pub fn load(cli: &Cli) -> Result<Self, ConfigError> {
         let defaults = Config {
             bind: DEFAULT_BIND.to_string(),
+            advertise: None,
             s3: S3Config {
                 bucket: None,
                 region: default_region(),
@@ -175,6 +186,7 @@ impl Config {
 
         let overrides = CliOverrides {
             bind: cli.bind.clone(),
+            advertise: cli.advertise.clone(),
             s3: Some(CliS3Overrides {
                 bucket: cli.bucket.clone(),
                 endpoint: cli.endpoint.clone(),
@@ -305,6 +317,7 @@ capacity = "1GiB"
         let cli = Cli {
             config: Some(file.path().to_path_buf()),
             bind: None,
+            advertise: None,
             bucket: None,
             endpoint: None,
             region: None,

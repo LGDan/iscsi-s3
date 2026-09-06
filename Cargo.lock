@@ -1540,8 +1540,6 @@ dependencies = [
 [[package]]
 name = "iscsi-target"
 version = "1.0.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7cb6539807113901fe4ec599f9c9fc01ad155f9966fb0725c0176b01b54e0f71"
 dependencies = [
  "byteorder",
  "crc32c",

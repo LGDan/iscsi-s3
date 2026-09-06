@@ -45,7 +45,7 @@ services:
     environment:
       AWS_ACCESS_KEY_ID: minioadmin
       AWS_SECRET_ACCESS_KEY: minioadmin
-      RUST_LOG: info,iscsi_s3=debug
+      RUST_LOG: info,iscsi_s3=debug,iscsi_target=debug
     restart: unless-stopped
 
   # One-shot smoke against volume 0 (port 3260) and volume 1 (port 3261)

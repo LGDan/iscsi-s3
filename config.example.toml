@@ -1,4 +1,8 @@
 bind = "0.0.0.0:3260"
+# Host (or host:port) returned in SendTargets. Needed when clients cannot
+# reach the listen address (Docker port publish, NAT). Host-only uses each
+# volume's listen port; host:port uses the same port-offset rules as bind.
+# advertise = "127.0.0.1"
 
 [s3]
 bucket = "iscsi"

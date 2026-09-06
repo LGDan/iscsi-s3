@@ -3,6 +3,7 @@ FROM rust:1-bookworm AS builder
 WORKDIR /app
 COPY Cargo.toml Cargo.lock ./
 COPY src ./src
+COPY vendor ./vendor
 COPY examples ./examples
 RUN cargo build --release --locked --bin iscsi-s3 --example smoke_client
 
@@ -16,4 +17,4 @@ RUN useradd --system --create-home --uid 10001 iscsi
 USER iscsi
 EXPOSE 3260 3261
 ENTRYPOINT ["iscsi-s3"]
-CMD ["--config", "/etc/iscsi-s3/config.toml", "--log", "info,iscsi_s3=info"]
+CMD ["--config", "/etc/iscsi-s3/config.toml", "--log", "info,iscsi_s3=debug,iscsi_target=debug"]

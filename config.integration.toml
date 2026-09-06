@@ -1,5 +1,7 @@
 # Docker Compose / container defaults (MinIO service hostname)
 bind = "0.0.0.0:3260"
+# Address iscsiadm stores from SendTargets (not the container eth0 IP).
+advertise = "192.168.88.15"
 
 [s3]
 bucket = "iscsi"
