@@ -4,7 +4,9 @@
 //! (`store::http` / `HttpRangeStore`) — not implemented in v1.
 
 use clap::Parser;
-use iscsi_s3::admin::{spawn_admin_server, AdminSnapshot, AdminState, VolumeSummary};
+use iscsi_s3::admin::{
+    spawn_admin_server, AdminSnapshot, AdminState, AdminVolumeHandle, VolumeSummary,
+};
 use iscsi_s3::cache::ChunkCache;
 use iscsi_s3::config::{resolve_auth, Cli, Config};
 use iscsi_s3::device::S3BlockDevice;
@@ -132,6 +134,7 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
 
     let mut volume_labels: Vec<VolumeLabels> = Vec::new();
     let mut volume_summaries: Vec<VolumeSummary> = Vec::new();
+    let mut volume_stores: Vec<AdminVolumeHandle> = Vec::new();
 
     for (index, vol) in cfg.volumes.iter().enumerate() {
         let opened = open_volume(
@@ -145,6 +148,11 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         )?;
         let capacity = opened.store.capacity();
         volume_labels.push(opened.labels.clone());
+        volume_stores.push(AdminVolumeHandle {
+            name: opened.name.clone(),
+            iqn: opened.iqn.clone(),
+            store: Arc::clone(&opened.store) as Arc<dyn BlockStore>,
+        });
         let device = S3BlockDevice::new(opened.store, opened.labels, Arc::clone(&metrics));
         let auth = resolve_auth(&cfg.auth, &vol.auth)?;
         volume_summaries.push(VolumeSummary {
@@ -227,6 +235,7 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 s3_region: cfg.s3.region.clone(),
                 s3_force_path_style: cfg.s3.force_path_style,
             }),
+            volume_stores,
         });
         spawn_admin_server(PathBuf::from(&cfg.admin.socket), admin_state)?;
     } else {

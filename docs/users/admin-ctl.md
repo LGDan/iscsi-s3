@@ -38,6 +38,7 @@ Docker: install both `iscsi-s3` and `iscsi-s3-ctl` in the image. Mount/share the
 | `cache set --max-bytes …` | Set budget (`0` disables + clears) |
 | `volume list` | List configured volumes (name, IQN, capacity, prefix, compression, auth) |
 | `volume s3-stats <name\|iqn>` | List S3 objects under the volume prefix: chunk/meta counts and bytes |
+| `volume write-image <name\|iqn> --file PATH` | Stream a raw disk image into a volume that has **no chunk objects** yet |
 | `reload` | Re-read the startup `--config` file + env; apply **safe** fields only |
 
 Global flags: `--socket PATH`, `--format text|json`.
@@ -78,6 +79,26 @@ iscsi-s3-ctl volume usage iqn.2026-09.local.iscsi-s3:disk0
 
 Reports object counts (`chunks`, `meta`, `other`) and summed object sizes. Unwritten sparse regions have no chunk object. With compression enabled, `bytes.chunks` is compressed on-disk size.
 
+## Seed a raw image (`volume write-image`)
+
+Write a dd-style / `.img` file into a volume **only when it has no chunk (block) objects yet**. Existing `meta.json` is fine. Unexpected non-chunk objects under the prefix are refused.
+
+```bash
+# Prefer offline: logout initiators first so nothing races the seed.
+iscsi-s3-ctl volume write-image disk0 --file ./disk.img
+# alias:
+iscsi-s3-ctl volume seed disk0 -f ./disk.img
+```
+
+Rules:
+
+- Image size must be `> 0` and `≤` volume capacity (smaller images leave the tail sparse).
+- The client streams bytes over the admin socket (path is local to `iscsi-s3-ctl`, not the daemon).
+- All-zero chunks are **skipped** so sparse regions stay object-free (same as never written).
+- Writes go through the live volume store (cache stays coherent).
+
+Wire protocol is two-phase: JSON request with `size` → ready JSON → raw body → final JSON.
+
 ## Safe cache toggle
 
 Disabling always flushes the LRU so the next reads hit S3. That is the right step **before** starting a second multi-instance peer that must not see stale data from this process’s cache. See [chunk cache safety](../developers/cache.md).
@@ -112,6 +133,7 @@ One JSON object per connection, newline-terminated request and response:
 {"op":"cache.set","max_bytes":0}
 {"op":"volume.list"}
 {"op":"volume.s3_stats","volume":"disk0"}
+{"op":"volume.write_image","volume":"disk0","size":1073741824}
 {"op":"reload"}
 ```
 

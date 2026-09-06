@@ -1,9 +1,10 @@
 //! Control client for a running iscsi-s3 daemon (Unix admin socket).
 
 use clap::{Parser, Subcommand, ValueEnum};
-use iscsi_s3::admin::call_admin;
+use iscsi_s3::admin::{call_admin, call_admin_write_image};
 use iscsi_s3::config::{parse_byte_size, DEFAULT_ADMIN_SOCKET};
 use serde_json::json;
+use std::fs::File;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
@@ -69,6 +70,15 @@ enum VolumeCmd {
         /// Volume name or IQN
         volume: String,
     },
+    /// Write a raw disk image into an empty volume (no existing chunk objects)
+    #[command(name = "write-image", alias = "seed")]
+    WriteImage {
+        /// Volume name or IQN
+        volume: String,
+        /// Path to a raw image (dd / .img); streamed over the admin socket
+        #[arg(long, short)]
+        file: PathBuf,
+    },
 }
 
 fn socket_path(cli: &CtlCli) -> PathBuf {
@@ -84,6 +94,14 @@ fn socket_path(cli: &CtlCli) -> PathBuf {
 fn main() -> ExitCode {
     let cli = CtlCli::parse();
     let sock = socket_path(&cli);
+
+    if let Commands::Volume {
+        action: VolumeCmd::WriteImage { volume, file },
+    } = &cli.command
+    {
+        return run_write_image(&cli, &sock, volume, file);
+    }
+
     let req = match build_request(&cli.command) {
         Ok(r) => r,
         Err(e) => {
@@ -92,33 +110,63 @@ fn main() -> ExitCode {
         }
     };
     match call_admin(&sock, &req) {
-        Ok(resp) => {
-            let ok = resp.get("ok").and_then(|v| v.as_bool()).unwrap_or(false);
-            match cli.format {
-                OutputFormat::Json => {
-                    println!(
-                        "{}",
-                        serde_json::to_string_pretty(&resp)
-                            .unwrap_or_else(|_| resp.to_string())
-                    );
-                }
-                OutputFormat::Text => {
-                    if let Err(e) = print_text(&cli.command, &resp) {
-                        eprintln!("error: {e}");
-                        return ExitCode::from(1);
-                    }
-                }
-            }
-            if ok {
-                ExitCode::SUCCESS
-            } else {
-                ExitCode::from(1)
-            }
-        }
+        Ok(resp) => finish_response(&cli, &resp),
         Err(e) => {
             eprintln!("error: {e}");
             ExitCode::from(1)
         }
+    }
+}
+
+fn run_write_image(cli: &CtlCli, sock: &PathBuf, volume: &str, file: &PathBuf) -> ExitCode {
+    let meta = match std::fs::metadata(file) {
+        Ok(m) => m,
+        Err(e) => {
+            eprintln!("error: open {}: {e}", file.display());
+            return ExitCode::from(2);
+        }
+    };
+    let size = meta.len();
+    let mut f = match File::open(file) {
+        Ok(f) => f,
+        Err(e) => {
+            eprintln!("error: open {}: {e}", file.display());
+            return ExitCode::from(2);
+        }
+    };
+    eprintln!(
+        "seeding volume {volume} from {} ({size} bytes)…",
+        file.display()
+    );
+    match call_admin_write_image(sock, volume, size, &mut f) {
+        Ok(resp) => finish_response(cli, &resp),
+        Err(e) => {
+            eprintln!("error: {e}");
+            ExitCode::from(1)
+        }
+    }
+}
+
+fn finish_response(cli: &CtlCli, resp: &serde_json::Value) -> ExitCode {
+    let ok = resp.get("ok").and_then(|v| v.as_bool()).unwrap_or(false);
+    match cli.format {
+        OutputFormat::Json => {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(resp).unwrap_or_else(|_| resp.to_string())
+            );
+        }
+        OutputFormat::Text => {
+            if let Err(e) = print_text(&cli.command, resp) {
+                eprintln!("error: {e}");
+                return ExitCode::from(1);
+            }
+        }
+    }
+    if ok {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::from(1)
     }
 }
 
@@ -146,6 +194,9 @@ fn build_request(cmd: &Commands) -> Result<serde_json::Value, String> {
             VolumeCmd::List => json!({ "op": "volume.list" }),
             VolumeCmd::S3Stats { volume } => {
                 json!({ "op": "volume.s3_stats", "volume": volume })
+            }
+            VolumeCmd::WriteImage { .. } => {
+                unreachable!("write-image uses call_admin_write_image")
             }
         },
     })
@@ -181,6 +232,11 @@ fn print_text(cmd: &Commands, resp: &serde_json::Value) -> Result<(), String> {
             action: VolumeCmd::S3Stats { .. },
         } => {
             print_volume_s3_stats(&data);
+        }
+        Commands::Volume {
+            action: VolumeCmd::WriteImage { .. },
+        } => {
+            print_write_image(&data);
         }
         Commands::Reload => {
             println!("reload complete");
@@ -343,6 +399,39 @@ fn print_volume_s3_stats(data: &serde_json::Value) {
             b.get("other").and_then(|v| v.as_u64()).unwrap_or(0)
         );
     }
+    if let Some(n) = data.get("note").and_then(|v| v.as_str()) {
+        println!("note: {n}");
+    }
+}
+
+fn print_write_image(data: &serde_json::Value) {
+    // Ready-only responses should not reach here on success path; final has bytes_read.
+    if data.get("ready") == Some(&json!(true)) {
+        println!(
+            "ready to receive {} bytes for volume {}",
+            data.get("size").and_then(|v| v.as_u64()).unwrap_or(0),
+            data.get("volume").and_then(|v| v.as_str()).unwrap_or("?")
+        );
+        return;
+    }
+    println!(
+        "seeded volume {} ({})",
+        data.get("volume").and_then(|v| v.as_str()).unwrap_or("?"),
+        data.get("iqn").and_then(|v| v.as_str()).unwrap_or("?")
+    );
+    println!(
+        "bytes_read={}  bytes_stored={}  chunks_written={}  zero_chunks_skipped={}",
+        data.get("bytes_read").and_then(|v| v.as_u64()).unwrap_or(0),
+        data.get("bytes_stored")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0),
+        data.get("chunks_written")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0),
+        data.get("zero_chunks_skipped")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0)
+    );
     if let Some(n) = data.get("note").and_then(|v| v.as_str()) {
         println!("note: {n}");
     }

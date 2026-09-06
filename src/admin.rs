@@ -2,11 +2,12 @@
 
 use crate::cache::ChunkCache;
 use crate::config::{parse_byte_size, Config};
+use crate::store::{list_prefix_stats, BlockStore, PrefixObjectStats};
 use iscsi_target::IscsiServer;
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -25,6 +26,13 @@ pub struct VolumeSummary {
     pub compression: String,
 }
 
+/// Live store handle used by admin write paths (same Arc as the iSCSI device).
+pub struct AdminVolumeHandle {
+    pub name: String,
+    pub iqn: String,
+    pub store: Arc<dyn BlockStore>,
+}
+
 pub struct AdminState {
     pub config_path: Option<PathBuf>,
     pub started: Instant,
@@ -34,6 +42,8 @@ pub struct AdminState {
     pub runtime: tokio::runtime::Handle,
     /// Labels / config snapshot updated on safe reload.
     pub snapshot: Mutex<AdminSnapshot>,
+    /// Per-volume stores for direct image seeding.
+    pub volume_stores: Vec<AdminVolumeHandle>,
 }
 
 #[derive(Debug, Clone)]
@@ -57,6 +67,17 @@ struct AdminRequest {
     /// Volume name or IQN for volume-scoped ops.
     #[serde(default)]
     volume: Option<String>,
+    /// Exact byte length of a following binary body (`volume.write_image`).
+    #[serde(default)]
+    size: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SeedImageResult {
+    pub bytes_read: u64,
+    pub bytes_stored: u64,
+    pub chunks_written: u64,
+    pub zero_chunks_skipped: u64,
 }
 
 #[derive(Debug, Serialize)]
@@ -113,14 +134,186 @@ fn handle_client(stream: UnixStream, state: &AdminState) -> Result<(), String> {
     }
     let req: AdminRequest =
         serde_json::from_str(line.trim()).map_err(|e| format!("bad request json: {e}"))?;
+
+    if req.op == "volume.write_image" {
+        return handle_write_image(state, &req, &mut reader, &stream);
+    }
+
     let response = dispatch(state, &req);
-    let mut writer = stream;
-    let body = serde_json::to_string(&response).map_err(|e| e.to_string())?;
-    writer
+    write_json_line(&stream, &response)
+}
+
+fn write_json_line(mut stream: &UnixStream, value: &serde_json::Value) -> Result<(), String> {
+    let body = serde_json::to_string(value).map_err(|e| e.to_string())?;
+    stream
         .write_all(body.as_bytes())
         .map_err(|e| format!("write: {e}"))?;
-    writer.write_all(b"\n").map_err(|e| format!("write: {e}"))?;
+    stream.write_all(b"\n").map_err(|e| format!("write: {e}"))?;
     Ok(())
+}
+
+/// Two-phase image seed: ready JSON, then exact `size` body bytes, then final JSON.
+fn handle_write_image(
+    state: &AdminState,
+    req: &AdminRequest,
+    reader: &mut BufReader<&UnixStream>,
+    stream: &UnixStream,
+) -> Result<(), String> {
+    match prepare_write_image(state, req) {
+        Ok(prep) => {
+            write_json_line(
+                stream,
+                &ok(json!({
+                    "ready": true,
+                    "volume": prep.volume_name,
+                    "iqn": prep.iqn,
+                    "size": prep.size,
+                    "capacity": prep.capacity,
+                    "chunk_size": prep.chunk_size,
+                })),
+            )?;
+            let result = match seed_image_from_reader(prep.store.as_ref(), reader, prep.size) {
+                Ok(r) => ok(json!({
+                    "volume": prep.volume_name,
+                    "iqn": prep.iqn,
+                    "bytes_read": r.bytes_read,
+                    "bytes_stored": r.bytes_stored,
+                    "chunks_written": r.chunks_written,
+                    "zero_chunks_skipped": r.zero_chunks_skipped,
+                    "note": "all-zero chunks were skipped (sparse); meta.json may already exist",
+                })),
+                Err(e) => err(e),
+            };
+            write_json_line(stream, &result)
+        }
+        Err(e) => write_json_line(stream, &err(e)),
+    }
+}
+
+struct WriteImagePrep {
+    volume_name: String,
+    iqn: String,
+    size: u64,
+    capacity: u64,
+    chunk_size: u64,
+    store: Arc<dyn BlockStore>,
+}
+
+fn prepare_write_image(state: &AdminState, req: &AdminRequest) -> Result<WriteImagePrep, String> {
+    let size = req
+        .size
+        .ok_or_else(|| "size is required for volume.write_image".to_string())?;
+    if size == 0 {
+        return Err("size must be greater than 0".into());
+    }
+
+    let snap = state.snapshot.lock().clone();
+    let vol = find_volume(&snap.volumes, req.volume.as_deref())?.clone();
+    let handle = state
+        .volume_stores
+        .iter()
+        .find(|h| h.name == vol.name || h.iqn == vol.iqn)
+        .ok_or_else(|| format!("no live store for volume {}", vol.name))?;
+
+    let capacity = handle.store.capacity();
+    if size > capacity {
+        return Err(format!(
+            "image size {size} exceeds volume capacity {capacity}"
+        ));
+    }
+
+    let bucket = snap
+        .s3_bucket
+        .clone()
+        .ok_or_else(|| "s3.bucket is not configured".to_string())?;
+    let stats = list_prefix_stats(
+        state.s3_client.clone(),
+        state.runtime.clone(),
+        bucket,
+        &vol.prefix,
+    )
+    .map_err(|e| e.to_string())?;
+    ensure_prefix_empty_for_seed(&stats)?;
+
+    Ok(WriteImagePrep {
+        volume_name: vol.name,
+        iqn: vol.iqn,
+        size,
+        capacity,
+        chunk_size: handle.store.chunk_size(),
+        store: Arc::clone(&handle.store),
+    })
+}
+
+/// Volume is seedable when it has no chunk (block) objects yet. `meta.json` is allowed.
+pub fn ensure_prefix_empty_for_seed(stats: &PrefixObjectStats) -> Result<(), String> {
+    if stats.chunk_count > 0 {
+        return Err(format!(
+            "volume is not empty: {} chunk object(s) already exist under the prefix",
+            stats.chunk_count
+        ));
+    }
+    if stats.other_count > 0 {
+        return Err(format!(
+            "volume prefix has {} unexpected non-chunk/non-meta object(s); refuse to seed",
+            stats.other_count
+        ));
+    }
+    Ok(())
+}
+
+/// Read `size` bytes and write into `store`, skipping all-zero chunks (sparse).
+pub fn seed_image_from_reader(
+    store: &dyn BlockStore,
+    reader: &mut impl Read,
+    size: u64,
+) -> Result<SeedImageResult, String> {
+    let chunk_size = store.chunk_size();
+    if chunk_size == 0 {
+        return Err("invalid chunk_size 0".into());
+    }
+    let capacity = store.capacity();
+    if size > capacity {
+        return Err(format!(
+            "image size {size} exceeds volume capacity {capacity}"
+        ));
+    }
+
+    let mut buf = vec![0u8; chunk_size as usize];
+    let mut remaining = size;
+    let mut offset = 0u64;
+    let mut chunks_written = 0u64;
+    let mut bytes_stored = 0u64;
+    let mut zero_chunks_skipped = 0u64;
+
+    while remaining > 0 {
+        let n = (remaining as usize).min(buf.len());
+        reader
+            .read_exact(&mut buf[..n])
+            .map_err(|e| format!("read image body at offset {offset}: {e}"))?;
+        if buf[..n].iter().all(|&b| b == 0) {
+            zero_chunks_skipped += 1;
+        } else {
+            store
+                .write_at(offset, &buf[..n])
+                .map_err(|e| format!("write at offset {offset}: {e}"))?;
+            chunks_written += 1;
+            bytes_stored += n as u64;
+        }
+        offset += n as u64;
+        remaining -= n as u64;
+    }
+
+    store
+        .flush()
+        .map_err(|e| format!("flush after image write: {e}"))?;
+
+    Ok(SeedImageResult {
+        bytes_read: size,
+        bytes_stored,
+        chunks_written,
+        zero_chunks_skipped,
+    })
 }
 
 fn dispatch(state: &AdminState, req: &AdminRequest) -> serde_json::Value {
@@ -458,6 +651,56 @@ pub fn call_admin(socket: &Path, request: &serde_json::Value) -> Result<serde_js
     serde_json::from_str(resp.trim()).map_err(|e| format!("bad response json: {e}"))
 }
 
+/// Two-phase `volume.write_image`: ready handshake, stream `size` bytes, final JSON.
+pub fn call_admin_write_image(
+    socket: &Path,
+    volume: &str,
+    size: u64,
+    body: &mut impl Read,
+) -> Result<serde_json::Value, String> {
+    let mut stream = UnixStream::connect(socket)
+        .map_err(|e| format!("connect {}: {e}", socket.display()))?;
+    let req = json!({
+        "op": "volume.write_image",
+        "volume": volume,
+        "size": size,
+    });
+    let line = serde_json::to_string(&req).map_err(|e| e.to_string())?;
+    stream
+        .write_all(line.as_bytes())
+        .map_err(|e| format!("write: {e}"))?;
+    stream.write_all(b"\n").map_err(|e| format!("write: {e}"))?;
+
+    let mut reader = BufReader::new(stream.try_clone().map_err(|e| format!("clone: {e}"))?);
+    let mut ready_line = String::new();
+    reader
+        .read_line(&mut ready_line)
+        .map_err(|e| format!("read ready: {e}"))?;
+    let ready: serde_json::Value = serde_json::from_str(ready_line.trim())
+        .map_err(|e| format!("bad ready json: {e}"))?;
+    if ready.get("ok") != Some(&json!(true)) {
+        return Ok(ready);
+    }
+
+    let mut remaining = size;
+    let mut buf = vec![0u8; 1024 * 1024];
+    while remaining > 0 {
+        let n = (remaining as usize).min(buf.len());
+        body.read_exact(&mut buf[..n])
+            .map_err(|e| format!("read local file: {e}"))?;
+        stream
+            .write_all(&buf[..n])
+            .map_err(|e| format!("send image bytes: {e}"))?;
+        remaining -= n as u64;
+    }
+
+    let mut final_line = String::new();
+    reader
+        .read_line(&mut final_line)
+        .map_err(|e| format!("read final: {e}"))?;
+    serde_json::from_str(final_line.trim()).map_err(|e| format!("bad final json: {e}"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -560,5 +803,52 @@ mod tests {
         assert_eq!(resp["ok"], true);
         assert_eq!(resp["data"]["ping"], "pong");
         rx.recv_timeout(std::time::Duration::from_secs(2)).unwrap();
+    }
+
+    #[test]
+    fn ensure_empty_allows_meta_only() {
+        ensure_prefix_empty_for_seed(&PrefixObjectStats {
+            object_count: 1,
+            meta_count: 1,
+            meta_bytes: 100,
+            ..Default::default()
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn ensure_empty_rejects_chunks() {
+        let err = ensure_prefix_empty_for_seed(&PrefixObjectStats {
+            object_count: 2,
+            chunk_count: 1,
+            meta_count: 1,
+            ..Default::default()
+        })
+        .unwrap_err();
+        assert!(err.contains("not empty"));
+    }
+
+    #[test]
+    fn seed_image_skips_zero_chunks() {
+        use crate::store::MemoryStore;
+        use std::io::Cursor;
+
+        let store = MemoryStore::new(16 * 1024, 512, 4 * 1024).unwrap();
+        // chunk0 = non-zero, chunk1 = zeros, chunk2 = partial non-zero
+        let mut image = vec![0u8; 10 * 1024];
+        image[0] = 0xAB;
+        image[9 * 1024] = 0xCD;
+        let mut cursor = Cursor::new(image);
+        let result = seed_image_from_reader(&store, &mut cursor, 10 * 1024).unwrap();
+        assert_eq!(result.bytes_read, 10 * 1024);
+        assert_eq!(result.chunks_written, 2);
+        assert_eq!(result.zero_chunks_skipped, 1);
+        assert_eq!(result.bytes_stored, 4 * 1024 + 2 * 1024);
+
+        let mut buf = [0u8; 1];
+        store.read_at(0, &mut buf).unwrap();
+        assert_eq!(buf[0], 0xAB);
+        store.read_at(9 * 1024, &mut buf).unwrap();
+        assert_eq!(buf[0], 0xCD);
     }
 }
