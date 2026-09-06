@@ -110,6 +110,17 @@ impl BlockStore for MemoryStore {
     fn chunk_size(&self) -> u64 {
         self.chunk_size
     }
+
+    fn present_chunks(&self) -> Result<Vec<u64>, StoreError> {
+        let mut keys: Vec<u64> = self.inner.read().chunks.keys().copied().collect();
+        keys.sort_unstable();
+        Ok(keys)
+    }
+
+    fn delete_chunk(&self, index: u64) -> Result<(), StoreError> {
+        self.inner.write().chunks.remove(&index);
+        Ok(())
+    }
 }
 
 #[cfg(test)]

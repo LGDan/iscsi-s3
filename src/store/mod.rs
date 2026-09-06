@@ -5,7 +5,8 @@ mod s3;
 
 pub use memory::MemoryStore;
 pub use s3::{
-    list_prefix_stats, plan_capacity, PrefixObjectStats, S3ChunkStore, S3StoreConfig, VolumeMeta,
+    list_chunk_indices, list_prefix_stats, plan_capacity, PrefixObjectStats, S3ChunkStore,
+    S3StoreConfig, VolumeMeta,
 };
 
 use thiserror::Error;
@@ -40,6 +41,10 @@ pub trait BlockStore: Send + Sync {
     fn flush(&self) -> Result<(), StoreError>;
     fn block_size(&self) -> u32;
     fn chunk_size(&self) -> u64;
+    /// Indices of chunks that currently exist (non-sparse). Used for volume copy.
+    fn present_chunks(&self) -> Result<Vec<u64>, StoreError>;
+    /// Remove a chunk object (restore sparse zeros). Used when overwriting on copy.
+    fn delete_chunk(&self, index: u64) -> Result<(), StoreError>;
 }
 
 pub(crate) fn check_range(

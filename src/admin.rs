@@ -67,6 +67,9 @@ struct AdminRequest {
     /// Volume name or IQN for volume-scoped ops.
     #[serde(default)]
     volume: Option<String>,
+    /// Destination volume name or IQN (`volume.copy`).
+    #[serde(default)]
+    to: Option<String>,
     /// Exact byte length of a following binary body (`volume.write_image`).
     #[serde(default)]
     size: Option<u64>,
@@ -78,6 +81,13 @@ pub struct SeedImageResult {
     pub bytes_stored: u64,
     pub chunks_written: u64,
     pub zero_chunks_skipped: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct CopyVolumeResult {
+    pub chunks_copied: u64,
+    pub chunks_deleted: u64,
+    pub bytes_copied: u64,
 }
 
 #[derive(Debug, Serialize)]
@@ -356,6 +366,10 @@ fn dispatch(state: &AdminState, req: &AdminRequest) -> serde_json::Value {
             Err(e) => err(e),
         },
         "volume.list" => ok(volume_list_json(state)),
+        "volume.copy" => match volume_copy(state, req.volume.as_deref(), req.to.as_deref()) {
+            Ok(v) => ok(v),
+            Err(e) => err(e),
+        },
         other => err(format!("unknown op: {other}")),
     }
 }
@@ -423,6 +437,145 @@ fn volume_s3_stats(
         "logical_chunk_bytes_if_full": logical_chunk_bytes,
         "note": "bytes are on-disk object sizes (compressed when compression != none); sparse unwritten chunks have no object",
     }))
+}
+
+fn find_volume_store<'a>(
+    stores: &'a [AdminVolumeHandle],
+    vol: &VolumeSummary,
+) -> Result<&'a AdminVolumeHandle, String> {
+    stores
+        .iter()
+        .find(|h| h.name == vol.name || h.iqn == vol.iqn)
+        .ok_or_else(|| format!("no live store for volume {}", vol.name))
+}
+
+fn volume_copy(
+    state: &AdminState,
+    from: Option<&str>,
+    to: Option<&str>,
+) -> Result<serde_json::Value, String> {
+    let snap = state.snapshot.lock().clone();
+    let src_sum = find_volume(&snap.volumes, from)?.clone();
+    let dst_sum = find_volume(&snap.volumes, to)?.clone();
+    if src_sum.name == dst_sum.name {
+        return Err("source and destination must be different volumes".into());
+    }
+
+    let src = find_volume_store(&state.volume_stores, &src_sum)?;
+    let dst = find_volume_store(&state.volume_stores, &dst_sum)?;
+
+    let result = copy_volume(src.store.as_ref(), dst.store.as_ref()).map_err(|e| e.to_string())?;
+
+    info!(
+        from = %src_sum.name,
+        to = %dst_sum.name,
+        chunks_copied = result.chunks_copied,
+        chunks_deleted = result.chunks_deleted,
+        bytes_copied = result.bytes_copied,
+        "volume copy complete"
+    );
+
+    Ok(json!({
+        "from": {
+            "volume": src_sum.name,
+            "iqn": src_sum.iqn,
+            "prefix": src_sum.prefix,
+            "capacity": src_sum.capacity,
+            "compression": src_sum.compression,
+        },
+        "to": {
+            "volume": dst_sum.name,
+            "iqn": dst_sum.iqn,
+            "prefix": dst_sum.prefix,
+            "capacity": dst_sum.capacity,
+            "compression": dst_sum.compression,
+        },
+        "chunks_copied": result.chunks_copied,
+        "chunks_deleted": result.chunks_deleted,
+        "bytes_copied": result.bytes_copied,
+        "note": "destination overwritten to match source sparsity; compression may be re-encoded per destination config",
+    }))
+}
+
+/// Sparse 1:1 copy: copy present source chunks, delete destination-only chunks.
+pub fn copy_volume(
+    src: &dyn BlockStore,
+    dst: &dyn BlockStore,
+) -> Result<CopyVolumeResult, String> {
+    if src.chunk_size() != dst.chunk_size() {
+        return Err(format!(
+            "chunk_size mismatch: source {} != destination {}",
+            src.chunk_size(),
+            dst.chunk_size()
+        ));
+    }
+    if src.block_size() != dst.block_size() {
+        return Err(format!(
+            "block_size mismatch: source {} != destination {}",
+            src.block_size(),
+            dst.block_size()
+        ));
+    }
+    if src.capacity() != dst.capacity() {
+        return Err(format!(
+            "capacity mismatch: source {} != destination {} (1:1 copy requires equal capacity)",
+            src.capacity(),
+            dst.capacity()
+        ));
+    }
+
+    let capacity = src.capacity();
+    let chunk_size = src.chunk_size();
+    if chunk_size == 0 {
+        return Err("invalid chunk_size 0".into());
+    }
+
+    let src_chunks = src
+        .present_chunks()
+        .map_err(|e| format!("list source chunks: {e}"))?;
+    let dst_chunks = dst
+        .present_chunks()
+        .map_err(|e| format!("list destination chunks: {e}"))?;
+
+    let src_set: std::collections::HashSet<u64> = src_chunks.iter().copied().collect();
+    let mut chunks_copied = 0u64;
+    let mut bytes_copied = 0u64;
+    let mut buf = vec![0u8; chunk_size as usize];
+
+    for &idx in &src_chunks {
+        let offset = idx.checked_mul(chunk_size).ok_or_else(|| {
+            format!("chunk index {idx} overflows with chunk_size {chunk_size}")
+        })?;
+        if offset >= capacity {
+            continue;
+        }
+        let len = ((capacity - offset) as usize).min(buf.len());
+        src.read_at(offset, &mut buf[..len])
+            .map_err(|e| format!("read source chunk {idx}: {e}"))?;
+        dst.write_at(offset, &buf[..len])
+            .map_err(|e| format!("write destination chunk {idx}: {e}"))?;
+        chunks_copied += 1;
+        bytes_copied += len as u64;
+    }
+
+    let mut chunks_deleted = 0u64;
+    for &idx in &dst_chunks {
+        if src_set.contains(&idx) {
+            continue;
+        }
+        dst.delete_chunk(idx)
+            .map_err(|e| format!("delete destination chunk {idx}: {e}"))?;
+        chunks_deleted += 1;
+    }
+
+    dst.flush()
+        .map_err(|e| format!("flush destination after copy: {e}"))?;
+
+    Ok(CopyVolumeResult {
+        chunks_copied,
+        chunks_deleted,
+        bytes_copied,
+    })
 }
 
 fn ok(data: serde_json::Value) -> serde_json::Value {
@@ -850,5 +1003,41 @@ mod tests {
         assert_eq!(buf[0], 0xAB);
         store.read_at(9 * 1024, &mut buf).unwrap();
         assert_eq!(buf[0], 0xCD);
+    }
+
+    #[test]
+    fn copy_volume_overwrites_and_deletes_extra() {
+        use crate::store::MemoryStore;
+
+        let src = MemoryStore::new(16 * 1024, 512, 4 * 1024).unwrap();
+        let dst = MemoryStore::new(16 * 1024, 512, 4 * 1024).unwrap();
+
+        src.write_at(0, &[1u8; 4096]).unwrap();
+        src.write_at(8192, &[2u8; 4096]).unwrap();
+        // dest has stale data in chunk1 and chunk2
+        dst.write_at(4096, &[9u8; 4096]).unwrap();
+        dst.write_at(8192, &[8u8; 4096]).unwrap();
+
+        let result = copy_volume(&src, &dst).unwrap();
+        assert_eq!(result.chunks_copied, 2);
+        assert_eq!(result.chunks_deleted, 1); // dest-only chunk1
+
+        let mut buf = [0u8; 1];
+        dst.read_at(0, &mut buf).unwrap();
+        assert_eq!(buf[0], 1);
+        dst.read_at(4096, &mut buf).unwrap();
+        assert_eq!(buf[0], 0); // deleted → sparse zeros
+        dst.read_at(8192, &mut buf).unwrap();
+        assert_eq!(buf[0], 2);
+        assert_eq!(dst.present_chunks().unwrap(), vec![0, 2]);
+    }
+
+    #[test]
+    fn copy_volume_rejects_capacity_mismatch() {
+        use crate::store::MemoryStore;
+        let src = MemoryStore::new(8192, 512, 4096).unwrap();
+        let dst = MemoryStore::new(16384, 512, 4096).unwrap();
+        let err = copy_volume(&src, &dst).unwrap_err();
+        assert!(err.contains("capacity mismatch"));
     }
 }

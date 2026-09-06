@@ -101,6 +101,63 @@ pub fn list_prefix_stats(
     )
 }
 
+/// List present chunk indices under `{prefix}/chunks/` (hex object names).
+pub fn list_chunk_indices(
+    client: Client,
+    runtime: Handle,
+    bucket: String,
+    prefix: &str,
+) -> Result<Vec<u64>, StoreError> {
+    let prefix = prefix.trim_matches('/').to_string();
+    let chunks_prefix = format!("{prefix}/chunks/");
+    run_on_runtime(
+        &runtime,
+        async move {
+            let mut indices = Vec::new();
+            let mut token: Option<String> = None;
+            loop {
+                let mut req = client
+                    .list_objects_v2()
+                    .bucket(&bucket)
+                    .prefix(&chunks_prefix);
+                if let Some(t) = token.take() {
+                    req = req.continuation_token(t);
+                }
+                let out = req
+                    .send()
+                    .await
+                    .map_err(|e| StoreError::S3(e.to_string()))?;
+                for obj in out.contents() {
+                    let key = obj.key().unwrap_or("");
+                    if let Some(idx) = parse_chunk_index_from_key(&chunks_prefix, key) {
+                        indices.push(idx);
+                    }
+                }
+                if out.is_truncated().unwrap_or(false) {
+                    token = out.next_continuation_token().map(|s| s.to_string());
+                    if token.is_none() {
+                        break;
+                    }
+                } else {
+                    break;
+                }
+            }
+            indices.sort_unstable();
+            indices.dedup();
+            Ok(indices)
+        },
+        Duration::from_secs(300),
+    )
+}
+
+fn parse_chunk_index_from_key(chunks_prefix: &str, key: &str) -> Option<u64> {
+    let name = key.strip_prefix(chunks_prefix)?;
+    if name.is_empty() || name.contains('/') {
+        return None;
+    }
+    u64::from_str_radix(name, 16).ok()
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct VolumeMeta {
     pub version: u32,
@@ -172,6 +229,26 @@ impl S3ChunkStore {
 
     fn stripe(&self, chunk_idx: u64) -> &Mutex<()> {
         &self.locks[(chunk_idx as usize) % LOCK_STRIPES]
+    }
+
+    fn delete_chunk_object(&self, index: u64) -> Result<(), StoreError> {
+        let started = Instant::now();
+        let key = self.chunk_key(index);
+        let client = self.client.clone();
+        let bucket = self.bucket.clone();
+        let result = self.run_async(async move {
+            client
+                .delete_object()
+                .bucket(&bucket)
+                .key(&key)
+                .send()
+                .await
+                .map_err(|e| StoreError::S3(e.to_string()))?;
+            Ok(())
+        });
+        self.metrics
+            .observe_s3(&self.labels, "delete", 0, started, result.is_ok());
+        result
     }
 
     /// Run an async S3 op on the Tokio runtime without nesting `block_on` on the
@@ -572,6 +649,20 @@ impl BlockStore for S3ChunkStore {
     fn chunk_size(&self) -> u64 {
         self.chunk_size
     }
+
+    fn present_chunks(&self) -> Result<Vec<u64>, StoreError> {
+        list_chunk_indices(
+            self.client.clone(),
+            self.runtime.clone(),
+            self.bucket.clone(),
+            &self.prefix,
+        )
+    }
+
+    fn delete_chunk(&self, index: u64) -> Result<(), StoreError> {
+        let _guard = self.stripe(index).lock();
+        self.delete_chunk_object(index)
+    }
 }
 
 #[cfg(test)]
@@ -625,5 +716,17 @@ mod tests {
         let err =
             plan_capacity(Some(&m), 8192, 4096, 512, Compression::Lz4).unwrap_err();
         assert!(matches!(err, StoreError::GeometryMismatch(_)));
+    }
+
+    #[test]
+    fn parse_chunk_index_hex() {
+        assert_eq!(
+            parse_chunk_index_from_key("disks/a/chunks/", "disks/a/chunks/000000000000000a"),
+            Some(10)
+        );
+        assert_eq!(
+            parse_chunk_index_from_key("disks/a/chunks/", "disks/a/chunks/"),
+            None
+        );
     }
 }

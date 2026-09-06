@@ -5,6 +5,7 @@ use iscsi_s3::admin::{call_admin, call_admin_write_image};
 use iscsi_s3::config::{parse_byte_size, DEFAULT_ADMIN_SOCKET};
 use serde_json::json;
 use std::fs::File;
+use std::io::{self, IsTerminal, Write};
 use std::path::PathBuf;
 use std::process::ExitCode;
 
@@ -79,6 +80,16 @@ enum VolumeCmd {
         #[arg(long, short)]
         file: PathBuf,
     },
+    /// Copy one volume onto another (1:1 sparse overwrite)
+    Copy {
+        /// Source volume name or IQN
+        from: String,
+        /// Destination volume name or IQN (overwritten)
+        to: String,
+        /// Skip interactive confirmation
+        #[arg(long, short = 'f')]
+        force: bool,
+    },
 }
 
 fn socket_path(cli: &CtlCli) -> PathBuf {
@@ -102,6 +113,16 @@ fn main() -> ExitCode {
         return run_write_image(&cli, &sock, volume, file);
     }
 
+    if let Commands::Volume {
+        action: VolumeCmd::Copy { from, to, force },
+    } = &cli.command
+    {
+        if let Err(e) = confirm_volume_copy(from, to, *force) {
+            eprintln!("error: {e}");
+            return ExitCode::from(2);
+        }
+    }
+
     let req = match build_request(&cli.command) {
         Ok(r) => r,
         Err(e) => {
@@ -115,6 +136,30 @@ fn main() -> ExitCode {
             eprintln!("error: {e}");
             ExitCode::from(1)
         }
+    }
+}
+
+fn confirm_volume_copy(from: &str, to: &str, force: bool) -> Result<(), String> {
+    if force {
+        return Ok(());
+    }
+    if !io::stdin().is_terminal() {
+        return Err(
+            "refusing destructive volume copy without --force when stdin is not a TTY".into(),
+        );
+    }
+    eprint!(
+        "This will OVERWRITE volume '{to}' with a 1:1 copy of '{from}'.\nType 'yes' to continue: "
+    );
+    let _ = io::stderr().flush();
+    let mut line = String::new();
+    io::stdin()
+        .read_line(&mut line)
+        .map_err(|e| format!("read confirmation: {e}"))?;
+    if line.trim() == "yes" {
+        Ok(())
+    } else {
+        Err("aborted (confirmation was not 'yes')".into())
     }
 }
 
@@ -198,6 +243,9 @@ fn build_request(cmd: &Commands) -> Result<serde_json::Value, String> {
             VolumeCmd::WriteImage { .. } => {
                 unreachable!("write-image uses call_admin_write_image")
             }
+            VolumeCmd::Copy { from, to, .. } => {
+                json!({ "op": "volume.copy", "volume": from, "to": to })
+            }
         },
     })
 }
@@ -237,6 +285,11 @@ fn print_text(cmd: &Commands, resp: &serde_json::Value) -> Result<(), String> {
             action: VolumeCmd::WriteImage { .. },
         } => {
             print_write_image(&data);
+        }
+        Commands::Volume {
+            action: VolumeCmd::Copy { .. },
+        } => {
+            print_volume_copy(&data);
         }
         Commands::Reload => {
             println!("reload complete");
@@ -429,6 +482,35 @@ fn print_write_image(data: &serde_json::Value) {
             .and_then(|v| v.as_u64())
             .unwrap_or(0),
         data.get("zero_chunks_skipped")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0)
+    );
+    if let Some(n) = data.get("note").and_then(|v| v.as_str()) {
+        println!("note: {n}");
+    }
+}
+
+fn print_volume_copy(data: &serde_json::Value) {
+    let from = data.get("from");
+    let to = data.get("to");
+    println!(
+        "copied {} → {}",
+        from.and_then(|v| v.get("volume"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("?"),
+        to.and_then(|v| v.get("volume"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("?")
+    );
+    println!(
+        "chunks_copied={}  chunks_deleted={}  bytes_copied={}",
+        data.get("chunks_copied")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0),
+        data.get("chunks_deleted")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0),
+        data.get("bytes_copied")
             .and_then(|v| v.as_u64())
             .unwrap_or(0)
     );

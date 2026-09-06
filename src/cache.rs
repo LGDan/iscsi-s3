@@ -291,6 +291,16 @@ impl<S: BlockStore> BlockStore for CachedStore<S> {
     fn chunk_size(&self) -> u64 {
         self.inner.chunk_size()
     }
+
+    fn present_chunks(&self) -> Result<Vec<u64>, StoreError> {
+        self.inner.present_chunks()
+    }
+
+    fn delete_chunk(&self, index: u64) -> Result<(), StoreError> {
+        self.inner.delete_chunk(index)?;
+        self.cache.invalidate(&self.labels.volume, index);
+        Ok(())
+    }
 }
 
 #[cfg(test)]

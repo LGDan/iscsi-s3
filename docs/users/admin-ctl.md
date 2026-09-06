@@ -39,6 +39,7 @@ Docker: install both `iscsi-s3` and `iscsi-s3-ctl` in the image. Mount/share the
 | `volume list` | List configured volumes (name, IQN, capacity, prefix, compression, auth) |
 | `volume s3-stats <name\|iqn>` | List S3 objects under the volume prefix: chunk/meta counts and bytes |
 | `volume write-image <name\|iqn> --file PATH` | Stream a raw disk image into a volume that has **no chunk objects** yet |
+| `volume copy <from> <to> [--force]` | 1:1 sparse copy; **overwrites** destination (prompts unless `--force`) |
 | `reload` | Re-read the startup `--config` file + env; apply **safe** fields only |
 
 Global flags: `--socket PATH`, `--format text|json`.
@@ -99,6 +100,24 @@ Rules:
 
 Wire protocol is two-phase: JSON request with `size` → ready JSON → raw body → final JSON.
 
+## Copy a volume (`volume copy`)
+
+Make a **1:1 sparse copy** of one configured volume onto another. Destination data is overwritten: source chunks are copied, and destination-only chunks are deleted so sparsity matches.
+
+```bash
+iscsi-s3-ctl volume copy disk0 disk1
+# prompts: Type 'yes' to continue
+iscsi-s3-ctl volume copy disk0 disk1 --force
+```
+
+Rules:
+
+- Source and destination must be different volumes on the same daemon.
+- `capacity`, `chunk_size`, and `block_size` must match.
+- Compression may differ (payload is re-encoded for the destination).
+- Client prompts for confirmation unless `--force` (non-TTY stdin also requires `--force`).
+- Prefer logging out initiators on both volumes first.
+
 ## Safe cache toggle
 
 Disabling always flushes the LRU so the next reads hit S3. That is the right step **before** starting a second multi-instance peer that must not see stale data from this process’s cache. See [chunk cache safety](../developers/cache.md).
@@ -134,6 +153,7 @@ One JSON object per connection, newline-terminated request and response:
 {"op":"volume.list"}
 {"op":"volume.s3_stats","volume":"disk0"}
 {"op":"volume.write_image","volume":"disk0","size":1073741824}
+{"op":"volume.copy","volume":"disk0","to":"disk1"}
 {"op":"reload"}
 ```
 
