@@ -81,7 +81,6 @@ services:
         condition: service_completed_successfully
     ports:
       - "3260:3260"
-      - "3261:3261"
     volumes:
       - ./config.toml:/etc/iscsi-s3/config.toml:ro
     environment:
@@ -96,9 +95,8 @@ volumes:
 
 ```bash
 sudo iscsiadm -m discovery -t sendtargets -p 127.0.0.1:3260
-sudo iscsiadm -m discovery -t sendtargets -p 127.0.0.1:3261
 sudo iscsiadm -m node -T iqn.2026-09.local.iscsi-s3:disk0 -p 127.0.0.1:3260 --login
-sudo iscsiadm -m node -T iqn.2026-09.local.iscsi-s3:disk1 -p 127.0.0.1:3261 --login
+sudo iscsiadm -m node -T iqn.2026-09.local.iscsi-s3:disk1 -p 127.0.0.1:3260 --login
 ```
 
 ---
@@ -346,8 +344,6 @@ chunk_size = "64KiB"
 ```yaml
 ports:
   - "3260:3260"
-  - "3261:3261"
-  - "3262:3262"
 ```
 
 ---
@@ -458,11 +454,10 @@ chunk_size = "4MiB"
 
 ```yaml
 ports:
-  - "3260:3260"   # boot
-  - "3261:3261"   # data
+  - "3260:3260"   # shared portal (boot + data IQNs)
 ```
 
-Point firmware at **boot** IQN on port **3260**, LUN **0**. Mount **data** from the OS via open-iscsi on `3261`.
+Point firmware at **boot** IQN on port **3260**, LUN **0**. Mount **data** from the OS via open-iscsi on the same portal with the data IQN.
 
 ---
 

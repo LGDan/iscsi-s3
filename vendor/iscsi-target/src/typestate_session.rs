@@ -720,6 +720,8 @@ impl TypestateSession<SecurityNegotiation> {
                         self.data.exp_cmd_sn, self.data.max_cmd_sn,
                         0, 0, login.csg, login.nsg, true, itt, response_data,
                     );
+                    // Login leaves `stat_sn` as last-used; SCSI uses next_stat_sn (next-to-assign).
+                    self.data.stat_sn = self.data.stat_sn.wrapping_add(1);
                     let new_session: TypestateSession<FullFeaturePhase> = TypestateSession {
                         data: self.data, _state: PhantomData,
                     };
@@ -932,6 +934,8 @@ impl TypestateSession<LoginOperationalNegotiation> {
                 self.data.exp_cmd_sn, self.data.max_cmd_sn,
                 0, 0, login.csg, login.nsg, true, itt, response_data,
             );
+            // Login leaves `stat_sn` as last-used; SCSI uses next_stat_sn (next-to-assign).
+            self.data.stat_sn = self.data.stat_sn.wrapping_add(1);
 
             let new_session: TypestateSession<FullFeaturePhase> = TypestateSession {
                 data: self.data, _state: PhantomData,

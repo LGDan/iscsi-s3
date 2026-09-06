@@ -13,7 +13,7 @@ Initiator  --iSCSI-->  iscsi-s3  --Get/PutObject-->  S3 / MinIO
 ## Features
 
 - Layered config: defaults → TOML → `ISCSI_S3_*` env → CLI
-- Multiple volumes (one IQN and TCP port per volume)
+- Multiple volumes on one TCP portal (IQN-based routing)
 - Grow-only capacity via `{prefix}/meta.json`
 - Sparse disks (missing chunks read as zeros)
 - Whole-chunk LRU cache
@@ -55,7 +55,6 @@ Set `advertise` in the mounted config to an address clients can reach (for Docke
 - No CHAP / initiator ACL UI yet (treat portals as trusted-network only).
 - No SCSI UNMAP/TRIM thin-provision reporting.
 - Shrink and geometry (`chunk_size` / `block_size`) changes are refused after first open.
-- One TCP port per volume (not a single shared multi-IQN portal).
 - Primary validation: Linux open-iscsi, Intel iSCSI Boot (with caveats), bundled smoke client.
 
 ## License

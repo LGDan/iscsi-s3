@@ -458,6 +458,7 @@ fn iscsi_digest(bytes: &[u8]) -> [u8; 4] {
 }
 
 /// Read a PDU from the TCP stream with optional digest verification
+#[allow(dead_code)]
 fn read_pdu(stream: &mut TcpStream) -> ScsiResult<IscsiPdu> {
     read_pdu_digest(stream, false, false)
 }
@@ -880,6 +881,7 @@ fn handle_write_command<D: ScsiBlockDevice>(
         if let Some(pending) = data.pending_writes.get_mut(&cmd.itt) {
             pending.next_r2t_offset = bytes_received + request_len;
             pending.r2t_sn = 1;
+            pending.r2t_pending = true;
         }
 
         let r2t = IscsiPdu::r2t(
@@ -1240,6 +1242,8 @@ struct TargetInfo {
 /// Serves multiple targets on a single port with IQN-based routing
 pub struct IscsiServer {
     bind_addr: String,
+    /// Optional host:port returned in SendTargets (defaults to socket local_addr).
+    advertise_addr: Option<String>,
     targets: Arc<Mutex<std::collections::HashMap<String, TargetInfo>>>,
     running: Arc<AtomicBool>,
     shutting_down: Arc<AtomicBool>,
@@ -1300,20 +1304,27 @@ impl IscsiServer {
                     let active_connections = Arc::clone(&self.active_connections);
                     let max_sessions = self.max_sessions;
                     let active_sessions = Arc::clone(&self.active_sessions);
-                    let bind_addr = self.bind_addr.clone();
+                    let advertise_addr = self.advertise_addr.clone();
 
                     thread::spawn(move || {
-                        let session_entered = handle_multi_target_connection(
+                        let session_entered = match handle_multi_target_connection(
                             stream,
                             targets,
-                            &bind_addr,
+                            advertise_addr.as_deref(),
                             running,
                             shutting_down,
                             max_sessions,
                             Arc::clone(&active_sessions),
-                        ).unwrap_or(false);
+                            addr,
+                        ) {
+                            Ok(entered) => entered,
+                            Err(e) => {
+                                log::error!("Connection from {} failed: {}", addr, e);
+                                false
+                            }
+                        };
 
-                        log::info!("Connection closed from {}", addr);
+                        log::info!("Connection closed from {} (full_feature={})", addr, session_entered);
 
                         active_connections.fetch_sub(1, Ordering::SeqCst);
 
@@ -1368,76 +1379,79 @@ impl IscsiServer {
     }
 }
 
+/// Resolve the portal string used in SendTargets TargetAddress (host:port).
+fn resolve_portal_address(stream: &TcpStream, advertise: Option<&str>) -> ScsiResult<String> {
+    if let Some(addr) = advertise {
+        return Ok(addr.to_string());
+    }
+    Ok(stream.local_addr().map_err(IscsiError::Io)?.to_string())
+}
+
 /// Handle a connection with multi-target routing
 fn handle_multi_target_connection(
     mut stream: TcpStream,
     targets: Arc<Mutex<std::collections::HashMap<String, TargetInfo>>>,
-    _bind_addr: &str,
+    advertise_addr: Option<&str>,
     running: Arc<AtomicBool>,
     shutting_down: Arc<AtomicBool>,
     max_sessions: u32,
     active_sessions: Arc<std::sync::atomic::AtomicUsize>,
+    peer: std::net::SocketAddr,
 ) -> ScsiResult<bool> {
-    let local_addr = stream.local_addr().map_err(IscsiError::Io)?;
     stream.set_nonblocking(false).map_err(IscsiError::Io)?;
     stream.set_read_timeout(Some(Duration::from_secs(5))).map_err(IscsiError::Io)?;
     stream.set_write_timeout(Some(Duration::from_secs(5))).map_err(IscsiError::Io)?;
 
-    let target_address = match local_addr {
-        std::net::SocketAddr::V4(addr) => addr.ip().to_string(),
-        std::net::SocketAddr::V6(addr) => format!("[{}]", addr.ip()),
-    };
+    let portal = resolve_portal_address(&stream, advertise_addr)?;
+    log::info!(
+        "Handling multi-target connection from {} (portal={}, advertise={})",
+        peer,
+        stream.local_addr().map(|a| a.to_string()).unwrap_or_else(|_| "?".into()),
+        portal
+    );
 
-    // Create initial session for login phase
-    let _session = AnySession::new();
-
-    // Read first PDU to extract target name
-    let first_pdu = match read_pdu(&mut stream) {
+    // Read first PDU to extract target name (login has no digests yet).
+    let first_pdu = match read_pdu_digest(&mut stream, false, false) {
         Ok(pdu) => pdu,
         Err(e) => {
-            log::error!("Failed to read first PDU: {}", e);
+            log::error!("Failed to read first PDU from {}: {}", peer, e);
             return Ok(false);
         }
     };
 
-    // Must be a login request
     if first_pdu.opcode != opcode::LOGIN_REQUEST {
-        log::warn!("First PDU is not login request: 0x{:02x}", first_pdu.opcode);
+        log::warn!("First PDU from {} is not login request: 0x{:02x}", peer, first_pdu.opcode);
         return Ok(false);
     }
 
-    // Parse login request to extract TargetName
     let login_req = first_pdu.parse_login_request()?;
-    let target_name = login_req.parameters.iter()
+    let target_name = login_req
+        .parameters
+        .iter()
         .find(|(k, _)| k == "TargetName")
-        .map(|(_, v)| v.as_str());
+        .map(|(_, v)| v.as_str())
+        .filter(|v| !v.is_empty());
 
-    // Check if this is a discovery session (no TargetName)
-    let is_discovery = target_name.is_none() || matches!(target_name, Some(""));
-
-    if is_discovery {
-        log::info!("Discovery session - returning all targets");
-        // Handle discovery session - returns all targets via SendTargets
-        return handle_discovery_session(stream, targets, &target_address, first_pdu);
+    if target_name.is_none() {
+        log::info!("Discovery session from {}", peer);
+        return handle_discovery_session(stream, targets, &portal, first_pdu, peer);
     }
 
     let target_name = target_name.unwrap();
-    log::info!("Login request for target: {}", target_name);
+    log::info!("Login request from {} for target: {}", peer, target_name);
 
-    // Look up target
     let targets_lock = targets.lock().unwrap();
     let target_info = match targets_lock.get(target_name) {
         Some(info) => info,
         None => {
             log::warn!("Target not found: {}", target_name);
-            // Send login reject - target not found
             let data = SessionData::default();
             let reject_pdu = data.create_login_reject(
                 first_pdu.itt,
-                pdu::login_status::TARGET_ERROR,
-                0x02, // Target not found
+                pdu::login_status::INITIATOR_ERROR,
+                0x03, // Target not found
             );
-            let _ = write_pdu(&mut stream, &reject_pdu);
+            let _ = write_pdu_digest(&mut stream, &reject_pdu, false, false);
             return Ok(false);
         }
     };
@@ -1448,11 +1462,9 @@ fn handle_multi_target_connection(
     let allowed_initiators = target_info.allowed_initiators.clone();
     drop(targets_lock);
 
-    log::info!("Routing to target: {} ({})", target_name, alias);
+    log::info!("Routing {} to target: {} ({})", peer, target_name, alias);
 
-    // Now handle the connection with the specific target
-    // Replay the first PDU through the normal handler
-    let session_entered = handle_connection_with_first_pdu_boxed(
+    handle_connection_with_first_pdu_boxed(
         stream,
         device,
         target_name,
@@ -1464,93 +1476,165 @@ fn handle_multi_target_connection(
         active_sessions,
         allowed_initiators,
         first_pdu,
-    )?;
-
-    Ok(session_entered)
+        &portal,
+        peer,
+    )
 }
 
-/// Handle discovery session (SessionType=Discovery)
+/// Handle discovery session (SessionType=Discovery) on the shared portal.
 fn handle_discovery_session(
     mut stream: TcpStream,
     targets: Arc<Mutex<std::collections::HashMap<String, TargetInfo>>>,
-    target_address: &str,
+    portal: &str,
     first_pdu: IscsiPdu,
+    peer: std::net::SocketAddr,
 ) -> ScsiResult<bool> {
     let mut session = AnySession::new();
+    let mut use_hd = false;
+    let mut use_dd = false;
 
-    // Process login normally but without device access
-    let (new_session, responses) = session.process_login(&first_pdu, "")?;
-    session = new_session;
-
-    for response in responses {
-        write_pdu(&mut stream, &response)?;
-    }
-
-    // Wait for text request with SendTargets
+    let mut pending = Some(first_pdu);
     loop {
-        let pdu = match read_pdu(&mut stream) {
-            Ok(pdu) => pdu,
-            Err(_) => break,
-        };
-
-        match pdu.opcode {
-            opcode::TEXT_REQUEST => {
-                let text_req = pdu.parse_text_request()?;
-                let is_send_targets = text_req.parameters.iter()
-                    .any(|(k, v)| k == "SendTargets" && (v == "All" || v.is_empty()));
-
-                if is_send_targets {
-                    // Build response with all targets
-                    let targets_lock = targets.lock().unwrap();
-                    let mut response_params = Vec::new();
-
-                    for (iqn, _) in targets_lock.iter() {
-                        response_params.push(("TargetName".to_string(), iqn.clone()));
-                        response_params.push(("TargetAddress".to_string(), format!("{},1", target_address)));
-                    }
-                    drop(targets_lock);
-
-                    let response_data = serialize_text_parameters(&response_params);
-                    let data = session.data_mut().ok_or_else(|| IscsiError::Protocol("No session data".to_string()))?;
-                    let response_pdu = IscsiPdu::text_response(
-                        pdu.itt, 0xFFFF_FFFF,
-                        data.next_stat_sn(), data.exp_cmd_sn, data.max_cmd_sn,
-                        true, response_data,
-                    );
-                    write_pdu(&mut stream, &response_pdu)?;
-                } else {
-                    // Empty response
-                    let data = session.data_mut().ok_or_else(|| IscsiError::Protocol("No session data".to_string()))?;
-                    let response_pdu = IscsiPdu::text_response(
-                        pdu.itt, 0xFFFF_FFFF,
-                        data.next_stat_sn(), data.exp_cmd_sn, data.max_cmd_sn,
-                        true, vec![],
-                    );
-                    write_pdu(&mut stream, &response_pdu)?;
+        let pdu = if let Some(p) = pending.take() {
+            p
+        } else {
+            match read_pdu_digest(&mut stream, use_hd, use_dd) {
+                Ok(pdu) => pdu,
+                Err(IscsiError::Io(ref e)) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
+                    log::info!("Discovery peer {} closed connection (EOF)", peer);
+                    break;
+                }
+                Err(IscsiError::Io(ref e)) if e.kind() == std::io::ErrorKind::TimedOut => {
+                    continue;
+                }
+                Err(e) => {
+                    log::debug!("Discovery session from {} ended: {}", peer, e);
+                    break;
                 }
             }
-            opcode::LOGOUT_REQUEST => {
-                let old_session = std::mem::replace(&mut session, AnySession::new());
-                let (_new_session, response) = old_session.process_logout(&pdu)?;
-                write_pdu(&mut stream, &response)?;
+        };
+
+        log::info!(
+            "RX {} from {} (discovery, opcode 0x{:02x}, state={})",
+            pdu.opcode_name(),
+            peer,
+            pdu.opcode,
+            session.state_name()
+        );
+
+        let was_ff = session.is_full_feature();
+        let responses = if session.is_login_phase() || matches!(pdu.opcode, opcode::LOGIN_REQUEST) {
+            if pdu.opcode != opcode::LOGIN_REQUEST {
+                log::warn!("Unexpected opcode 0x{:02x} during discovery login from {}", pdu.opcode, peer);
                 break;
             }
-            _ => {
-                log::warn!("Unexpected opcode during discovery: 0x{:02x}", pdu.opcode);
-                break;
+            let old = std::mem::replace(&mut session, AnySession::new());
+            let (new_session, responses) = old.process_login(&pdu, "")?;
+            session = new_session;
+            responses
+        } else if session.is_full_feature() {
+            match pdu.opcode {
+                opcode::TEXT_REQUEST => {
+                    let text_req = pdu.parse_text_request()?;
+                    let is_send_targets = text_req.parameters.iter().any(|(k, v)| {
+                        k == "SendTargets" && (v == "All" || v.is_empty() || v == "all")
+                    });
+
+                    let data = session
+                        .data_mut()
+                        .ok_or_else(|| IscsiError::Protocol("No session data".to_string()))?;
+                    let response_data = if is_send_targets {
+                        let targets_lock = targets.lock().unwrap();
+                        let mut response_params = Vec::new();
+                        for (iqn, _) in targets_lock.iter() {
+                            response_params.push(("TargetName".to_string(), iqn.clone()));
+                            // Same portal for every IQN on this shared listener.
+                            response_params
+                                .push(("TargetAddress".to_string(), format!("{},1", portal)));
+                        }
+                        drop(targets_lock);
+                        log::info!(
+                            "SendTargets for {}: {} target(s) at {}",
+                            peer,
+                            response_params.len() / 2,
+                            portal
+                        );
+                        serialize_text_parameters(&response_params)
+                    } else {
+                        vec![]
+                    };
+                    vec![IscsiPdu::text_response(
+                        pdu.itt,
+                        0xFFFF_FFFF,
+                        data.next_stat_sn(),
+                        data.exp_cmd_sn,
+                        data.max_cmd_sn,
+                        true,
+                        response_data,
+                    )]
+                }
+                opcode::NOP_OUT => {
+                    vec![session.process_nop_out(&pdu)?]
+                }
+                opcode::LOGOUT_REQUEST => {
+                    let old = std::mem::replace(&mut session, AnySession::new());
+                    let (_ended, response) = old.process_logout(&pdu)?;
+                    let responses = vec![response];
+                    for resp in &responses {
+                        write_pdu_digest(&mut stream, resp, use_hd, use_dd)?;
+                    }
+                    break;
+                }
+                _ => {
+                    log::warn!("Unexpected opcode during discovery FFP: 0x{:02x}", pdu.opcode);
+                    break;
+                }
             }
+        } else {
+            log::info!("Discovery session from {} ended (state={})", peer, session.state_name());
+            break;
+        };
+
+        for resp in &responses {
+            log::info!(
+                "TX {} to {} (discovery, opcode 0x{:02x})",
+                resp.opcode_name(),
+                peer,
+                resp.opcode
+            );
+            write_pdu_digest(&mut stream, resp, use_hd, use_dd)?;
+        }
+
+        if !was_ff && session.is_full_feature() {
+            if let Some(data) = session.data() {
+                use_hd = matches!(data.params.header_digest, crate::session::DigestType::CRC32C);
+                use_dd = matches!(data.params.data_digest, crate::session::DigestType::CRC32C);
+                log::info!(
+                    "Discovery session from {} entered FullFeaturePhase (HeaderDigest={}, DataDigest={})",
+                    peer,
+                    if use_hd { "CRC32C" } else { "None" },
+                    if use_dd { "CRC32C" } else { "None" }
+                );
+            }
+        }
+
+        if session.is_ended() {
+            break;
         }
     }
 
-    Ok(false) // Discovery session complete (not counted as active session)
+    Ok(false)
 }
 
-/// Boxed device version of handle_connection_with_first_pdu for multi-target server
+/// Normal (non-discovery) session after TargetName routing, with digest support.
+///
+/// Uses the same reader-thread + inline NOP pattern as `handle_connection` so
+/// keepalives are answered while SCSI I/O (e.g. S3) blocks the main loop.
 fn handle_connection_with_first_pdu_boxed(
     mut stream: TcpStream,
     device: Arc<Mutex<Box<dyn ScsiBlockDevice + Send>>>,
     target_name: &str,
-    _target_alias: &str,
+    target_alias: &str,
     auth_config: crate::auth::AuthConfig,
     running: Arc<AtomicBool>,
     shutting_down: Arc<AtomicBool>,
@@ -1558,93 +1642,285 @@ fn handle_connection_with_first_pdu_boxed(
     active_sessions: Arc<std::sync::atomic::AtomicUsize>,
     allowed_initiators: Option<Vec<String>>,
     first_pdu: IscsiPdu,
+    portal: &str,
+    peer: std::net::SocketAddr,
 ) -> ScsiResult<bool> {
-    // Similar to handle_connection but with first PDU already read
-    let local_addr = stream.local_addr().map_err(IscsiError::Io)?;
-    let target_address = match local_addr {
-        std::net::SocketAddr::V4(addr) => addr.ip().to_string(),
-        std::net::SocketAddr::V6(addr) => format!("[{}]", addr.ip()),
-    };
-
-    let mut session = AnySession::new();
+    let mut session =
+        AnySession::new_configured(auth_config, target_name, target_alias, allowed_initiators);
     let mut session_entered = false;
 
-    // Process the first PDU (login request)
-    let (new_session, responses) = session.process_login(&first_pdu, target_name)?;
-    session = new_session;
+    let mut write_stream = stream.try_clone().map_err(IscsiError::Io)?;
+    let nop_write_stream = Arc::new(Mutex::new(stream.try_clone().map_err(IscsiError::Io)?));
 
-    for response in responses {
-        write_pdu(&mut stream, &response)?;
-    }
+    let use_header_digest = Arc::new(AtomicBool::new(false));
+    let use_data_digest = Arc::new(AtomicBool::new(false));
+    let reader_hd = use_header_digest.clone();
+    let reader_dd = use_data_digest.clone();
+    let nop_hd = use_header_digest.clone();
+    let nop_dd = use_data_digest.clone();
 
-    // Continue with normal connection handling
-    loop {
-        if !running.load(Ordering::SeqCst) {
-            break;
-        }
+    let (pdu_tx, pdu_rx) = std::sync::mpsc::channel::<IscsiPdu>();
+    let conn_running = Arc::new(AtomicBool::new(true));
+    let reader_running = conn_running.clone();
+    let nop_writer = nop_write_stream.clone();
 
-        let pdu = match read_pdu(&mut stream) {
-            Ok(pdu) => pdu,
-            Err(e) => {
-                if matches!(e, IscsiError::Io(ref io_e) if io_e.kind() == std::io::ErrorKind::TimedOut) {
+    // First PDU was already consumed for TargetName routing; reader handles the rest.
+    let reader_handle = thread::spawn(move || {
+        while reader_running.load(Ordering::SeqCst) {
+            let pdu = match read_pdu_atomic(&mut stream, &reader_hd, &reader_dd) {
+                Ok(pdu) => pdu,
+                Err(IscsiError::Io(ref e)) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
+                    log::info!("Peer {} closed connection (EOF)", peer);
+                    break;
+                }
+                Err(IscsiError::Io(ref e)) if e.kind() == std::io::ErrorKind::WouldBlock => {
                     continue;
                 }
-                log::debug!("Error reading PDU: {}", e);
+                Err(IscsiError::Io(ref e)) if e.kind() == std::io::ErrorKind::TimedOut => {
+                    continue;
+                }
+                Err(e) => {
+                    log::error!("Error reading PDU from {}: {}", peer, e);
+                    break;
+                }
+            };
+
+            if pdu.opcode == opcode::NOP_OUT {
+                log::debug!("NOP-Out received on shared portal, responding inline");
+                let mut resp = IscsiPdu::new();
+                resp.opcode = 0x20; // NOP-In
+                resp.flags = 0x80; // Final
+                resp.itt = pdu.itt;
+                resp.specific[0..4].copy_from_slice(&pdu.specific[0..4]); // TTT
+                if let Ok(mut writer) = nop_writer.lock() {
+                    let _ = write_pdu_digest(
+                        &mut *writer,
+                        &resp,
+                        nop_hd.load(Ordering::SeqCst),
+                        nop_dd.load(Ordering::SeqCst),
+                    );
+                }
+                continue;
+            }
+
+            if pdu_tx.send(pdu).is_err() {
                 break;
+            }
+        }
+    });
+
+    let mut pending = Some(first_pdu);
+    while running.load(Ordering::SeqCst) {
+        let pdu = if let Some(p) = pending.take() {
+            p
+        } else {
+            match pdu_rx.recv_timeout(Duration::from_secs(300)) {
+                Ok(pdu) => pdu,
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    log::info!("Connection from {} idle timeout (300s), closing", peer);
+                    break;
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                    log::info!(
+                        "Connection from {} reader exited (state={}, full_feature={})",
+                        peer,
+                        session.state_name(),
+                        session_entered
+                    );
+                    break;
+                }
             }
         };
 
-        // Check if shutting down and reject new logins
-        if shutting_down.load(Ordering::SeqCst) && pdu.opcode == opcode::LOGIN_REQUEST {
+        if shutting_down.load(Ordering::SeqCst)
+            && pdu.opcode == opcode::LOGIN_REQUEST
+            && !session_entered
+        {
             let data = SessionData::default();
-            let reject_pdu = data.create_login_reject(pdu.itt, pdu::login_status::INITIATOR_ERROR, 0x01);
-            let _ = write_pdu(&mut stream, &reject_pdu);
+            let reject_pdu =
+                data.create_login_reject(pdu.itt, pdu::login_status::TARGET_ERROR, 0x01);
+            let _ = write_pdu_digest(&mut write_stream, &reject_pdu, false, false);
             break;
         }
 
-        // Check session limit before entering full feature phase
         if !session_entered && pdu.opcode == opcode::LOGIN_REQUEST {
             let current_sessions = active_sessions.load(Ordering::SeqCst);
             if current_sessions >= max_sessions as usize {
-                log::warn!("Session limit reached ({}/{})", current_sessions, max_sessions);
+                log::warn!(
+                    "Session limit reached ({}/{}) — rejecting {}",
+                    current_sessions,
+                    max_sessions,
+                    peer
+                );
                 let data = SessionData::default();
-                let reject_pdu = data.create_login_reject(pdu.itt, pdu::login_status::INITIATOR_ERROR, 0x01);
-                let _ = write_pdu(&mut stream, &reject_pdu);
+                let reject_pdu =
+                    data.create_login_reject(pdu.itt, pdu::login_status::TARGET_ERROR, 0x02);
+                let _ = write_pdu_digest(&mut write_stream, &reject_pdu, false, false);
                 break;
             }
         }
 
-        let responses = handle_pdu_multi_target(
-            &pdu,
-            &mut session,
-            &device,
-            target_name,
-            &target_address,
-            &mut stream,
-            &auth_config,
-            &allowed_initiators,
-            &mut session_entered,
-            &active_sessions,
-        )?;
-
-        for response in responses {
-            write_pdu(&mut stream, &response)?;
+        let rx_level_info = !session.is_full_feature()
+            || !matches!(
+                pdu.opcode,
+                opcode::SCSI_COMMAND | opcode::SCSI_DATA_OUT | opcode::NOP_OUT
+            );
+        if rx_level_info {
+            log::info!(
+                "RX {} from {} (opcode 0x{:02x}, state={}, data_len={})",
+                pdu.opcode_name(),
+                peer,
+                pdu.opcode,
+                session.state_name(),
+                pdu.data.len()
+            );
+        } else {
+            log::debug!(
+                "RX {} from {} (opcode 0x{:02x}, state={}, data_len={})",
+                pdu.opcode_name(),
+                peer,
+                pdu.opcode,
+                session.state_name(),
+                pdu.data.len()
+            );
         }
 
-        // Logout is handled by handle_pdu_multi_target
+        let was_full_feature = session.is_full_feature();
+
+        let responses = if session.is_login_phase() {
+            if pdu.opcode != opcode::LOGIN_REQUEST {
+                log::warn!(
+                    "Invalid opcode 0x{:02x} during login from {}",
+                    pdu.opcode,
+                    peer
+                );
+                if let Some(data) = session.data() {
+                    vec![data.create_invalid_request_during_login_reject(pdu.itt)]
+                } else {
+                    break;
+                }
+            } else {
+                let old = std::mem::replace(&mut session, AnySession::new());
+                let (new_session, responses) = old.process_login(&pdu, target_name)?;
+                session = new_session;
+                responses
+            }
+        } else if session.is_full_feature() {
+            match pdu.opcode {
+                opcode::SCSI_COMMAND => {
+                    handle_scsi_command_boxed(&mut session, &pdu, &device, target_name)?
+                }
+                opcode::SCSI_DATA_OUT => handle_scsi_data_out_boxed(&mut session, &pdu, &device)?,
+                opcode::TEXT_REQUEST => {
+                    handle_text_request(&mut session, &pdu, target_name, portal)?
+                }
+                opcode::NOP_OUT => vec![session.process_nop_out(&pdu)?],
+                opcode::LOGOUT_REQUEST => {
+                    let old = std::mem::replace(&mut session, AnySession::new());
+                    let (new_session, response) = old.process_logout(&pdu)?;
+                    session = new_session;
+                    vec![response]
+                }
+                opcode::TASK_MANAGEMENT_REQUEST => handle_task_management(&mut session, &pdu)?,
+                _ => {
+                    log::warn!("Unhandled opcode from {}: 0x{:02x}", peer, pdu.opcode);
+                    vec![]
+                }
+            }
+        } else {
+            log::info!(
+                "Session from {} ended (state={})",
+                peer,
+                session.state_name()
+            );
+            break;
+        };
+
+        let entering_full_feature = !was_full_feature && session.is_full_feature();
+
+        for resp_pdu in &responses {
+            let tx_info = !session.is_full_feature()
+                || entering_full_feature
+                || !matches!(
+                    resp_pdu.opcode,
+                    opcode::SCSI_DATA_IN | opcode::SCSI_RESPONSE | opcode::R2T | opcode::NOP_IN
+                );
+            if tx_info {
+                log::info!(
+                    "TX {} to {} (opcode 0x{:02x}, data_len={})",
+                    resp_pdu.opcode_name(),
+                    peer,
+                    resp_pdu.opcode,
+                    resp_pdu.data.len()
+                );
+            } else {
+                log::debug!(
+                    "TX {} to {} (opcode 0x{:02x}, data_len={})",
+                    resp_pdu.opcode_name(),
+                    peer,
+                    resp_pdu.opcode,
+                    resp_pdu.data.len()
+                );
+            }
+            write_pdu_digest(
+                &mut write_stream,
+                resp_pdu,
+                use_header_digest.load(Ordering::SeqCst),
+                use_data_digest.load(Ordering::SeqCst),
+            )?;
+        }
+
+        if entering_full_feature {
+            if let Some(data) = session.data() {
+                let hd = matches!(data.params.header_digest, crate::session::DigestType::CRC32C);
+                let dd = matches!(data.params.data_digest, crate::session::DigestType::CRC32C);
+                use_header_digest.store(hd, Ordering::SeqCst);
+                use_data_digest.store(dd, Ordering::SeqCst);
+                log::info!(
+                    "Session from {} entered FullFeaturePhase: initiator={} HeaderDigest={} DataDigest={} MaxConnections={} MaxRecv={} MaxXmit={} MaxBurst={} FirstBurst={} ImmediateData={} InitialR2T={} portal={}",
+                    peer,
+                    data.params.initiator_name,
+                    if hd { "CRC32C" } else { "None" },
+                    if dd { "CRC32C" } else { "None" },
+                    data.params.max_connections,
+                    data.params.max_recv_data_segment_length,
+                    data.params.max_xmit_data_segment_length,
+                    data.params.max_burst_length,
+                    data.params.first_burst_length,
+                    data.params.immediate_data,
+                    data.params.initial_r2t,
+                    portal
+                );
+            }
+            session_entered = true;
+            active_sessions.fetch_add(1, Ordering::SeqCst);
+        }
+
+        if session.is_ended() {
+            log::info!(
+                "Session from {} ending (state={})",
+                peer,
+                session.state_name()
+            );
+            break;
+        }
     }
 
+    conn_running.store(false, Ordering::SeqCst);
+    let _ = write_stream.shutdown(Shutdown::Both);
+    let _ = reader_handle.join();
     Ok(session_entered)
 }
 
-/// Handle a single PDU in multi-target mode
+/// Handle a single PDU in multi-target mode (legacy helper retained for SCSI boxed path tests)
+#[allow(dead_code)]
 fn handle_pdu_multi_target(
     pdu: &IscsiPdu,
     session: &mut AnySession,
     device: &Arc<Mutex<Box<dyn ScsiBlockDevice + Send>>>,
     target_name: &str,
     target_address: &str,
-    stream: &mut TcpStream,
+    _stream: &mut TcpStream,
     _auth_config: &crate::auth::AuthConfig,
     _allowed_initiators: &Option<Vec<String>>,
     session_entered: &mut bool,
@@ -1652,36 +1928,20 @@ fn handle_pdu_multi_target(
 ) -> ScsiResult<Vec<IscsiPdu>> {
     match pdu.opcode {
         opcode::LOGIN_REQUEST => {
-            // Track session entry
             let was_in_full_feature = session.is_full_feature();
-
             let old_session = std::mem::replace(session, AnySession::new());
             let (new_session, responses) = old_session.process_login(pdu, target_name)?;
             *session = new_session;
-
-            // If we just entered full feature phase, increment session count
             if !was_in_full_feature && session.is_full_feature() {
                 *session_entered = true;
                 active_sessions.fetch_add(1, Ordering::SeqCst);
-                stream.set_read_timeout(Some(Duration::from_secs(30))).ok();
-                log::info!("Session entered FullFeaturePhase, increasing timeout");
             }
-
             Ok(responses)
         }
-        opcode::TEXT_REQUEST => {
-            handle_text_request(session, pdu, target_name, target_address)
-        }
-        opcode::SCSI_COMMAND => {
-            handle_scsi_command_boxed(session, pdu, device, target_name)
-        }
-        opcode::SCSI_DATA_OUT => {
-            handle_scsi_data_out_boxed(session, pdu, device)
-        }
-        opcode::NOP_OUT => {
-            let response = session.process_nop_out(pdu)?;
-            Ok(vec![response])
-        }
+        opcode::TEXT_REQUEST => handle_text_request(session, pdu, target_name, target_address),
+        opcode::SCSI_COMMAND => handle_scsi_command_boxed(session, pdu, device, target_name),
+        opcode::SCSI_DATA_OUT => handle_scsi_data_out_boxed(session, pdu, device),
+        opcode::NOP_OUT => Ok(vec![session.process_nop_out(pdu)?]),
         opcode::LOGOUT_REQUEST => {
             let old_session = std::mem::replace(session, AnySession::new());
             let (new_session, response) = old_session.process_logout(pdu)?;
@@ -1863,6 +2123,7 @@ fn handle_write_command_boxed(
         if let Some(pending) = data.pending_writes.get_mut(&cmd.itt) {
             pending.next_r2t_offset = bytes_received + request_len;
             pending.r2t_sn = 1;
+            pending.r2t_pending = true;
         }
 
         let r2t = IscsiPdu::r2t(
@@ -1908,67 +2169,113 @@ fn handle_scsi_data_out_boxed(
     let lba = pending.lba;
     let total_expected = transfer_length * block_size;
 
-    // Copy incoming data into pending buffer
-    let offset = data_out.buffer_offset as usize;
-    let data_len = pdu.data.len();
-    if offset + data_len > pending.buffer.len() {
-        log::error!("Data-Out overflow: offset={}, len={}, buffer={}", offset, data_len, pending.buffer.len());
-        return Ok(vec![]);
-    }
+    // Copy data into buffer at the correct offset (same rules as IscsiTarget path).
+    let start_offset = data_out.buffer_offset as usize;
+    let end_offset = start_offset + data_out.data.len();
 
-    pending.buffer[offset..offset + data_len].copy_from_slice(&pdu.data);
-    pending.bytes_received += data_len as u32;
-
-    log::info!(
-        "Data-Out: ITT=0x{:08x}, offset={}, len={}, bytes_received={}/{}, final={}",
-        data_out.itt, offset, data_len, pending.bytes_received, total_expected, data_out.final_flag
-    );
-
-    // Handle final PDU
-    if data_out.final_flag {
-        if pending.bytes_received != total_expected {
-            log::error!("Incomplete write: received={}, expected={}", pending.bytes_received, total_expected);
-            data.pending_writes.remove(&data_out.itt);
-            let sense = crate::scsi::SenseData::medium_error();
-            return Ok(vec![IscsiPdu::scsi_response(
-                data_out.itt, data.next_stat_sn(), data.exp_cmd_sn, data.max_cmd_sn,
-                pdu::scsi_status::CHECK_CONDITION, 0, 0, Some(&sense.to_bytes()),
-            )]);
-        }
-
-        let pending = data.pending_writes.remove(&data_out.itt).unwrap();
-        let mut device_guard = device.lock().map_err(|_| IscsiError::Scsi("Device lock poisoned".to_string()))?;
-
-        if let Err(e) = device_guard.write(lba, &pending.buffer, block_size) {
-            log::error!("Write failed: {}", e);
-            let sense = crate::scsi::SenseData::medium_error();
-            return Ok(vec![IscsiPdu::scsi_response(
-                data_out.itt, data.next_stat_sn(), data.exp_cmd_sn, data.max_cmd_sn,
-                pdu::scsi_status::CHECK_CONDITION, 0, 0, Some(&sense.to_bytes()),
-            )]);
-        }
-
+    if end_offset > pending.buffer.len() {
+        log::error!(
+            "DATA-OUT offset {} + len {} exceeds buffer size {}",
+            data_out.buffer_offset,
+            data_out.data.len(),
+            pending.buffer.len()
+        );
+        let sense = crate::scsi::SenseData::medium_error();
         return Ok(vec![IscsiPdu::scsi_response(
             data_out.itt, data.next_stat_sn(), data.exp_cmd_sn, data.max_cmd_sn,
-            pdu::scsi_status::GOOD, 0, 0, None,
+            pdu::scsi_status::CHECK_CONDITION, 0, 0, Some(&sense.to_bytes()),
         )]);
     }
 
-    // Not final - send next R2T if needed
-    let pending = data.pending_writes.get_mut(&data_out.itt).unwrap();
-    if pending.bytes_received < pending.expected_data_len {
-        let remaining = pending.expected_data_len - pending.bytes_received;
+    pending.buffer[start_offset..end_offset].copy_from_slice(&data_out.data);
+    if end_offset as u32 > pending.bytes_received {
+        pending.bytes_received = end_offset as u32;
+    }
+
+    log::debug!(
+        "Data-Out: ITT=0x{:08x} off={} len={} F={} recv={}/{} TTT=0x{:08x}",
+        data_out.itt,
+        start_offset,
+        data_out.data.len(),
+        data_out.final_flag,
+        pending.bytes_received,
+        total_expected,
+        data_out.ttt
+    );
+
+    // Complete only on F=1 with full length (don't finish while unsolicited/R2T burst in flight).
+    if data_out.final_flag && pending.bytes_received >= total_expected {
+        let itt = data_out.itt;
+        log::debug!(
+            "Write complete: ITT=0x{:08x} bytes={}/{}",
+            itt,
+            pending.bytes_received,
+            total_expected
+        );
+        let buffer = pending.buffer.clone();
+        pending.completed = true;
+
+        let mut device_guard = device
+            .lock()
+            .map_err(|_| IscsiError::Scsi("Device lock poisoned".to_string()))?;
+        let write_result = device_guard.write(lba, &buffer, block_size);
+        drop(device_guard);
+
+        let (status, sense) = match write_result {
+            Ok(()) => (scsi_status::GOOD, None),
+            Err(e) => {
+                log::error!("Write failed: {}", e);
+                (
+                    pdu::scsi_status::CHECK_CONDITION,
+                    Some(crate::scsi::SenseData::medium_error().to_bytes()),
+                )
+            }
+        };
+
+        return Ok(vec![IscsiPdu::scsi_response(
+            itt,
+            data.next_stat_sn(),
+            data.exp_cmd_sn,
+            data.max_cmd_sn,
+            status,
+            0,
+            0,
+            sense.as_deref(),
+        )]);
+    }
+
+    // F bit set — current burst done; clear outstanding R2T slot.
+    if data_out.final_flag {
+        pending.r2t_pending = false;
+    }
+
+    // Only issue the next R2T after F=1 and when MaxOutstandingR2T allows it.
+    // Never send R2T on intermediate (F=0) Data-Out PDUs within a burst.
+    if data_out.final_flag && !pending.r2t_pending && pending.bytes_received < total_expected {
         let max_burst = data.params.max_burst_length;
+        let remaining = total_expected - pending.bytes_received;
         let request_len = remaining.min(max_burst);
+        let current_offset = pending.bytes_received;
+        let r2t_sn = pending.r2t_sn;
+        let ttt = pending.ttt;
+        let lun = pending.lun;
+        let itt = data_out.itt;
+
+        pending.next_r2t_offset += request_len;
+        pending.r2t_sn += 1;
+        pending.r2t_pending = true;
 
         let r2t = IscsiPdu::r2t(
-            pending.lun, data_out.itt, pending.ttt, data.stat_sn,
-            data.exp_cmd_sn, data.max_cmd_sn,
-            pending.r2t_sn, pending.bytes_received, request_len,
+            lun,
+            itt,
+            ttt,
+            data.stat_sn,
+            data.exp_cmd_sn,
+            data.max_cmd_sn,
+            r2t_sn,
+            current_offset,
+            request_len,
         );
-
-        pending.r2t_sn += 1;
-        pending.next_r2t_offset = pending.bytes_received + request_len;
 
         return Ok(vec![r2t]);
     }
@@ -1979,6 +2286,7 @@ fn handle_scsi_data_out_boxed(
 /// Builder for configuring a multi-target iSCSI server
 pub struct IscsiServerBuilder {
     bind_addr: Option<String>,
+    advertise_addr: Option<String>,
     targets: std::collections::HashMap<String, (Box<dyn ScsiBlockDevice + Send>, String, crate::auth::AuthConfig, Option<Vec<String>>)>,
     max_connections: Option<u32>,
     max_sessions: Option<u32>,
@@ -1988,6 +2296,7 @@ impl IscsiServerBuilder {
     fn new() -> Self {
         Self {
             bind_addr: None,
+            advertise_addr: None,
             targets: std::collections::HashMap::new(),
             max_connections: None,
             max_sessions: None,
@@ -1996,6 +2305,12 @@ impl IscsiServerBuilder {
 
     pub fn bind_addr(mut self, addr: &str) -> Self {
         self.bind_addr = Some(addr.to_string());
+        self
+    }
+
+    /// Host:port returned in SendTargets for every IQN on this portal.
+    pub fn advertise_addr(mut self, addr: &str) -> Self {
+        self.advertise_addr = Some(addr.to_string());
         self
     }
 
@@ -2059,6 +2374,7 @@ impl IscsiServerBuilder {
 
         Ok(IscsiServer {
             bind_addr,
+            advertise_addr: self.advertise_addr,
             targets: Arc::new(Mutex::new(targets_map)),
             running: Arc::new(AtomicBool::new(false)),
             shutting_down: Arc::new(AtomicBool::new(false)),

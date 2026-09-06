@@ -1,6 +1,6 @@
-//! Smoke client: login + write/read against per-volume portals.
+//! Smoke client: login + write/read against an iscsi-s3 portal.
 //!
-//! Volume N listens on base_port + N (see iscsi-s3 main).
+//! Multi-volume targets share one portal; pass host:port (default IQN in code).
 //!
 //! ```bash
 //! cargo run --example smoke_client -- 127.0.0.1:3260

@@ -4,9 +4,9 @@
 
 ```text
 iSCSI initiator
-    │  TCP (one port per volume)
+    │  TCP (shared portal)
     ▼
-IscsiTarget (vendored iscsi-target)
+IscsiServer (vendored iscsi-target, IQN routing)
     │  SCSI READ/WRITE → ScsiBlockDevice
     ▼
 S3BlockDevice
@@ -21,24 +21,18 @@ S3Store  →  {prefix}/chunks/{index:016x}
 
 S3 I/O runs on a dedicated Tokio runtime. iSCSI connection threads call into the store via a spawn + channel pattern so they never nest `block_on` on the runtime.
 
-## One port per volume
+## One portal, many IQNs
 
-Earlier multi-IQN-on-one-port (`IscsiServer`) paths were abandoned for digest interoperability. The binary starts **one `IscsiTarget` thread per volume**:
+All volumes share `bind` (for example `0.0.0.0:3260`). Discovery lists every IQN with the same `TargetAddress` (from `advertise`, or the socket `local_addr`). Login includes `TargetName=<iqn>`; the server routes to that volume’s device.
 
-| Volume index | Listen port |
-|-------------:|-------------|
-| 0 | `bind_port` |
-| 1 | `bind_port + 1` |
-| … | … |
-
-Discovery and login are therefore **per portal**.
+Earlier builds used one TCP port per volume to work around digest bugs in the multi-target path. Digests on `IscsiServer` are fixed; the shared portal is the default again.
 
 ## Advertise vs bind
 
 - `bind` — where the process listens (`0.0.0.0:3260` is typical in containers).
 - `advertise` — `TargetAddress` in SendTargets / related text. Required when `local_addr` is not client-reachable (Docker publish, NAT).
 
-Implementation: `IscsiTargetBuilder::advertise_addr` in the vendored crate.
+Implementation: `advertise_addr` on `IscsiServer` / `IscsiTarget` builders in the vendored crate.
 
 ## Chunking and meta
 

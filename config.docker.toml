@@ -1,6 +1,6 @@
 # Docker Compose / container defaults (MinIO service hostname)
 bind = "0.0.0.0:3260"
-# Reachable address for SendTargets (host publishes 3260/3261).
+# Reachable address for SendTargets (host publishes 3260).
 advertise = "127.0.0.1"
 
 [s3]

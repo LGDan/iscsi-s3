@@ -38,7 +38,6 @@ services:
         condition: service_completed_successfully
     ports:
       - "3260:3260"
-      - "3261:3261"
     volumes:
       #- ./config.docker.toml:/etc/iscsi-s3/config.toml:ro
       - ./config.integration.toml:/etc/iscsi-s3/config.toml:ro
@@ -48,7 +47,7 @@ services:
       RUST_LOG: info,iscsi_s3=debug,iscsi_target=debug
     restart: unless-stopped
 
-  # One-shot smoke against volume 0 (port 3260) and volume 1 (port 3261)
+  # One-shot smoke against the shared portal (default IQN on :3260)
   # smoke:
   #   build: .
   #   entrypoint: ["smoke_client"]

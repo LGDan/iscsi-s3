@@ -106,7 +106,7 @@ pub struct Cli {
     #[arg(short, long)]
     pub config: Option<PathBuf>,
 
-    /// Listen address (host:port) for the shared multi-target portal.
+    /// Listen address (host:port) for the shared multi-IQN portal.
     #[arg(long)]
     pub bind: Option<String>,
 

@@ -73,7 +73,7 @@ bind = "0.0.0.0:3260"
 advertise = "192.168.88.15"   # address initiators will dial
 ```
 
-2. Publish/firewall TCP `3260` (and `3261+` if multi-volume).
+2. Publish/firewall TCP `3260` (shared portal for all IQNs).
 3. Prefer a trusted network or VPN — default builds do not enable CHAP.
 4. On the initiator:
 
@@ -118,16 +118,14 @@ Compose ports:
 ```yaml
 ports:
   - "3260:3260"
-  - "3261:3261"
 ```
 
-Discover **each** portal, or login with explicit ports:
+One discovery lists both IQNs:
 
 ```bash
 sudo iscsiadm -m discovery -t sendtargets -p 127.0.0.1:3260
-sudo iscsiadm -m discovery -t sendtargets -p 127.0.0.1:3261
 sudo iscsiadm -m node -T iqn.2026-09.local.iscsi-s3:disk0 -p 127.0.0.1:3260 --login
-sudo iscsiadm -m node -T iqn.2026-09.local.iscsi-s3:disk1 -p 127.0.0.1:3261 --login
+sudo iscsiadm -m node -T iqn.2026-09.local.iscsi-s3:disk1 -p 127.0.0.1:3260 --login
 ```
 
 ---
@@ -152,7 +150,7 @@ update-grub   # ensure ESP is mounted at /boot/efi, not /boot
 
 Mount order on UEFI when repairing: root → (optional separate `/boot`) → **ESP at `/boot/efi`**.
 
-Each volume is LUN **0** on its own IQN/port. There is no separate “boot LUN” setting in iscsi-s3 config.
+Each volume is LUN **0** on its own IQN (same portal). There is no separate “boot LUN” setting in iscsi-s3 config.
 
 ---
 

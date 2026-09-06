@@ -9,9 +9,8 @@ use iscsi_s3::config::{Cli, Config};
 use iscsi_s3::device::S3BlockDevice;
 use iscsi_s3::store::BlockStore;
 use iscsi_s3::volume::{build_s3_client, open_volume};
-use iscsi_target::IscsiTarget;
+use iscsi_target::IscsiServer;
 use std::sync::Arc;
-use std::thread;
 use tracing::{error, info};
 use tracing_subscriber::EnvFilter;
 
@@ -31,24 +30,15 @@ fn main() {
     }
 }
 
-fn volume_bind(base: &str, index: usize) -> Result<String, String> {
-    let (host, port) = split_host_port(base)?;
-    let port = port
-        .checked_add(u16::try_from(index).map_err(|_| "too many volumes".to_string())?)
-        .ok_or_else(|| "port overflow".to_string())?;
-    Ok(format_host_port(&host, port))
-}
-
-/// Resolve the per-volume address returned in SendTargets.
+/// Resolve the portal advertised in SendTargets.
 ///
-/// `advertise` may be a host (`127.0.0.1`, `host.docker.internal`) or a full
-/// `host:port` base (same port-offset rules as `bind`).
-fn volume_advertise(advertise: &str, bind: &str, index: usize) -> Result<String, String> {
+/// `advertise` may be a host (`127.0.0.1`) or full `host:port`. Host-only
+/// reuses the port from `bind`.
+fn resolve_advertise(advertise: &str, bind: &str) -> Result<String, String> {
     if looks_like_host_port(advertise) {
-        volume_bind(advertise, index)
+        Ok(advertise.to_string())
     } else {
-        let bound = volume_bind(bind, index)?;
-        let (_, port) = split_host_port(&bound)?;
+        let (_, port) = split_host_port(bind)?;
         Ok(format_host_port(advertise, port))
     }
 }
@@ -83,7 +73,6 @@ fn split_host_port(addr: &str) -> Result<(String, u16), String> {
 }
 
 fn format_host_port(host: &str, port: u16) -> String {
-    // Bracket bare IPv6 literals (contain ':' but are not already [bracketed]).
     if host.contains(':') && !host.starts_with('[') {
         format!("[{host}]:{port}")
     } else {
@@ -103,94 +92,67 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     let client = runtime.block_on(build_s3_client(&cfg))?;
     let cache = ChunkCache::new(cfg.cache.max_bytes);
 
-    let mut joins = Vec::new();
+    let advertise = cfg
+        .advertise
+        .as_deref()
+        .map(|a| resolve_advertise(a, &cfg.bind))
+        .transpose()?;
+
+    let mut builder = IscsiServer::builder().bind_addr(&cfg.bind);
+    if let Some(ref addr) = advertise {
+        builder = builder.advertise_addr(addr);
+    }
 
     for (index, vol) in cfg.volumes.iter().enumerate() {
         let opened = open_volume(&client, handle.clone(), Arc::clone(&cache), &cfg, index, vol)?;
-        let bind = volume_bind(&cfg.bind, index)?;
-        let advertise = cfg
-            .advertise
-            .as_deref()
-            .map(|a| volume_advertise(a, &cfg.bind, index))
-            .transpose()?;
         info!(
             name = %opened.name,
             iqn = %opened.iqn,
-            bind = %bind,
+            bind = %cfg.bind,
             advertise = advertise.as_deref().unwrap_or("(socket local_addr)"),
             capacity = opened.store.capacity(),
             "volume ready"
         );
 
         let device = S3BlockDevice::new(opened.store, &opened.name);
-        let iqn = opened.iqn.clone();
-        let name = opened.name.clone();
-
-        let join = thread::Builder::new()
-            .name(format!("iscsi-{name}"))
-            .spawn(move || {
-                let mut builder = IscsiTarget::builder()
-                    .bind_addr(&bind)
-                    .target_name(&iqn)
-                    .target_alias(&name);
-                if let Some(ref addr) = advertise {
-                    builder = builder.advertise_addr(addr);
-                }
-                let target = match builder.build(device) {
-                    Ok(t) => t,
-                    Err(e) => {
-                        error!(volume = %name, error = %e, "failed to build iSCSI target");
-                        return;
-                    }
-                };
-                info!(volume = %name, bind = %bind, iqn = %iqn, "iSCSI target listening");
-                if let Err(e) = target.run() {
-                    error!(volume = %name, error = %e, "iSCSI target exited with error");
-                }
-            })?;
-        joins.push(join);
+        builder = builder.add_target(
+            opened.iqn,
+            Box::new(device),
+            Some(opened.name),
+        );
     }
 
+    let server = builder.build().map_err(|e| e.to_string())?;
     info!(
-        volumes = joins.len(),
-        "started per-volume targets (port = base + index); digest-safe IscsiTarget path"
+        bind = %cfg.bind,
+        advertise = advertise.as_deref().unwrap_or("(socket local_addr)"),
+        volumes = cfg.volumes.len(),
+        "starting shared-portal IscsiServer (one TCP port, many IQNs)"
     );
 
-    // Keep the tokio runtime alive for S3 I/O while target threads run.
+    // Keep the tokio runtime alive for S3 I/O while the target runs.
     let _runtime_guard = runtime;
-    for j in joins {
-        let _ = j.join();
-    }
+    server.run().map_err(|e| e.to_string())?;
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{volume_advertise, volume_bind};
+    use super::resolve_advertise;
 
     #[test]
-    fn volume_bind_offsets_port() {
-        assert_eq!(volume_bind("0.0.0.0:3260", 0).unwrap(), "0.0.0.0:3260");
-        assert_eq!(volume_bind("0.0.0.0:3260", 1).unwrap(), "0.0.0.0:3261");
-    }
-
-    #[test]
-    fn advertise_host_only_uses_bind_ports() {
+    fn advertise_host_only_uses_bind_port() {
         assert_eq!(
-            volume_advertise("127.0.0.1", "0.0.0.0:3260", 0).unwrap(),
+            resolve_advertise("127.0.0.1", "0.0.0.0:3260").unwrap(),
             "127.0.0.1:3260"
         );
-        assert_eq!(
-            volume_advertise("127.0.0.1", "0.0.0.0:3260", 1).unwrap(),
-            "127.0.0.1:3261"
-        );
     }
 
     #[test]
-    fn advertise_host_port_offsets_like_bind() {
+    fn advertise_full_host_port_unchanged() {
         assert_eq!(
-            volume_advertise("10.0.0.5:4000", "0.0.0.0:3260", 1).unwrap(),
-            "10.0.0.5:4001"
+            resolve_advertise("10.0.0.5:4000", "0.0.0.0:3260").unwrap(),
+            "10.0.0.5:4000"
         );
     }
 }

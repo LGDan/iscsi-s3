@@ -41,8 +41,8 @@ capacity = "10GiB"
 
 | Key | Description |
 |-----|-------------|
-| `bind` | Base listen address `host:port`. Volume index *i* uses `port + i`. |
-| `advertise` | Portal returned in SendTargets (`host` or `host:port`). Host-only reuses each volume’s listen port; `host:port` uses the same port-offset rules as `bind`. Unset → socket `local_addr` (often a container IP behind Docker). |
+| `bind` | Listen address `host:port` for the shared portal (all IQNs). |
+| `advertise` | Portal returned in SendTargets (`host` or `host:port`). Host-only reuses the port from `bind`. Unset → socket `local_addr` (often a container IP behind Docker). |
 | `s3.bucket` | Required. Bucket name. |
 | `s3.region` | AWS region (also used with custom endpoints). |
 | `s3.endpoint` | Optional custom endpoint (MinIO, Ceph RGW, …). Omit for AWS. |
@@ -58,16 +58,11 @@ capacity = "10GiB"
 
 Sizes accept human strings (`64KiB`, `4MiB`, `10GiB`) or raw byte integers.
 
-## Port mapping
+## Port / portal
 
-With `bind = "0.0.0.0:3260"` and two volumes:
+All volumes share one listen address (`bind`). A single discovery against that portal returns every IQN with the same `TargetAddress`.
 
-| Index | Volume | Listen |
-|------:|--------|--------|
-| 0 | first `[[volumes]]` | `:3260` |
-| 1 | second | `:3261` |
-
-Docker must publish every used port. Discovery is **per portal** (run `iscsiadm` discovery on each port, or login with an explicit `-p host:port`).
+Docker must publish that port (default `3260`).
 
 ## Environment
 

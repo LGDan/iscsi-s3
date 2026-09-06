@@ -28,7 +28,7 @@ cargo run --release -- --config config.toml --log info,iscsi_s3=debug,iscsi_targ
 
 ```text
 src/
-  main.rs          # binary: bind/advertise, per-volume IscsiTarget threads
+  main.rs          # binary: shared-portal IscsiServer, volume open
   lib.rs           # crate root
   config.rs        # figment + clap
   volume.rs        # open volume, S3 client, meta grow rules
