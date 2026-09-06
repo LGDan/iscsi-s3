@@ -61,6 +61,8 @@ Set `advertise` in the mounted config to an address clients can reach (for Docke
 ./scripts/serve-docs-site.sh 8080   # custom port
 ```
 
+GitHub Actions builds and publishes the site to **GitHub Pages** on pushes to `main`/`master` that touch `docs/` or `mkdocs.yml` (workflow: `.github/workflows/docs.yml`, using the MkDocs Material **Docker** image). Enable **Settings → Pages → Source: GitHub Actions** once per repo.
+
 ## Limitations
 
 - Discovery sessions are unauthenticated; enable CHAP for normal login when portals are not fully trusted.

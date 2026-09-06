@@ -28,6 +28,8 @@ run_mkdocs() {
     --user "$DOCKER_USER" \
     -e HOME=/tmp \
     -e XDG_CACHE_HOME=/tmp/.cache \
+    -e SITE_URL="${SITE_URL:-}" \
+    -e REPO_URL="${REPO_URL:-}" \
     -v "$ROOT:/docs:rw" \
     -w /docs \
     "$@"
@@ -38,7 +40,11 @@ case "$CMD" in
     echo "==> building docs with $IMAGE → $SITE_DIR/"
     # Ensure output dir exists and is writable by the container user.
     mkdir -p "$ROOT/$SITE_DIR"
-    run_mkdocs "$IMAGE" build --clean -d "/docs/$SITE_DIR"
+    EXTRA=(build --clean -d "/docs/$SITE_DIR")
+    if [[ "${STRICT:-0}" == "1" ]]; then
+      EXTRA+=(--strict)
+    fi
+    run_mkdocs "$IMAGE" "${EXTRA[@]}"
     echo "==> done: $ROOT/$SITE_DIR/index.html"
     ;;
   serve)
@@ -65,7 +71,10 @@ Usage: $(basename "$0") [build|serve|pull|help]
 Environment:
   MKDOCS_IMAGE   Image to use (default: ${IMAGE})
   SITE_DIR       Output directory under the repo (default: site)
-  PORT           Host port for serve (default: 8000)
+  PORT           Host port for serve (default 8000)
+  SITE_URL       Optional MkDocs site_url (!ENV in mkdocs.yml)
+  REPO_URL       Optional MkDocs repo_url (!ENV in mkdocs.yml)
+  STRICT         Set to 1 to pass --strict to mkdocs build
 EOF
     ;;
   *)

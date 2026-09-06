@@ -1,0 +1,68 @@
+# Build MkDocs (via Docker) and publish to GitHub Pages.
+#
+# One-time repo setup (Settings → Pages):
+#   Source: GitHub Actions
+#
+# After the first successful run, the site is at:
+#   https://<owner>.github.io/<repo>/
+#
+# Build uses the same squidfunk/mkdocs-material container as
+# ./scripts/build-docs-site.sh (no host Python/MkDocs install).
+
+name: Docs
+
+on:
+  push:
+    branches:
+      - main
+      - master
+    paths:
+      - "docs/**"
+      - "mkdocs.yml"
+      - ".github/workflows/docs.yml"
+      - "scripts/build-docs-site.sh"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure site URLs
+        run: |
+          owner="${{ github.repository_owner }}"
+          repo="${{ github.event.repository.name }}"
+          {
+            echo "SITE_URL=https://${owner}.github.io/${repo}/"
+            echo "REPO_URL=https://github.com/${{ github.repository }}"
+          } >> "$GITHUB_ENV"
+
+      - name: Build docs site (Docker)
+        run: ./scripts/build-docs-site.sh build
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: site
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4

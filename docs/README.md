@@ -36,6 +36,8 @@
 
 Uses a temporary `squidfunk/mkdocs-material` container (no local Python required).
 
+CI publishes the same site to **GitHub Pages** via [`.github/workflows/docs.yml`](../.github/workflows/docs.yml) (Docker build, no host Python). Set **Settings → Pages → Source** to **GitHub Actions** after the first merge.
+
 ## Related files in the repo
 
 | Path | Role |

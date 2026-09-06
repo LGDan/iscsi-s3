@@ -1,7 +1,8 @@
 site_name: iscsi-s3
 site_description: Userspace iSCSI target backed by S3 chunk objects
-site_url: ""
-repo_url: https://github.com/dan/iscsi-http
+# Overridden in CI via SITE_URL (GitHub Pages).
+site_url: !ENV [SITE_URL, ""]
+repo_url: !ENV [REPO_URL, "https://github.com/LGDan/iscsi-s3"]
 edit_uri: ""
 
 docs_dir: docs
@@ -63,7 +64,9 @@ nav:
       - Configuration: users/configuration.md
       - MPIO setup: users/mpio.md
       - Admin control: users/admin-ctl.md
+      - Volume snapshots: users/snapshots.md
       - Tutorials: users/tutorials.md
+      - Install OS on iSCSI: users/iscsi-os-install.md
   - Developers:
       - Getting started: developers/getting-started.md
       - Architecture: developers/architecture.md
