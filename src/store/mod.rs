@@ -4,7 +4,9 @@ mod memory;
 mod s3;
 
 pub use memory::MemoryStore;
-pub use s3::{plan_capacity, S3ChunkStore, S3StoreConfig, VolumeMeta};
+pub use s3::{
+    list_prefix_stats, plan_capacity, PrefixObjectStats, S3ChunkStore, S3StoreConfig, VolumeMeta,
+};
 
 use thiserror::Error;
 

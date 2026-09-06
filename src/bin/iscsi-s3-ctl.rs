@@ -36,6 +36,11 @@ enum Commands {
         #[command(subcommand)]
         action: CacheCmd,
     },
+    /// Per-volume S3 / config queries
+    Volume {
+        #[command(subcommand)]
+        action: VolumeCmd,
+    },
     /// Re-read config file; apply safe fields only (cache.max_bytes, stats labels)
     Reload,
 }
@@ -51,6 +56,18 @@ enum CacheCmd {
     Set {
         #[arg(long)]
         max_bytes: String,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum VolumeCmd {
+    /// List configured volumes (name, IQN, capacity, prefix, …)
+    List,
+    /// List objects under the volume S3 prefix (chunk count, bytes used, …)
+    #[command(name = "s3-stats", alias = "usage")]
+    S3Stats {
+        /// Volume name or IQN
+        volume: String,
     },
 }
 
@@ -79,7 +96,11 @@ fn main() -> ExitCode {
             let ok = resp.get("ok").and_then(|v| v.as_bool()).unwrap_or(false);
             match cli.format {
                 OutputFormat::Json => {
-                    println!("{}", serde_json::to_string_pretty(&resp).unwrap_or_else(|_| resp.to_string()));
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&resp)
+                            .unwrap_or_else(|_| resp.to_string())
+                    );
                 }
                 OutputFormat::Text => {
                     if let Err(e) = print_text(&cli.command, &resp) {
@@ -121,6 +142,12 @@ fn build_request(cmd: &Commands) -> Result<serde_json::Value, String> {
                 json!({ "op": "cache.set", "max_bytes": n })
             }
         },
+        Commands::Volume { action } => match action {
+            VolumeCmd::List => json!({ "op": "volume.list" }),
+            VolumeCmd::S3Stats { volume } => {
+                json!({ "op": "volume.s3_stats", "volume": volume })
+            }
+        },
     })
 }
 
@@ -144,6 +171,16 @@ fn print_text(cmd: &Commands, resp: &serde_json::Value) -> Result<(), String> {
         Commands::Cache { .. } => {
             println!("cache updated");
             print_cache(&data);
+        }
+        Commands::Volume {
+            action: VolumeCmd::List,
+        } => {
+            print_volume_list(&data);
+        }
+        Commands::Volume {
+            action: VolumeCmd::S3Stats { .. },
+        } => {
+            print_volume_s3_stats(&data);
         }
         Commands::Reload => {
             println!("reload complete");
@@ -220,11 +257,15 @@ fn print_stats(data: &serde_json::Value) {
         println!("volumes:");
         for v in vols {
             println!(
-                "  - {} ({}) capacity={} auth={}",
+                "  - {} ({}) capacity={} auth={} prefix={} compression={}",
                 v.get("name").and_then(|x| x.as_str()).unwrap_or("?"),
                 v.get("iqn").and_then(|x| x.as_str()).unwrap_or("?"),
                 v.get("capacity").and_then(|x| x.as_u64()).unwrap_or(0),
-                v.get("auth").and_then(|x| x.as_str()).unwrap_or("?")
+                v.get("auth").and_then(|x| x.as_str()).unwrap_or("?"),
+                v.get("prefix").and_then(|x| x.as_str()).unwrap_or("?"),
+                v.get("compression")
+                    .and_then(|x| x.as_str())
+                    .unwrap_or("none")
             );
         }
     }
@@ -241,4 +282,68 @@ fn print_cache(c: &serde_json::Value) {
         c.get("used_bytes").and_then(|v| v.as_u64()).unwrap_or(0),
         c.get("entries").and_then(|v| v.as_u64()).unwrap_or(0)
     );
+}
+
+fn print_volume_list(data: &serde_json::Value) {
+    let count = data.get("count").and_then(|v| v.as_u64()).unwrap_or(0);
+    println!("volumes: {count}");
+    if let Some(vols) = data.get("volumes").and_then(|v| v.as_array()) {
+        for v in vols {
+            println!(
+                "  - {}  iqn={}  capacity={}  prefix={}  compression={}  auth={}",
+                v.get("name").and_then(|x| x.as_str()).unwrap_or("?"),
+                v.get("iqn").and_then(|x| x.as_str()).unwrap_or("?"),
+                v.get("capacity").and_then(|x| x.as_u64()).unwrap_or(0),
+                v.get("prefix").and_then(|x| x.as_str()).unwrap_or("?"),
+                v.get("compression")
+                    .and_then(|x| x.as_str())
+                    .unwrap_or("none"),
+                v.get("auth").and_then(|x| x.as_str()).unwrap_or("?")
+            );
+        }
+    }
+}
+
+fn print_volume_s3_stats(data: &serde_json::Value) {
+    println!(
+        "volume: {} ({})",
+        data.get("volume").and_then(|v| v.as_str()).unwrap_or("?"),
+        data.get("iqn").and_then(|v| v.as_str()).unwrap_or("?")
+    );
+    println!(
+        "s3: s3://{}/{}",
+        data.get("bucket").and_then(|v| v.as_str()).unwrap_or("?"),
+        data.get("prefix").and_then(|v| v.as_str()).unwrap_or("?")
+    );
+    println!(
+        "logical_capacity_bytes: {}  chunk_size: {}  compression: {}",
+        data.get("logical_capacity_bytes")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0),
+        data.get("chunk_size").and_then(|v| v.as_u64()).unwrap_or(0),
+        data.get("compression")
+            .and_then(|v| v.as_str())
+            .unwrap_or("none")
+    );
+    if let Some(o) = data.get("objects") {
+        println!(
+            "objects: total={} chunks={} meta={} other={}",
+            o.get("total").and_then(|v| v.as_u64()).unwrap_or(0),
+            o.get("chunks").and_then(|v| v.as_u64()).unwrap_or(0),
+            o.get("meta").and_then(|v| v.as_u64()).unwrap_or(0),
+            o.get("other").and_then(|v| v.as_u64()).unwrap_or(0)
+        );
+    }
+    if let Some(b) = data.get("bytes") {
+        println!(
+            "bytes: total={} chunks={} meta={} other={}",
+            b.get("total").and_then(|v| v.as_u64()).unwrap_or(0),
+            b.get("chunks").and_then(|v| v.as_u64()).unwrap_or(0),
+            b.get("meta").and_then(|v| v.as_u64()).unwrap_or(0),
+            b.get("other").and_then(|v| v.as_u64()).unwrap_or(0)
+        );
+    }
+    if let Some(n) = data.get("note").and_then(|v| v.as_str()) {
+        println!("note: {n}");
+    }
 }

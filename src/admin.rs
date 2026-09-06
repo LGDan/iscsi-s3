@@ -20,6 +20,9 @@ pub struct VolumeSummary {
     pub iqn: String,
     pub capacity: u64,
     pub auth: String,
+    pub prefix: String,
+    pub chunk_size: u64,
+    pub compression: String,
 }
 
 pub struct AdminState {
@@ -27,6 +30,8 @@ pub struct AdminState {
     pub started: Instant,
     pub cache: Arc<ChunkCache>,
     pub server: Arc<IscsiServer>,
+    pub s3_client: aws_sdk_s3::Client,
+    pub runtime: tokio::runtime::Handle,
     /// Labels / config snapshot updated on safe reload.
     pub snapshot: Mutex<AdminSnapshot>,
 }
@@ -49,6 +54,9 @@ struct AdminRequest {
     op: String,
     #[serde(default)]
     max_bytes: Option<serde_json::Value>,
+    /// Volume name or IQN for volume-scoped ops.
+    #[serde(default)]
+    volume: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -150,8 +158,78 @@ fn dispatch(state: &AdminState, req: &AdminRequest) -> serde_json::Value {
             Ok(v) => ok(v),
             Err(e) => err(e),
         },
+        "volume.s3_stats" => match volume_s3_stats(state, req.volume.as_deref()) {
+            Ok(v) => ok(v),
+            Err(e) => err(e),
+        },
+        "volume.list" => ok(volume_list_json(state)),
         other => err(format!("unknown op: {other}")),
     }
+}
+
+fn volume_list_json(state: &AdminState) -> serde_json::Value {
+    let snap = state.snapshot.lock();
+    json!({
+        "volumes": snap.volumes,
+        "count": snap.volumes.len(),
+    })
+}
+
+fn find_volume<'a>(
+    volumes: &'a [VolumeSummary],
+    selector: Option<&str>,
+) -> Result<&'a VolumeSummary, String> {
+    let Some(sel) = selector.map(str::trim).filter(|s| !s.is_empty()) else {
+        return Err("volume name or IQN is required".into());
+    };
+    volumes
+        .iter()
+        .find(|v| v.name == sel || v.iqn == sel)
+        .ok_or_else(|| format!("unknown volume {sel:?}"))
+}
+
+fn volume_s3_stats(
+    state: &AdminState,
+    selector: Option<&str>,
+) -> Result<serde_json::Value, String> {
+    let snap = state.snapshot.lock().clone();
+    let vol = find_volume(&snap.volumes, selector)?.clone();
+    let bucket = snap
+        .s3_bucket
+        .clone()
+        .ok_or_else(|| "s3.bucket is not configured".to_string())?;
+    let stats = crate::store::list_prefix_stats(
+        state.s3_client.clone(),
+        state.runtime.clone(),
+        bucket.clone(),
+        &vol.prefix,
+    )
+    .map_err(|e| e.to_string())?;
+
+    let logical_chunk_bytes = stats.chunk_count.saturating_mul(vol.chunk_size);
+    Ok(json!({
+        "volume": vol.name,
+        "iqn": vol.iqn,
+        "bucket": bucket,
+        "prefix": vol.prefix,
+        "logical_capacity_bytes": vol.capacity,
+        "chunk_size": vol.chunk_size,
+        "compression": vol.compression,
+        "objects": {
+            "total": stats.object_count,
+            "chunks": stats.chunk_count,
+            "meta": stats.meta_count,
+            "other": stats.other_count,
+        },
+        "bytes": {
+            "total": stats.total_bytes,
+            "chunks": stats.chunk_bytes,
+            "meta": stats.meta_bytes,
+            "other": stats.other_bytes,
+        },
+        "logical_chunk_bytes_if_full": logical_chunk_bytes,
+        "note": "bytes are on-disk object sizes (compressed when compression != none); sparse unwritten chunks have no object",
+    }))
 }
 
 fn ok(data: serde_json::Value) -> serde_json::Value {
@@ -350,17 +428,16 @@ fn volumes_structurally_changed(current: &AdminSnapshot, new_cfg: &Config) -> bo
         return true;
     }
     for (cur, vol) in current.volumes.iter().zip(new_cfg.volumes.iter()) {
-        if cur.name != vol.name || cur.iqn != vol.iqn {
-            return true;
-        }
-        // capacity grow is still restart for ctl v1 (store already open).
-        if cur.capacity != vol.capacity {
+        if cur.name != vol.name
+            || cur.iqn != vol.iqn
+            || cur.prefix != vol.prefix.trim_matches('/')
+            || cur.capacity != vol.capacity
+            || cur.chunk_size != vol.chunk_size
+            || cur.compression != vol.compression.as_str()
+        {
             return true;
         }
     }
-    // prefix/geometry not in VolumeSummary — if names/iqns match assume same set;
-    // reject if any volume block_size/chunk_size/prefix would need compare.
-    // Include prefix in summary next — for now compare lengths only + iqn/name/capacity.
     false
 }
 
@@ -398,6 +475,9 @@ mod tests {
                 iqn: "iqn.test:disk0".into(),
                 capacity: 1024,
                 auth: "none".into(),
+                prefix: "disks/disk0".into(),
+                chunk_size: 4096,
+                compression: "none".into(),
             }],
             cache_max_bytes: 1024,
             s3_bucket: None,

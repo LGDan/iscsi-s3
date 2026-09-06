@@ -152,6 +152,9 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             iqn: opened.iqn.clone(),
             capacity,
             auth: auth.mode.as_str().to_string(),
+            prefix: vol.prefix.trim_matches('/').to_string(),
+            chunk_size: vol.chunk_size,
+            compression: vol.compression.as_str().to_string(),
         });
         info!(
             name = %opened.name,
@@ -211,6 +214,8 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             started: Instant::now(),
             cache: Arc::clone(&cache),
             server: Arc::clone(&server),
+            s3_client: client.clone(),
+            runtime: handle.clone(),
             snapshot: Mutex::new(AdminSnapshot {
                 bind: cfg.bind.clone(),
                 portals: portals.clone(),

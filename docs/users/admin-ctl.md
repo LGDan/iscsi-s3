@@ -36,6 +36,8 @@ Docker: install both `iscsi-s3` and `iscsi-s3-ctl` in the image. Mount/share the
 | `cache disable` | Set `max_bytes = 0` and **clear** all cached chunks |
 | `cache enable [--max-bytes 256MiB]` | Enable cache (cold); default size is last non-zero budget |
 | `cache set --max-bytes …` | Set budget (`0` disables + clears) |
+| `volume list` | List configured volumes (name, IQN, capacity, prefix, compression, auth) |
+| `volume s3-stats <name\|iqn>` | List S3 objects under the volume prefix: chunk/meta counts and bytes |
 | `reload` | Re-read the startup `--config` file + env; apply **safe** fields only |
 
 Global flags: `--socket PATH`, `--format text|json`.
@@ -64,6 +66,17 @@ Example cache disable:
 ```bash
 iscsi-s3-ctl cache disable --format json
 ```
+
+S3 usage for a volume (paginated `ListObjectsV2` on the volume prefix):
+
+```bash
+iscsi-s3-ctl volume s3-stats disk0
+iscsi-s3-ctl volume s3-stats disk0 --format json
+# alias:
+iscsi-s3-ctl volume usage iqn.2026-09.local.iscsi-s3:disk0
+```
+
+Reports object counts (`chunks`, `meta`, `other`) and summed object sizes. Unwritten sparse regions have no chunk object. With compression enabled, `bytes.chunks` is compressed on-disk size.
 
 ## Safe cache toggle
 
@@ -97,6 +110,8 @@ One JSON object per connection, newline-terminated request and response:
 {"op":"cache.disable"}
 {"op":"cache.enable","max_bytes":268435456}
 {"op":"cache.set","max_bytes":0}
+{"op":"volume.list"}
+{"op":"volume.s3_stats","volume":"disk0"}
 {"op":"reload"}
 ```
 

@@ -18,6 +18,89 @@ use tokio::runtime::Handle;
 const META_VERSION: u32 = 1;
 const LOCK_STRIPES: usize = 64;
 
+fn run_on_runtime<F, T>(runtime: &Handle, fut: F, timeout: Duration) -> Result<T, StoreError>
+where
+    F: std::future::Future<Output = Result<T, StoreError>> + Send + 'static,
+    T: Send + 'static,
+{
+    let (tx, rx) = mpsc::channel();
+    runtime.spawn(async move {
+        let _ = tx.send(fut.await);
+    });
+    rx.recv_timeout(timeout)
+        .map_err(|_| StoreError::S3("timed out waiting for S3 operation".into()))?
+}
+
+/// Aggregated object counts/sizes under a volume prefix.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PrefixObjectStats {
+    pub object_count: u64,
+    pub chunk_count: u64,
+    pub meta_count: u64,
+    pub other_count: u64,
+    pub total_bytes: u64,
+    pub chunk_bytes: u64,
+    pub meta_bytes: u64,
+    pub other_bytes: u64,
+}
+
+/// List all objects under `{prefix}/` and sum sizes (paginated `ListObjectsV2`).
+pub fn list_prefix_stats(
+    client: Client,
+    runtime: Handle,
+    bucket: String,
+    prefix: &str,
+) -> Result<PrefixObjectStats, StoreError> {
+    let prefix = prefix.trim_matches('/').to_string();
+    let list_prefix = format!("{prefix}/");
+    run_on_runtime(
+        &runtime,
+        async move {
+            let mut stats = PrefixObjectStats::default();
+            let mut token: Option<String> = None;
+            loop {
+                let mut req = client
+                    .list_objects_v2()
+                    .bucket(&bucket)
+                    .prefix(&list_prefix);
+                if let Some(t) = token.take() {
+                    req = req.continuation_token(t);
+                }
+                let out = req
+                    .send()
+                    .await
+                    .map_err(|e| StoreError::S3(e.to_string()))?;
+                for obj in out.contents() {
+                    let key = obj.key().unwrap_or("");
+                    let size = obj.size().unwrap_or(0) as u64;
+                    stats.object_count += 1;
+                    stats.total_bytes += size;
+                    if key.ends_with("/meta.json") || key == format!("{prefix}/meta.json") {
+                        stats.meta_count += 1;
+                        stats.meta_bytes += size;
+                    } else if key.contains("/chunks/") {
+                        stats.chunk_count += 1;
+                        stats.chunk_bytes += size;
+                    } else {
+                        stats.other_count += 1;
+                        stats.other_bytes += size;
+                    }
+                }
+                if out.is_truncated().unwrap_or(false) {
+                    token = out.next_continuation_token().map(|s| s.to_string());
+                    if token.is_none() {
+                        break;
+                    }
+                } else {
+                    break;
+                }
+            }
+            Ok(stats)
+        },
+        Duration::from_secs(300),
+    )
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct VolumeMeta {
     pub version: u32,
@@ -98,12 +181,7 @@ impl S3ChunkStore {
         F: std::future::Future<Output = Result<T, StoreError>> + Send + 'static,
         T: Send + 'static,
     {
-        let (tx, rx) = mpsc::channel();
-        self.runtime.spawn(async move {
-            let _ = tx.send(fut.await);
-        });
-        rx.recv_timeout(Duration::from_secs(60))
-            .map_err(|_| StoreError::S3("timed out waiting for S3 operation".into()))?
+        run_on_runtime(&self.runtime, fut, Duration::from_secs(60))
     }
 
     fn resolve_meta(&self, config_capacity: u64) -> Result<u64, StoreError> {
