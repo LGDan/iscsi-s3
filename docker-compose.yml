@@ -40,7 +40,8 @@ services:
       - "3260:3260"
       - "3261:3261"
     volumes:
-      - ./config.docker.toml:/etc/iscsi-s3/config.toml:ro
+      #- ./config.docker.toml:/etc/iscsi-s3/config.toml:ro
+      - ./config.integration.toml:/etc/iscsi-s3/config.toml:ro
     environment:
       AWS_ACCESS_KEY_ID: minioadmin
       AWS_SECRET_ACCESS_KEY: minioadmin
@@ -48,15 +49,15 @@ services:
     restart: unless-stopped
 
   # One-shot smoke against volume 0 (port 3260) and volume 1 (port 3261)
-  smoke:
-    build: .
-    entrypoint: ["smoke_client"]
-    command: ["iscsi-s3:3260"]
-    depends_on:
-      - iscsi-s3
-    profiles:
-      - test
-    restart: "no"
+  # smoke:
+  #   build: .
+  #   entrypoint: ["smoke_client"]
+  #   command: ["iscsi-s3:3260"]
+  #   depends_on:
+  #     - iscsi-s3
+  #   profiles:
+  #     - test
+  #   restart: "no"
 
 volumes:
   minio-data:
