@@ -103,6 +103,15 @@ sudo iscsiadm -m node -T "$IQN" -p ${HOST}:3260 \
 sudo iscsiadm -m node -T "$IQN" -p ${HOST}:3260 --login
 ```
 
+Or with `iscsi-s3-ctl` (sets the same node keys, then logs in):
+
+```bash
+export ISCSI_S3_CHAP_USERNAME=iscsiuser
+export ISCSI_S3_CHAP_PASSWORD='change-me'
+sudo -E iscsi-s3-ctl volume connect disk0
+sudo iscsi-s3-ctl volume device disk0
+```
+
 MPIO peers must use the **same** auth settings on every instance.
 
 ## Port / portal

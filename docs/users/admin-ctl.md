@@ -45,8 +45,9 @@ Docker: install both `iscsi-s3` and `iscsi-s3-ctl` in the image. Mount/share the
 | `volume grow <name\|iqn> --capacity SIZE` | Grow-only capacity update (meta.json + live READ CAPACITY) |
 | `volume copy <from> <to> [--force]` | 1:1 sparse copy; **overwrites** destination (prompts unless `--force`) |
 | `volume wipe <name\|iqn> [--force]` | Delete all chunk objects; keeps `meta.json` (prompts unless `--force`) |
-| `volume connect <name\|iqn> [--portal HOST:PORT]` | Local helper: `iscsiadm` discovery + login |
+| `volume connect <name\|iqn> [--portal …] [--username …] [--password …]` | Local helper: `iscsiadm` discovery + optional CHAP + login |
 | `volume disconnect <name\|iqn> [--portal HOST:PORT]` | Local helper: `iscsiadm` logout |
+| `volume device <name\|iqn> [--wait SECS]` | Print local `/dev` path(s) for a connected volume |
 | `reload` | Re-read the startup `--config` file + env; apply **safe** fields only |
 
 Global flags: `--socket PATH`, `--format text|json`.
@@ -182,14 +183,31 @@ These run **on the machine where you invoke `iscsi-s3-ctl`**, not inside the dae
 sudo iscsi-s3-ctl volume connect disk0
 sudo iscsi-s3-ctl volume connect disk0 --portal 127.0.0.1:3260
 
+# CHAP (required when the volume auth is chap / mutual-chap)
+sudo iscsi-s3-ctl volume connect disk0 \
+  --username iscsiuser --password 'change-me'
+# Prefer env so the secret is not on the command line:
+export ISCSI_S3_CHAP_USERNAME=iscsiuser
+export ISCSI_S3_CHAP_PASSWORD='change-me'
+sudo -E iscsi-s3-ctl volume connect disk0
+# Mutual CHAP also needs:
+#   --mutual-username / --mutual-password
+#   or ISCSI_S3_CHAP_MUTUAL_USERNAME / ISCSI_S3_CHAP_MUTUAL_PASSWORD
+
 # Logout all sessions for that IQN (or one portal)
 sudo iscsi-s3-ctl volume disconnect disk0
 sudo iscsi-s3-ctl volume disconnect disk0 --portal 127.0.0.1:3260
+
+# After connect: resolve the local block device (prefers multipath map)
+sudo iscsi-s3-ctl volume device disk0
+# DEV=$(sudo iscsi-s3-ctl volume device disk0 | awk '/^device:/{print $2}')
 ```
 
 Portal selection: `--portal` if set; else daemon `portals` / `advertise` from `stats`; else a non-wildcard `bind`. If the daemon only binds `0.0.0.0:…` with no advertise/portals, pass `--portal` explicitly.
 
-CHAP-enabled volumes: the helper does not set node secrets; configure CHAP on the node first if login fails (see [configuration](configuration.md#chap-authentication)).
+CHAP: connect configures `node.session.auth.*` on each portal before `--login`. Credentials come from flags or `ISCSI_S3_CHAP_*` env vars (never from the daemon admin socket). See also [configuration](configuration.md#chap-authentication).
+
+`volume device` scans `/dev/disk/by-path/*-iscsi-{iqn}-lun-*`, resolves to `/dev/sd*`, and prefers a multipath `/dev/mapper/…` when the block device is a path under dm-multipath. Waits up to `--wait` seconds (default 5) for udev.
 
 ## Safe cache toggle
 

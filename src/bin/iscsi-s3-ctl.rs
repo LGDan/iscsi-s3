@@ -3,11 +3,14 @@
 use clap::{Parser, Subcommand, ValueEnum};
 use iscsi_s3::admin::{call_admin, call_admin_export, call_admin_write_image};
 use iscsi_s3::config::{parse_byte_size, DEFAULT_ADMIN_SOCKET};
+use iscsi_s3::identity::{naa_from_iqn, serial_from_iqn};
 use serde_json::json;
 use std::fs::File;
 use std::io::{self, IsTerminal, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode, Stdio};
+use std::thread;
+use std::time::{Duration, Instant};
 
 #[derive(Debug, Clone, ValueEnum)]
 enum OutputFormat {
@@ -131,6 +134,18 @@ enum VolumeCmd {
         /// Portal host:port (default: daemon portals / advertise)
         #[arg(long, short)]
         portal: Option<String>,
+        /// CHAP username (or ISCSI_S3_CHAP_USERNAME)
+        #[arg(long)]
+        username: Option<String>,
+        /// CHAP password (or ISCSI_S3_CHAP_PASSWORD / ISCSI_S3_CHAP_SECRET)
+        #[arg(long)]
+        password: Option<String>,
+        /// Mutual CHAP username (or ISCSI_S3_CHAP_MUTUAL_USERNAME)
+        #[arg(long)]
+        mutual_username: Option<String>,
+        /// Mutual CHAP password (or ISCSI_S3_CHAP_MUTUAL_PASSWORD)
+        #[arg(long)]
+        mutual_password: Option<String>,
     },
     /// Logout via open-iscsi (`iscsiadm`) on this host
     Disconnect {
@@ -139,6 +154,14 @@ enum VolumeCmd {
         /// Portal host:port (default: logout all sessions for the IQN)
         #[arg(long, short)]
         portal: Option<String>,
+    },
+    /// Show local block device path(s) for a connected volume
+    Device {
+        /// Volume name or IQN
+        volume: String,
+        /// Seconds to wait for udev/by-path to appear (default 5)
+        #[arg(long, default_value = "5")]
+        wait: u64,
     },
 }
 
@@ -176,10 +199,24 @@ fn main() -> ExitCode {
     }
 
     if let Commands::Volume {
-        action: VolumeCmd::Connect { volume, portal },
+        action:
+            VolumeCmd::Connect {
+                volume,
+                portal,
+                username,
+                password,
+                mutual_username,
+                mutual_password,
+            },
     } = &cli.command
     {
-        return match run_volume_connect(&sock, volume, portal.as_deref()) {
+        let chap = ChapCredentials::resolve(
+            username.as_deref(),
+            password.as_deref(),
+            mutual_username.as_deref(),
+            mutual_password.as_deref(),
+        );
+        return match run_volume_connect(&sock, volume, portal.as_deref(), chap) {
             Ok(()) => ExitCode::SUCCESS,
             Err(e) => {
                 eprintln!("error: {e}");
@@ -193,6 +230,19 @@ fn main() -> ExitCode {
     } = &cli.command
     {
         return match run_volume_disconnect(&sock, volume, portal.as_deref()) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => {
+                eprintln!("error: {e}");
+                ExitCode::from(1)
+            }
+        };
+    }
+
+    if let Commands::Volume {
+        action: VolumeCmd::Device { volume, wait },
+    } = &cli.command
+    {
+        return match run_volume_device(&sock, volume, *wait) {
             Ok(()) => ExitCode::SUCCESS,
             Err(e) => {
                 eprintln!("error: {e}");
@@ -414,8 +464,10 @@ fn build_request(cmd: &Commands) -> Result<serde_json::Value, String> {
                 }
                 req
             }
-            VolumeCmd::Connect { .. } | VolumeCmd::Disconnect { .. } => {
-                unreachable!("connect/disconnect are local iscsiadm helpers")
+            VolumeCmd::Connect { .. }
+            | VolumeCmd::Disconnect { .. }
+            | VolumeCmd::Device { .. } => {
+                unreachable!("connect/disconnect/device are local helpers")
             }
         },
     })
@@ -486,7 +538,10 @@ fn print_text(cmd: &Commands, resp: &serde_json::Value) -> Result<(), String> {
             print_volume_sessions(&data);
         }
         Commands::Volume {
-            action: VolumeCmd::Connect { .. } | VolumeCmd::Disconnect { .. },
+            action:
+                VolumeCmd::Connect { .. }
+                | VolumeCmd::Disconnect { .. }
+                | VolumeCmd::Device { .. },
         } => {}
         Commands::Reload => {
             println!("reload complete");
@@ -981,22 +1036,189 @@ fn run_iscsiadm(args: &[&str]) -> Result<(), String> {
     }
 }
 
+#[derive(Debug, Clone, Default)]
+struct ChapCredentials {
+    username: Option<String>,
+    password: Option<String>,
+    mutual_username: Option<String>,
+    mutual_password: Option<String>,
+}
+
+impl ChapCredentials {
+    fn resolve(
+        username: Option<&str>,
+        password: Option<&str>,
+        mutual_username: Option<&str>,
+        mutual_password: Option<&str>,
+    ) -> Self {
+        fn env_or(cli: Option<&str>, keys: &[&str]) -> Option<String> {
+            if let Some(v) = cli.map(str::trim).filter(|s| !s.is_empty()) {
+                return Some(v.to_string());
+            }
+            for k in keys {
+                if let Ok(v) = std::env::var(k) {
+                    let v = v.trim();
+                    if !v.is_empty() {
+                        return Some(v.to_string());
+                    }
+                }
+            }
+            None
+        }
+        Self {
+            username: env_or(username, &["ISCSI_S3_CHAP_USERNAME"]),
+            password: env_or(
+                password,
+                &["ISCSI_S3_CHAP_PASSWORD", "ISCSI_S3_CHAP_SECRET"],
+            ),
+            mutual_username: env_or(mutual_username, &["ISCSI_S3_CHAP_MUTUAL_USERNAME"]),
+            mutual_password: env_or(
+                mutual_password,
+                &["ISCSI_S3_CHAP_MUTUAL_PASSWORD", "ISCSI_S3_CHAP_MUTUAL_SECRET"],
+            ),
+        }
+    }
+
+    fn has_one_way(&self) -> bool {
+        self.username.is_some() && self.password.is_some()
+    }
+
+    fn has_mutual(&self) -> bool {
+        self.mutual_username.is_some() && self.mutual_password.is_some()
+    }
+
+    fn validate_for_volume_auth(&self, auth: &str) -> Result<(), String> {
+        match auth {
+            "none" => Ok(()),
+            "chap" => {
+                if self.has_one_way() {
+                    Ok(())
+                } else {
+                    Err(
+                        "volume requires CHAP: pass --username/--password or set \
+                         ISCSI_S3_CHAP_USERNAME and ISCSI_S3_CHAP_PASSWORD"
+                            .into(),
+                    )
+                }
+            }
+            "mutual-chap" => {
+                if self.has_one_way() && self.has_mutual() {
+                    Ok(())
+                } else {
+                    Err(
+                        "volume requires mutual CHAP: pass --username/--password and \
+                         --mutual-username/--mutual-password (or matching ISCSI_S3_CHAP_* env vars)"
+                            .into(),
+                    )
+                }
+            }
+            other => {
+                // Unknown label from older daemons — require one-way if not none.
+                if other != "none" && !self.has_one_way() {
+                    Err(format!(
+                        "volume auth={other}: pass --username/--password or ISCSI_S3_CHAP_* env"
+                    ))
+                } else {
+                    Ok(())
+                }
+            }
+        }
+    }
+}
+
+fn configure_node_chap(iqn: &str, portal: &str, chap: &ChapCredentials) -> Result<(), String> {
+    if !chap.has_one_way() {
+        return Ok(());
+    }
+    let user = chap.username.as_deref().unwrap();
+    let pass = chap.password.as_deref().unwrap();
+    run_iscsiadm(&[
+        "-m",
+        "node",
+        "-T",
+        iqn,
+        "-p",
+        portal,
+        "--op",
+        "update",
+        "-n",
+        "node.session.auth.authmethod",
+        "-v",
+        "CHAP",
+    ])?;
+    run_iscsiadm(&[
+        "-m",
+        "node",
+        "-T",
+        iqn,
+        "-p",
+        portal,
+        "--op",
+        "update",
+        "-n",
+        "node.session.auth.username",
+        "-v",
+        user,
+    ])?;
+    run_iscsiadm(&[
+        "-m",
+        "node",
+        "-T",
+        iqn,
+        "-p",
+        portal,
+        "--op",
+        "update",
+        "-n",
+        "node.session.auth.password",
+        "-v",
+        pass,
+    ])?;
+    if chap.has_mutual() {
+        let mu = chap.mutual_username.as_deref().unwrap();
+        let mp = chap.mutual_password.as_deref().unwrap();
+        run_iscsiadm(&[
+            "-m",
+            "node",
+            "-T",
+            iqn,
+            "-p",
+            portal,
+            "--op",
+            "update",
+            "-n",
+            "node.session.auth.username_in",
+            "-v",
+            mu,
+        ])?;
+        run_iscsiadm(&[
+            "-m",
+            "node",
+            "-T",
+            iqn,
+            "-p",
+            portal,
+            "--op",
+            "update",
+            "-n",
+            "node.session.auth.password_in",
+            "-v",
+            mp,
+        ])?;
+    }
+    Ok(())
+}
+
 fn run_volume_connect(
     sock: &PathBuf,
     volume: &str,
     portal_override: Option<&str>,
+    chap: ChapCredentials,
 ) -> Result<(), String> {
     let (data, info) = fetch_volume_attach(sock, volume)?;
     let bind = data.get("bind").and_then(|v| v.as_str());
     let portals = resolve_portals(&info, portal_override, bind)?;
-
-    if info.auth != "none" {
-        eprintln!(
-            "note: volume {} uses auth={}; configure CHAP on the node if login fails \
-             (see docs/users/configuration.md)",
-            info.name, info.auth
-        );
-    }
+    chap.validate_for_volume_auth(&info.auth)?;
 
     // Discover via the first portal (SendTargets returns the rest).
     run_iscsiadm(&[
@@ -1009,6 +1231,7 @@ fn run_volume_connect(
     ])?;
 
     for portal in &portals {
+        configure_node_chap(&info.iqn, portal, &chap)?;
         run_iscsiadm(&["-m", "node", "-T", &info.iqn, "-p", portal, "--login"])?;
     }
 
@@ -1045,4 +1268,111 @@ fn run_volume_disconnect(
         println!("disconnected {} ({}) (all portals)", info.name, info.iqn);
     }
     Ok(())
+}
+
+#[derive(Debug)]
+struct LocalDevice {
+    by_path: PathBuf,
+    block: PathBuf,
+    mapper: Option<PathBuf>,
+}
+
+fn run_volume_device(sock: &PathBuf, volume: &str, wait_secs: u64) -> Result<(), String> {
+    let (_data, info) = fetch_volume_attach(sock, volume)?;
+    let serial = serial_from_iqn(&info.iqn);
+    let naa = naa_from_iqn(&info.iqn);
+    let naa_hex: String = naa.iter().map(|b| format!("{b:02x}")).collect();
+
+    let deadline = Instant::now() + Duration::from_secs(wait_secs.max(1));
+    let devices = loop {
+        let found = find_local_devices(&info.iqn)?;
+        if !found.is_empty() || Instant::now() >= deadline {
+            break found;
+        }
+        thread::sleep(Duration::from_millis(200));
+    };
+
+    if devices.is_empty() {
+        return Err(format!(
+            "no local device for {} ({}); is the volume connected? \
+             looked under /dev/disk/by-path/*-iscsi-*-lun-*",
+            info.name, info.iqn
+        ));
+    }
+
+    println!("volume: {} ({})", info.name, info.iqn);
+    println!("serial: {serial}");
+    println!("naa: 0x{naa_hex}");
+    for (i, d) in devices.iter().enumerate() {
+        println!("path[{i}]: {}", d.by_path.display());
+        println!("  block: {}", d.block.display());
+        if let Some(ref m) = d.mapper {
+            println!("  multipath: {}", m.display());
+        }
+    }
+    // Prefer multipath map when present, else first block device.
+    let preferred = devices
+        .iter()
+        .find_map(|d| d.mapper.as_ref())
+        .unwrap_or(&devices[0].block);
+    println!("device: {}", preferred.display());
+    Ok(())
+}
+
+fn find_local_devices(iqn: &str) -> Result<Vec<LocalDevice>, String> {
+    let dir = Path::new("/dev/disk/by-path");
+    if !dir.is_dir() {
+        return Ok(Vec::new());
+    }
+    let mut out = Vec::new();
+    let entries = std::fs::read_dir(dir).map_err(|e| format!("read {}: {e}", dir.display()))?;
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        // ip-…-iscsi-{iqn}-lun-N
+        if !name.contains("-iscsi-") || !name.contains(iqn) || !name.contains("-lun-") {
+            continue;
+        }
+        let by_path = entry.path();
+        let block = std::fs::canonicalize(&by_path)
+            .map_err(|e| format!("resolve {}: {e}", by_path.display()))?;
+        let mapper = multipath_mapper_for_block(&block);
+        out.push(LocalDevice {
+            by_path,
+            block,
+            mapper,
+        });
+    }
+    out.sort_by(|a, b| a.by_path.cmp(&b.by_path));
+    out.dedup_by(|a, b| a.block == b.block);
+    Ok(out)
+}
+
+fn multipath_mapper_for_block(block: &Path) -> Option<PathBuf> {
+    // /sys/block/sdX/holders/dm-Y → /dev/mapper/* with dm-uuid-mpath-*
+    let name = block.file_name()?.to_str()?;
+    let holders = Path::new("/sys/block").join(name).join("holders");
+    let entries = std::fs::read_dir(holders).ok()?;
+    for entry in entries.flatten() {
+        let dm = entry.file_name();
+        let dm = dm.to_string_lossy();
+        if !dm.starts_with("dm-") {
+            continue;
+        }
+        let uuid_path = Path::new("/sys/block").join(dm.as_ref()).join("dm/uuid");
+        let uuid = std::fs::read_to_string(uuid_path).ok()?;
+        if !uuid.starts_with("mpath-") {
+            continue;
+        }
+        // Prefer /dev/mapper name from /sys/block/dm-Y/dm/name
+        let name_path = Path::new("/sys/block").join(dm.as_ref()).join("dm/name");
+        if let Ok(map_name) = std::fs::read_to_string(name_path) {
+            let map_name = map_name.trim();
+            if !map_name.is_empty() {
+                return Some(PathBuf::from(format!("/dev/mapper/{map_name}")));
+            }
+        }
+        return Some(PathBuf::from(format!("/dev/{dm}")));
+    }
+    None
 }
