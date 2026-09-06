@@ -7,7 +7,7 @@ use serde_json::json;
 use std::fs::File;
 use std::io::{self, IsTerminal, Write};
 use std::path::PathBuf;
-use std::process::ExitCode;
+use std::process::{Command, ExitCode, Stdio};
 
 #[derive(Debug, Clone, ValueEnum)]
 enum OutputFormat {
@@ -90,6 +90,30 @@ enum VolumeCmd {
         #[arg(long, short = 'f')]
         force: bool,
     },
+    /// Delete all chunk objects on a volume (keeps meta.json)
+    Wipe {
+        /// Volume name or IQN
+        volume: String,
+        /// Skip interactive confirmation
+        #[arg(long, short = 'f')]
+        force: bool,
+    },
+    /// Discover + login via open-iscsi (`iscsiadm`) on this host
+    Connect {
+        /// Volume name or IQN
+        volume: String,
+        /// Portal host:port (default: daemon portals / advertise)
+        #[arg(long, short)]
+        portal: Option<String>,
+    },
+    /// Logout via open-iscsi (`iscsiadm`) on this host
+    Disconnect {
+        /// Volume name or IQN
+        volume: String,
+        /// Portal host:port (default: logout all sessions for the IQN)
+        #[arg(long, short)]
+        portal: Option<String>,
+    },
 }
 
 fn socket_path(cli: &CtlCli) -> PathBuf {
@@ -114,10 +138,58 @@ fn main() -> ExitCode {
     }
 
     if let Commands::Volume {
+        action: VolumeCmd::Connect { volume, portal },
+    } = &cli.command
+    {
+        return match run_volume_connect(&sock, volume, portal.as_deref()) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => {
+                eprintln!("error: {e}");
+                ExitCode::from(1)
+            }
+        };
+    }
+
+    if let Commands::Volume {
+        action: VolumeCmd::Disconnect { volume, portal },
+    } = &cli.command
+    {
+        return match run_volume_disconnect(&sock, volume, portal.as_deref()) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => {
+                eprintln!("error: {e}");
+                ExitCode::from(1)
+            }
+        };
+    }
+
+    if let Commands::Volume {
         action: VolumeCmd::Copy { from, to, force },
     } = &cli.command
     {
-        if let Err(e) = confirm_volume_copy(from, to, *force) {
+        if let Err(e) = confirm_yes(
+            &format!(
+                "This will OVERWRITE volume '{to}' with a 1:1 copy of '{from}'."
+            ),
+            *force,
+            "volume copy",
+        ) {
+            eprintln!("error: {e}");
+            return ExitCode::from(2);
+        }
+    }
+
+    if let Commands::Volume {
+        action: VolumeCmd::Wipe { volume, force },
+    } = &cli.command
+    {
+        if let Err(e) = confirm_yes(
+            &format!(
+                "This will WIPE all chunk data on volume '{volume}' (meta.json is kept)."
+            ),
+            *force,
+            "volume wipe",
+        ) {
             eprintln!("error: {e}");
             return ExitCode::from(2);
         }
@@ -139,18 +211,16 @@ fn main() -> ExitCode {
     }
 }
 
-fn confirm_volume_copy(from: &str, to: &str, force: bool) -> Result<(), String> {
+fn confirm_yes(message: &str, force: bool, action: &str) -> Result<(), String> {
     if force {
         return Ok(());
     }
     if !io::stdin().is_terminal() {
-        return Err(
-            "refusing destructive volume copy without --force when stdin is not a TTY".into(),
-        );
+        return Err(format!(
+            "refusing destructive {action} without --force when stdin is not a TTY"
+        ));
     }
-    eprint!(
-        "This will OVERWRITE volume '{to}' with a 1:1 copy of '{from}'.\nType 'yes' to continue: "
-    );
+    eprint!("{message}\nType 'yes' to continue: ");
     let _ = io::stderr().flush();
     let mut line = String::new();
     io::stdin()
@@ -246,6 +316,12 @@ fn build_request(cmd: &Commands) -> Result<serde_json::Value, String> {
             VolumeCmd::Copy { from, to, .. } => {
                 json!({ "op": "volume.copy", "volume": from, "to": to })
             }
+            VolumeCmd::Wipe { volume, .. } => {
+                json!({ "op": "volume.wipe", "volume": volume })
+            }
+            VolumeCmd::Connect { .. } | VolumeCmd::Disconnect { .. } => {
+                unreachable!("connect/disconnect are local iscsiadm helpers")
+            }
         },
     })
 }
@@ -291,6 +367,14 @@ fn print_text(cmd: &Commands, resp: &serde_json::Value) -> Result<(), String> {
         } => {
             print_volume_copy(&data);
         }
+        Commands::Volume {
+            action: VolumeCmd::Wipe { .. },
+        } => {
+            print_volume_wipe(&data);
+        }
+        Commands::Volume {
+            action: VolumeCmd::Connect { .. } | VolumeCmd::Disconnect { .. },
+        } => {}
         Commands::Reload => {
             println!("reload complete");
             if let Some(arr) = data.get("applied").and_then(|a| a.as_array()) {
@@ -517,4 +601,211 @@ fn print_volume_copy(data: &serde_json::Value) {
     if let Some(n) = data.get("note").and_then(|v| v.as_str()) {
         println!("note: {n}");
     }
+}
+
+fn print_volume_wipe(data: &serde_json::Value) {
+    println!(
+        "wiped volume {} ({})",
+        data.get("volume").and_then(|v| v.as_str()).unwrap_or("?"),
+        data.get("iqn").and_then(|v| v.as_str()).unwrap_or("?")
+    );
+    println!(
+        "chunks_deleted={}",
+        data.get("chunks_deleted")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0)
+    );
+    if let Some(n) = data.get("note").and_then(|v| v.as_str()) {
+        println!("note: {n}");
+    }
+}
+
+struct VolumeAttachInfo {
+    name: String,
+    iqn: String,
+    auth: String,
+    portals: Vec<String>,
+}
+
+fn lookup_volume_attach_from_stats(
+    data: &serde_json::Value,
+    volume: &str,
+) -> Result<VolumeAttachInfo, String> {
+    let vols = data
+        .get("volumes")
+        .and_then(|v| v.as_array())
+        .ok_or_else(|| "stats response missing volumes".to_string())?;
+    let vol = vols
+        .iter()
+        .find(|v| {
+            v.get("name").and_then(|x| x.as_str()) == Some(volume)
+                || v.get("iqn").and_then(|x| x.as_str()) == Some(volume)
+        })
+        .ok_or_else(|| format!("unknown volume {volume:?}"))?;
+
+    let portals_from_stats: Vec<String> = data
+        .get("portals")
+        .and_then(|p| p.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|x| x.as_str().map(|s| s.to_string()))
+                .filter(|s| !s.is_empty())
+                .collect()
+        })
+        .unwrap_or_default();
+
+    Ok(VolumeAttachInfo {
+        name: vol
+            .get("name")
+            .and_then(|x| x.as_str())
+            .unwrap_or(volume)
+            .to_string(),
+        iqn: vol
+            .get("iqn")
+            .and_then(|x| x.as_str())
+            .ok_or_else(|| "volume missing iqn".to_string())?
+            .to_string(),
+        auth: vol
+            .get("auth")
+            .and_then(|x| x.as_str())
+            .unwrap_or("none")
+            .to_string(),
+        portals: portals_from_stats,
+    })
+}
+
+fn fetch_volume_attach(sock: &PathBuf, volume: &str) -> Result<(serde_json::Value, VolumeAttachInfo), String> {
+    let resp = call_admin(sock, &json!({ "op": "stats" }))?;
+    if resp.get("ok") != Some(&json!(true)) {
+        return Err(resp
+            .get("error")
+            .and_then(|e| e.as_str())
+            .unwrap_or("stats failed")
+            .to_string());
+    }
+    let data = resp.get("data").cloned().unwrap_or(json!({}));
+    let info = lookup_volume_attach_from_stats(&data, volume)?;
+    Ok((data, info))
+}
+
+fn resolve_portals(
+    info: &VolumeAttachInfo,
+    portal_override: Option<&str>,
+    bind: Option<&str>,
+) -> Result<Vec<String>, String> {
+    if let Some(p) = portal_override {
+        return Ok(vec![normalize_portal(p)]);
+    }
+    if !info.portals.is_empty() {
+        return Ok(info.portals.iter().map(|p| normalize_portal(p)).collect());
+    }
+    if let Some(bind) = bind {
+        if !is_wildcard_bind(bind) {
+            return Ok(vec![normalize_portal(bind)]);
+        }
+    }
+    Err(
+        "no usable portal: set portals/advertise on the daemon, or pass --portal HOST:PORT".into(),
+    )
+}
+
+fn normalize_portal(portal: &str) -> String {
+    let p = portal.trim();
+    if p.contains(':') {
+        p.to_string()
+    } else {
+        format!("{p}:3260")
+    }
+}
+
+fn is_wildcard_bind(bind: &str) -> bool {
+    let host = bind.rsplit_once(':').map(|(h, _)| h).unwrap_or(bind);
+    let host = host.trim_matches(|c| c == '[' || c == ']');
+    host == "0.0.0.0" || host == "::" || host == "*"
+}
+
+fn run_iscsiadm(args: &[&str]) -> Result<(), String> {
+    eprintln!("+ iscsiadm {}", args.join(" "));
+    let status = Command::new("iscsiadm")
+        .args(args)
+        .stdin(Stdio::null())
+        .status()
+        .map_err(|e| {
+            format!("failed to run iscsiadm ({e}); is open-iscsi installed and in PATH?")
+        })?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!(
+            "iscsiadm {} failed with {}",
+            args.join(" "),
+            status
+        ))
+    }
+}
+
+fn run_volume_connect(
+    sock: &PathBuf,
+    volume: &str,
+    portal_override: Option<&str>,
+) -> Result<(), String> {
+    let (data, info) = fetch_volume_attach(sock, volume)?;
+    let bind = data.get("bind").and_then(|v| v.as_str());
+    let portals = resolve_portals(&info, portal_override, bind)?;
+
+    if info.auth != "none" {
+        eprintln!(
+            "note: volume {} uses auth={}; configure CHAP on the node if login fails \
+             (see docs/users/configuration.md)",
+            info.name, info.auth
+        );
+    }
+
+    // Discover via the first portal (SendTargets returns the rest).
+    run_iscsiadm(&[
+        "-m",
+        "discovery",
+        "-t",
+        "sendtargets",
+        "-p",
+        &portals[0],
+    ])?;
+
+    for portal in &portals {
+        run_iscsiadm(&["-m", "node", "-T", &info.iqn, "-p", portal, "--login"])?;
+    }
+
+    println!(
+        "connected {} ({}) via {}",
+        info.name,
+        info.iqn,
+        portals.join(", ")
+    );
+    Ok(())
+}
+
+fn run_volume_disconnect(
+    sock: &PathBuf,
+    volume: &str,
+    portal_override: Option<&str>,
+) -> Result<(), String> {
+    let (_data, info) = fetch_volume_attach(sock, volume)?;
+    if let Some(portal) = portal_override {
+        let portal = normalize_portal(portal);
+        run_iscsiadm(&[
+            "-m",
+            "node",
+            "-T",
+            &info.iqn,
+            "-p",
+            &portal,
+            "--logout",
+        ])?;
+        println!("disconnected {} ({}) from {portal}", info.name, info.iqn);
+    } else {
+        // Logout every session for this target IQN.
+        run_iscsiadm(&["-m", "node", "-T", &info.iqn, "-u"])?;
+        println!("disconnected {} ({}) (all portals)", info.name, info.iqn);
+    }
+    Ok(())
 }

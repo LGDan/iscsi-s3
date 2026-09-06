@@ -90,6 +90,11 @@ pub struct CopyVolumeResult {
     pub bytes_copied: u64,
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct WipeVolumeResult {
+    pub chunks_deleted: u64,
+}
+
 #[derive(Debug, Serialize)]
 pub struct RejectedChange {
     pub field: String,
@@ -370,6 +375,10 @@ fn dispatch(state: &AdminState, req: &AdminRequest) -> serde_json::Value {
             Ok(v) => ok(v),
             Err(e) => err(e),
         },
+        "volume.wipe" => match volume_wipe(state, req.volume.as_deref()) {
+            Ok(v) => ok(v),
+            Err(e) => err(e),
+        },
         other => err(format!("unknown op: {other}")),
     }
 }
@@ -576,6 +585,45 @@ pub fn copy_volume(
         chunks_deleted,
         bytes_copied,
     })
+}
+
+fn volume_wipe(state: &AdminState, selector: Option<&str>) -> Result<serde_json::Value, String> {
+    let snap = state.snapshot.lock().clone();
+    let vol = find_volume(&snap.volumes, selector)?.clone();
+    let handle = find_volume_store(&state.volume_stores, &vol)?;
+    let result = wipe_volume(handle.store.as_ref()).map_err(|e| e.to_string())?;
+
+    info!(
+        volume = %vol.name,
+        chunks_deleted = result.chunks_deleted,
+        "volume wipe complete"
+    );
+
+    Ok(json!({
+        "volume": vol.name,
+        "iqn": vol.iqn,
+        "prefix": vol.prefix,
+        "chunks_deleted": result.chunks_deleted,
+        "note": "all chunk objects deleted; meta.json kept (volume geometry unchanged)",
+    }))
+}
+
+/// Delete every present chunk (restore a fully sparse volume). Keeps meta.json.
+pub fn wipe_volume(store: &dyn BlockStore) -> Result<WipeVolumeResult, String> {
+    let chunks = store
+        .present_chunks()
+        .map_err(|e| format!("list chunks: {e}"))?;
+    let mut chunks_deleted = 0u64;
+    for idx in chunks {
+        store
+            .delete_chunk(idx)
+            .map_err(|e| format!("delete chunk {idx}: {e}"))?;
+        chunks_deleted += 1;
+    }
+    store
+        .flush()
+        .map_err(|e| format!("flush after wipe: {e}"))?;
+    Ok(WipeVolumeResult { chunks_deleted })
 }
 
 fn ok(data: serde_json::Value) -> serde_json::Value {
@@ -1039,5 +1087,24 @@ mod tests {
         let dst = MemoryStore::new(16384, 512, 4096).unwrap();
         let err = copy_volume(&src, &dst).unwrap_err();
         assert!(err.contains("capacity mismatch"));
+    }
+
+    #[test]
+    fn wipe_volume_deletes_present_chunks() {
+        use crate::store::MemoryStore;
+        let store = MemoryStore::new(16 * 1024, 512, 4 * 1024).unwrap();
+        store.write_at(0, &[1u8; 4096]).unwrap();
+        store.write_at(8192, &[2u8; 4096]).unwrap();
+        assert_eq!(store.present_chunks().unwrap().len(), 2);
+
+        let result = wipe_volume(&store).unwrap();
+        assert_eq!(result.chunks_deleted, 2);
+        assert!(store.present_chunks().unwrap().is_empty());
+
+        let mut buf = [0u8; 1];
+        store.read_at(0, &mut buf).unwrap();
+        assert_eq!(buf[0], 0);
+        store.read_at(8192, &mut buf).unwrap();
+        assert_eq!(buf[0], 0);
     }
 }

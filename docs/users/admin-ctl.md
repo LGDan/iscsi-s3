@@ -40,6 +40,9 @@ Docker: install both `iscsi-s3` and `iscsi-s3-ctl` in the image. Mount/share the
 | `volume s3-stats <name\|iqn>` | List S3 objects under the volume prefix: chunk/meta counts and bytes |
 | `volume write-image <name\|iqn> --file PATH` | Stream a raw disk image into a volume that has **no chunk objects** yet |
 | `volume copy <from> <to> [--force]` | 1:1 sparse copy; **overwrites** destination (prompts unless `--force`) |
+| `volume wipe <name\|iqn> [--force]` | Delete all chunk objects; keeps `meta.json` (prompts unless `--force`) |
+| `volume connect <name\|iqn> [--portal HOST:PORT]` | Local helper: `iscsiadm` discovery + login |
+| `volume disconnect <name\|iqn> [--portal HOST:PORT]` | Local helper: `iscsiadm` logout |
 | `reload` | Re-read the startup `--config` file + env; apply **safe** fields only |
 
 Global flags: `--socket PATH`, `--format text|json`.
@@ -118,6 +121,36 @@ Rules:
 - Client prompts for confirmation unless `--force` (non-TTY stdin also requires `--force`).
 - Prefer logging out initiators on both volumes first.
 
+## Wipe a volume (`volume wipe`)
+
+Delete every chunk object under the volume prefix. `meta.json` (capacity / geometry / compression) is kept so the volume stays configured but fully sparse.
+
+```bash
+iscsi-s3-ctl volume wipe disk0
+# prompts: Type 'yes' to continue
+iscsi-s3-ctl volume wipe disk0 --force
+```
+
+Prefer `volume disconnect` (or logout) first so initiators are not reading/writing during the wipe.
+
+## Connect / disconnect (open-iscsi helpers)
+
+These run **on the machine where you invoke `iscsi-s3-ctl`**, not inside the daemon. They look up the volume IQN (and portals) over the admin socket, then call `iscsiadm`. Requires `open-iscsi` / `iscsiadm` in `PATH`, and usually root.
+
+```bash
+# Discover + login (all advertised portals, or one with --portal)
+sudo iscsi-s3-ctl volume connect disk0
+sudo iscsi-s3-ctl volume connect disk0 --portal 127.0.0.1:3260
+
+# Logout all sessions for that IQN (or one portal)
+sudo iscsi-s3-ctl volume disconnect disk0
+sudo iscsi-s3-ctl volume disconnect disk0 --portal 127.0.0.1:3260
+```
+
+Portal selection: `--portal` if set; else daemon `portals` / `advertise` from `stats`; else a non-wildcard `bind`. If the daemon only binds `0.0.0.0:…` with no advertise/portals, pass `--portal` explicitly.
+
+CHAP-enabled volumes: the helper does not set node secrets; configure CHAP on the node first if login fails (see [configuration](configuration.md#chap-authentication)).
+
 ## Safe cache toggle
 
 Disabling always flushes the LRU so the next reads hit S3. That is the right step **before** starting a second multi-instance peer that must not see stale data from this process’s cache. See [chunk cache safety](../developers/cache.md).
@@ -154,6 +187,7 @@ One JSON object per connection, newline-terminated request and response:
 {"op":"volume.s3_stats","volume":"disk0"}
 {"op":"volume.write_image","volume":"disk0","size":1073741824}
 {"op":"volume.copy","volume":"disk0","to":"disk1"}
+{"op":"volume.wipe","volume":"disk0"}
 {"op":"reload"}
 ```
 
