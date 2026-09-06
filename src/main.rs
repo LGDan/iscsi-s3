@@ -4,6 +4,7 @@
 //! (`store::http` / `HttpRangeStore`) — not implemented in v1.
 
 use clap::Parser;
+use iscsi_s3::admin::{spawn_admin_server, AdminSnapshot, AdminState, VolumeSummary};
 use iscsi_s3::cache::ChunkCache;
 use iscsi_s3::config::{resolve_auth, Cli, Config};
 use iscsi_s3::device::S3BlockDevice;
@@ -11,7 +12,10 @@ use iscsi_s3::metrics::{spawn_metrics_server, Metrics, SessionMetricsSink, Volum
 use iscsi_s3::store::BlockStore;
 use iscsi_s3::volume::{build_s3_client, open_volume};
 use iscsi_target::IscsiServer;
+use parking_lot::Mutex;
+use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Instant;
 use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 
@@ -99,6 +103,7 @@ fn resolve_portals(cfg: &Config) -> Result<Vec<String>, String> {
 }
 
 fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
+    let config_path = cli.config.clone();
     let cfg = Config::load(&cli)?;
 
     let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -126,6 +131,7 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let mut volume_labels: Vec<VolumeLabels> = Vec::new();
+    let mut volume_summaries: Vec<VolumeSummary> = Vec::new();
 
     for (index, vol) in cfg.volumes.iter().enumerate() {
         let opened = open_volume(
@@ -141,6 +147,12 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         volume_labels.push(opened.labels.clone());
         let device = S3BlockDevice::new(opened.store, opened.labels, Arc::clone(&metrics));
         let auth = resolve_auth(&cfg.auth, &vol.auth)?;
+        volume_summaries.push(VolumeSummary {
+            name: opened.name.clone(),
+            iqn: opened.iqn.clone(),
+            capacity,
+            auth: auth.mode.as_str().to_string(),
+        });
         info!(
             name = %opened.name,
             iqn = %opened.iqn,
@@ -193,6 +205,29 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         info!("prometheus metrics disabled");
     }
 
+    if cfg.admin.enabled {
+        let admin_state = Arc::new(AdminState {
+            config_path,
+            started: Instant::now(),
+            cache: Arc::clone(&cache),
+            server: Arc::clone(&server),
+            snapshot: Mutex::new(AdminSnapshot {
+                bind: cfg.bind.clone(),
+                portals: portals.clone(),
+                instance: cfg.instance.clone(),
+                volumes: volume_summaries,
+                cache_max_bytes: cfg.cache.max_bytes,
+                s3_bucket: cfg.s3.bucket.clone(),
+                s3_endpoint: cfg.s3.endpoint.clone(),
+                s3_region: cfg.s3.region.clone(),
+                s3_force_path_style: cfg.s3.force_path_style,
+            }),
+        });
+        spawn_admin_server(PathBuf::from(&cfg.admin.socket), admin_state)?;
+    } else {
+        info!("admin control socket disabled");
+    }
+
     // Keep the tokio runtime alive for S3 I/O while the target runs.
     let _runtime_guard = runtime;
     server.run().map_err(|e| e.to_string())?;
@@ -231,6 +266,7 @@ mod tests {
             s3: Default::default(),
             cache: Default::default(),
             metrics: Default::default(),
+            admin: Default::default(),
             volumes: vec![],
         };
         assert_eq!(

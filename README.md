@@ -16,6 +16,7 @@ Initiator  --iSCSI-->  iscsi-s3  --Get/PutObject-->  S3 / MinIO
 - Multiple volumes on one TCP portal (IQN-based routing)
 - Multi-portal SendTargets + multi-instance Path-A MPIO (shared S3, CAS writes)
 - Optional one-way or mutual CHAP (per volume or global)
+- Admin Unix socket + `iscsi-s3-ctl` (stats, cache toggle, safe reload)
 - Grow-only capacity via `{prefix}/meta.json`
 - Sparse disks (missing chunks read as zeros)
 - Whole-chunk LRU cache (disable for multi-instance)
@@ -40,6 +41,7 @@ Set `advertise` in the mounted config to an address clients can reach (for Docke
 | [User getting started](docs/users/getting-started.md) | Run the target and connect a Linux initiator |
 | [Configuration](docs/users/configuration.md) | TOML, env, CLI reference |
 | [MPIO setup](docs/users/mpio.md) | Dual-path multipath, lab Compose, dual-NIC, rolling upgrade |
+| [Admin control](docs/users/admin-ctl.md) | `iscsi-s3-ctl` stats, cache toggle, reload |
 | [User tutorials](docs/users/tutorials.md) | Mount disks, grow volumes, remote access, iSCSI boot |
 | [Developer getting started](docs/developers/getting-started.md) | Build, layout, vendored crate |
 | [Architecture](docs/developers/architecture.md) | How chunks, ports, and sessions work |

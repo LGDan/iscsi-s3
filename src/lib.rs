@@ -1,5 +1,6 @@
 //! iSCSI target backed by S3 chunk objects.
 
+pub mod admin;
 pub mod cache;
 pub mod config;
 pub mod device;

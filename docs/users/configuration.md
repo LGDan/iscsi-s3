@@ -53,7 +53,9 @@ capacity = "10GiB"
 | `s3.endpoint` | Optional custom endpoint (MinIO, Ceph RGW, …). Omit for AWS. |
 | `s3.force_path_style` | Path-style URLs (`http://endpoint/bucket/key`). Usually `true` for MinIO. |
 | `s3.access_key_id` / `secret_access_key` | Optional static keys; otherwise AWS default credential chain / `AWS_*`. |
-| `cache.max_bytes` | Shared in-process LRU for whole chunks. Safe with one process (including dual-portal). Use `0` when multiple daemons share a volume. Details: [cache safety](../developers/cache.md), [MPIO Setup A](mpio.md#setup-a--single-process-dual-nic-keep-the-cache). |
+| `cache.max_bytes` | Shared in-process LRU for whole chunks. Safe with one process (including dual-portal). Use `0` when multiple daemons share a volume. Live toggle via [`iscsi-s3-ctl`](admin-ctl.md). Details: [cache safety](../developers/cache.md), [MPIO Setup A](mpio.md#setup-a--single-process-dual-nic-keep-the-cache). |
+| `admin.enabled` | Listen for `iscsi-s3-ctl` on a Unix socket (default `true`). |
+| `admin.socket` | Admin UDS path (default `/tmp/iscsi-s3/admin.sock`). |
 | `volumes[].name` | Short label (logs, INQUIRY product id). |
 | `volumes[].iqn` | iSCSI target name (unique). |
 | `volumes[].prefix` | S3 key prefix (unique). |

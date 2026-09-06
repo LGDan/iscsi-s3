@@ -99,7 +99,7 @@ Full-chunk writes use `etag = None` (no precondition). Concurrent full overwrite
 
 1. **Lab / single portal / one container:** leave default cache on for read performance.
 2. **Dual-NIC, one process (network resilience + cache):** `bind = 0.0.0.0:3260`, list both IPs in `portals`, keep cache — [MPIO Setup A](../users/mpio.md#setup-a--single-process-dual-nic-keep-the-cache).
-3. **Two or more daemons on the same volume (rolling upgrades):** `cache.max_bytes = 0` on every instance — [MPIO Setup B/C](../users/mpio.md).
+3. **Two or more daemons on the same volume (rolling upgrades):** `cache.max_bytes = 0` on every instance — [MPIO Setup B/C](../users/mpio.md). Use `iscsi-s3-ctl cache disable` on a live single-process instance before adding a peer ([admin control](../users/admin-ctl.md)).
 4. **Suspect stale data:** restart the daemon (clears LRU) or set cache to 0 and restart; confirm no second caching peer shares the prefix.
 5. **Metrics:** cache hit/miss counters are per volume; use them to see whether the LRU is doing useful work, not as a coherence signal across instances.
 

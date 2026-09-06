@@ -13,6 +13,10 @@ path = "src/lib.rs"
 name = "iscsi-s3"
 path = "src/main.rs"
 
+[[bin]]
+name = "iscsi-s3-ctl"
+path = "src/bin/iscsi-s3-ctl.rs"
+
 [dependencies]
 aws-config = { version = "1", features = ["behavior-version-latest"] }
 aws-sdk-s3 = "1"

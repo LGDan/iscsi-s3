@@ -35,11 +35,17 @@ force_path_style = true
 max_bytes = "256MiB"
 # For multi-instance MPIO set to 0 so peers cannot return stale chunks:
 # max_bytes = 0
+# Or live: iscsi-s3-ctl cache disable  (see docs/users/admin-ctl.md)
 
 [metrics]
 # Prometheus scrape endpoint (GET /metrics). Disable with enabled = false.
 enabled = true
 bind = "0.0.0.0:9090"
+
+# Local Unix socket for iscsi-s3-ctl (stats / cache / reload).
+# [admin]
+# enabled = true
+# socket = "/tmp/iscsi-s3/admin.sock"
 
 [[volumes]]
 name = "disk0"

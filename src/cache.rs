@@ -15,6 +15,8 @@ struct CacheEntry {
 struct CacheInner {
     entries: HashMap<CacheKey, CacheEntry>,
     max_bytes: u64,
+    /// Last non-zero budget (for `cache enable` without an explicit size).
+    last_nonzero_max_bytes: u64,
     used_bytes: u64,
     tick: u64,
 }
@@ -36,15 +38,84 @@ impl ChunkCache {
             inner: Mutex::new(CacheInner {
                 entries: HashMap::new(),
                 max_bytes,
+                last_nonzero_max_bytes: if max_bytes > 0 {
+                    max_bytes
+                } else {
+                    crate::config::DEFAULT_CACHE_MAX
+                },
                 used_bytes: 0,
                 tick: 0,
             }),
         })
     }
 
+    /// `(used_bytes, entry_count)`.
     pub fn stats(&self) -> (u64, usize) {
         let inner = self.inner.lock();
         (inner.used_bytes, inner.entries.len())
+    }
+
+    pub fn max_bytes(&self) -> u64 {
+        self.inner.lock().max_bytes
+    }
+
+    pub fn last_nonzero_max_bytes(&self) -> u64 {
+        self.inner.lock().last_nonzero_max_bytes
+    }
+
+    pub fn is_enabled(&self) -> bool {
+        self.max_bytes() > 0
+    }
+
+    /// Update the budget. When set to `0`, also clears all entries.
+    pub fn set_max_bytes(&self, max_bytes: u64) {
+        let mut inner = self.inner.lock();
+        if max_bytes > 0 {
+            inner.last_nonzero_max_bytes = max_bytes;
+        }
+        inner.max_bytes = max_bytes;
+        if max_bytes == 0 {
+            inner.entries.clear();
+            inner.used_bytes = 0;
+        } else {
+            // Evict until under budget.
+            while inner.used_bytes > inner.max_bytes && !inner.entries.is_empty() {
+                let victim = inner
+                    .entries
+                    .iter()
+                    .min_by_key(|(_, e)| e.tick)
+                    .map(|(k, _)| k.clone());
+                if let Some(v) = victim {
+                    if let Some(e) = inner.entries.remove(&v) {
+                        inner.used_bytes =
+                            inner.used_bytes.saturating_sub(e.data.len() as u64);
+                    }
+                } else {
+                    break;
+                }
+            }
+        }
+    }
+
+    /// Drop every cached chunk (e.g. before multi-instance bring-up).
+    pub fn clear(&self) {
+        let mut inner = self.inner.lock();
+        inner.entries.clear();
+        inner.used_bytes = 0;
+    }
+
+    /// Disable caching and flush (alias for `set_max_bytes(0)`).
+    pub fn disable(&self) {
+        self.set_max_bytes(0);
+    }
+
+    /// Enable caching with `max_bytes`, or the last non-zero budget if `None`.
+    pub fn enable(&self, max_bytes: Option<u64>) {
+        let budget = max_bytes
+            .filter(|b| *b > 0)
+            .unwrap_or_else(|| self.last_nonzero_max_bytes());
+        self.clear();
+        self.set_max_bytes(budget);
     }
 
     fn get(&self, volume: &str, chunk_idx: u64) -> Option<Vec<u8>> {
@@ -241,5 +312,27 @@ mod tests {
         cached.read_at(0, &mut b).unwrap();
         assert_eq!(a, b);
         assert_eq!(a, [7u8; 100]);
+    }
+
+    #[test]
+    fn disable_clears_and_misses() {
+        let mem = MemoryStore::new(8192, 512, 4096).unwrap();
+        mem.write_at(0, &[9u8; 100]).unwrap();
+        let cache = ChunkCache::new(1024 * 1024);
+        let metrics = Metrics::new().unwrap();
+        let labels = VolumeLabels::new("v0", "iqn.test:v0");
+        let cached = CachedStore::new(mem, Arc::clone(&cache), labels, metrics);
+        let mut a = [0u8; 100];
+        cached.read_at(0, &mut a).unwrap();
+        assert_eq!(cache.stats().1, 1);
+        cache.disable();
+        assert_eq!(cache.max_bytes(), 0);
+        assert_eq!(cache.stats(), (0, 0));
+        assert!(!cache.is_enabled());
+        // Re-enable restores last budget; cold cache.
+        cache.enable(None);
+        assert!(cache.is_enabled());
+        assert_eq!(cache.max_bytes(), 1024 * 1024);
+        assert_eq!(cache.stats(), (0, 0));
     }
 }

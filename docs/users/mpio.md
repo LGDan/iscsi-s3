@@ -82,7 +82,7 @@ When running **two or more** daemons against the same volume:
 | Identical `[[volumes]]` (same `iqn`, `prefix`, `capacity`, geometry) on every instance | Same LUN / same objects |
 | Identical `portals = [...]` on every instance | Discovery lists every path from either portal |
 | Identical `[auth]` / volume auth on every instance | Same CHAP secret so either path accepts login |
-| `cache.max_bytes = 0` | Per-process LRU cannot invalidate peers; stale reads after failover ([cache safety](../developers/cache.md)) |
+| `cache.max_bytes = 0` | Per-process LRU cannot invalidate peers; stale reads after failover ([cache safety](../developers/cache.md)). Before starting a peer, run `iscsi-s3-ctl cache disable` on the live instance ([admin control](admin-ctl.md)). |
 | Shared S3 (or MinIO) credentials/bucket | Single source of truth; RMW uses `If-Match` CAS |
 | Distinct `bind` (or host port publish) per instance | Each path has its own TCP endpoint |
 | Optional `instance = "a"` / `"b"` | Labels logs only |
@@ -330,6 +330,7 @@ Keep `cache.max_bytes = 0` for the whole life of a multi-instance volume.
 ## Related
 
 - [Configuration](configuration.md) — `portals`, `advertise`, `cache`, [CHAP](configuration.md#chap-authentication)
+- [Admin control](admin-ctl.md) — `iscsi-s3-ctl` cache disable before multi-instance
 - [Chunk cache](../developers/cache.md) — when cache is safe vs stale-read risk
 - [Architecture](../developers/architecture.md) — identity and CAS notes
 - [Examples §13](../examples.md#13-dual-path-mpio-two-daemons-shared-s3) — dual-NIC TOML snippets

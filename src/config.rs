@@ -51,6 +51,8 @@ pub struct Config {
     #[serde(default)]
     pub metrics: MetricsConfig,
     #[serde(default)]
+    pub admin: AdminConfig,
+    #[serde(default)]
     pub volumes: Vec<VolumeConfig>,
 }
 
@@ -118,6 +120,35 @@ fn default_metrics_enabled() -> bool {
 
 fn default_metrics_bind() -> String {
     "0.0.0.0:9090".to_string()
+}
+
+pub const DEFAULT_ADMIN_SOCKET: &str = "/tmp/iscsi-s3/admin.sock";
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AdminConfig {
+    /// Listen for `iscsi-s3-ctl` on a Unix domain socket.
+    #[serde(default = "default_admin_enabled")]
+    pub enabled: bool,
+    /// Filesystem path for the admin UDS.
+    #[serde(default = "default_admin_socket")]
+    pub socket: String,
+}
+
+impl Default for AdminConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_admin_enabled(),
+            socket: default_admin_socket(),
+        }
+    }
+}
+
+fn default_admin_enabled() -> bool {
+    true
+}
+
+fn default_admin_socket() -> String {
+    DEFAULT_ADMIN_SOCKET.to_string()
 }
 
 /// Optional CHAP credentials (global or per-volume).
@@ -390,6 +421,7 @@ impl Config {
             },
             cache: CacheConfig::default(),
             metrics: MetricsConfig::default(),
+            admin: AdminConfig::default(),
             volumes: Vec::new(),
         };
 
@@ -418,6 +450,36 @@ impl Config {
         };
         figment = figment.merge(Serialized::defaults(overrides));
 
+        let config: Config = figment.extract()?;
+        config.validate()?;
+        Ok(config)
+    }
+
+    /// Reload from a config file + current process env (no CLI overrides).
+    pub fn load_for_reload(path: &std::path::Path) -> Result<Self, ConfigError> {
+        let defaults = Config {
+            bind: DEFAULT_BIND.to_string(),
+            advertise: None,
+            portals: Vec::new(),
+            instance: None,
+            auth: None,
+            s3: S3Config {
+                bucket: None,
+                region: default_region(),
+                endpoint: None,
+                force_path_style: false,
+                access_key_id: None,
+                secret_access_key: None,
+            },
+            cache: CacheConfig::default(),
+            metrics: MetricsConfig::default(),
+            admin: AdminConfig::default(),
+            volumes: Vec::new(),
+        };
+        let figment = Figment::new()
+            .merge(Serialized::defaults(defaults))
+            .merge(Toml::file(path))
+            .merge(Env::prefixed("ISCSI_S3_").split("__"));
         let config: Config = figment.extract()?;
         config.validate()?;
         Ok(config)
@@ -487,6 +549,17 @@ impl Config {
         }
         Ok(())
     }
+}
+
+/// Parse a human size (`256MiB`) or decimal integer string into bytes.
+pub fn parse_byte_size(s: &str) -> Result<u64, String> {
+    let s = s.trim();
+    if let Ok(n) = s.parse::<u64>() {
+        return Ok(n);
+    }
+    s.parse::<bytesize::ByteSize>()
+        .map(|b| b.as_u64())
+        .map_err(|e| format!("invalid size {s:?}: {e}"))
 }
 
 /// Serde helper so TOML can use `"10GiB"` or integer bytes.
