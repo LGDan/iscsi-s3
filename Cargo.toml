@@ -36,6 +36,9 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tracing-log = "0.2"
 prometheus = "0.13"
 tiny_http = "0.12"
+lz4_flex = "0.11"
+zstd = "0.13"
+flate2 = "1"
 
 [dev-dependencies]
 tempfile = "3"

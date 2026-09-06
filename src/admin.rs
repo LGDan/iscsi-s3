@@ -423,6 +423,7 @@ mod tests {
                 block_size: 512,
                 chunk_size: 4096,
                 auth: None,
+                compression: Default::default(),
             }],
         };
         let r = apply_safe_reload(&snap, &cfg, &cache).unwrap();

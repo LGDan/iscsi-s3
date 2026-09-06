@@ -74,6 +74,7 @@ pub fn open_volume(
             capacity: vol.capacity,
             block_size: vol.block_size,
             chunk_size: vol.chunk_size,
+            compression: vol.compression,
             labels: labels.clone(),
             metrics: Arc::clone(&metrics),
         },

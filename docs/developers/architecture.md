@@ -44,6 +44,7 @@ Implementation: `portal_addrs` / `advertise_addr` on `IscsiServer` / `IscsiTarge
 - Disk = linear byte space of `capacity`, SCSI `block_size` (default 512).
 - Split into `chunk_size` objects (default 4 MiB).
 - Missing objects read as zeros (sparse).
+- Optional per-volume chunk compression (`none` / `lz4` / `zstd` / `deflate`); compressed objects use an `ISC3` header. Locked in `meta.json`.
 - Writes RMW partial chunks as needed.
 - `meta.json` locks capacity/geometry grow-only rules (see user configuration docs).
 

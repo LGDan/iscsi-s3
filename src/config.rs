@@ -312,6 +312,9 @@ pub struct VolumeConfig {
     pub block_size: u32,
     #[serde(default = "default_chunk_size", with = "bytesize_serde")]
     pub chunk_size: u64,
+    /// Chunk object compression (`none`, `lz4`, `zstd`, `deflate`). Locked in meta.json.
+    #[serde(default)]
+    pub compression: crate::compression::Compression,
     /// Optional per-volume CHAP override (inherits unset fields from `[auth]`).
     #[serde(default)]
     pub auth: Option<AuthSettings>,

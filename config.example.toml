@@ -54,6 +54,7 @@ prefix = "disks/disk0"
 capacity = "10GiB"
 # block_size = 512
 # chunk_size = "4MiB"
+# compression = "none"   # or "lz4" | "zstd" | "deflate" (locked in meta.json)
 
 [[volumes]]
 name = "disk1"

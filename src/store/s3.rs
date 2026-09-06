@@ -1,6 +1,7 @@
 //! S3-backed chunk store with per-volume meta.json.
 
 use super::{check_range, BlockStore, StoreError};
+use crate::compression::{decode_chunk, encode_chunk, Compression};
 use crate::metrics::{Metrics, VolumeLabels};
 use aws_sdk_s3::error::SdkError;
 use aws_sdk_s3::operation::get_object::GetObjectError;
@@ -23,6 +24,9 @@ pub struct VolumeMeta {
     pub capacity_bytes: u64,
     pub chunk_size: u64,
     pub block_size: u32,
+    /// Locked at first meta write; missing in old meta → `none`.
+    #[serde(default)]
+    pub compression: Compression,
 }
 
 pub struct S3StoreConfig {
@@ -31,6 +35,7 @@ pub struct S3StoreConfig {
     pub capacity: u64,
     pub block_size: u32,
     pub chunk_size: u64,
+    pub compression: Compression,
     pub labels: VolumeLabels,
     pub metrics: Arc<Metrics>,
 }
@@ -41,6 +46,7 @@ pub struct S3ChunkStore {
     prefix: String,
     block_size: u32,
     chunk_size: u64,
+    compression: Compression,
     capacity: AtomicU64,
     runtime: Handle,
     locks: Arc<[Mutex<()>; LOCK_STRIPES]>,
@@ -60,6 +66,7 @@ impl S3ChunkStore {
             prefix: cfg.prefix.trim_matches('/').to_string(),
             block_size: cfg.block_size,
             chunk_size: cfg.chunk_size,
+            compression: cfg.compression,
             capacity: AtomicU64::new(cfg.capacity),
             runtime,
             locks,
@@ -106,6 +113,7 @@ impl S3ChunkStore {
             config_capacity,
             self.chunk_size,
             self.block_size,
+            self.compression,
         )?;
         if let Some(meta) = to_write {
             self.put_meta(&meta)?;
@@ -210,6 +218,7 @@ impl S3ChunkStore {
         let client = self.client.clone();
         let bucket = self.bucket.clone();
         let chunk_size = self.chunk_size as usize;
+        let compression = self.compression;
         let result = self.run_async(async move {
             match client
                 .get_object()
@@ -226,13 +235,8 @@ impl S3ChunkStore {
                         .await
                         .map_err(|e| StoreError::S3(e.to_string()))?
                         .into_bytes();
-                    if bytes.len() != chunk_size {
-                        return Err(StoreError::S3(format!(
-                            "chunk {key} has length {}, expected {chunk_size}",
-                            bytes.len()
-                        )));
-                    }
-                    Ok((bytes.to_vec(), etag))
+                    let plain = decode_chunk(compression, &bytes, chunk_size)?;
+                    Ok((plain, etag))
                 }
                 Err(e) => {
                     let msg = e.to_string();
@@ -276,7 +280,7 @@ impl S3ChunkStore {
         let key = self.chunk_key(index);
         let client = self.client.clone();
         let bucket = self.bucket.clone();
-        let body = data.to_vec();
+        let body = encode_chunk(self.compression, data)?;
         let bytes = body.len() as u64;
         let if_match = if_match.map(|s| s.to_string());
         let result = self.run_async(async move {
@@ -318,6 +322,7 @@ pub fn plan_capacity(
     config_capacity: u64,
     chunk_size: u64,
     block_size: u32,
+    compression: Compression,
 ) -> Result<(u64, Option<VolumeMeta>), StoreError> {
     match existing {
         None => {
@@ -326,6 +331,7 @@ pub fn plan_capacity(
                 capacity_bytes: config_capacity,
                 chunk_size,
                 block_size,
+                compression,
             };
             Ok((config_capacity, Some(meta)))
         }
@@ -340,6 +346,13 @@ pub fn plan_capacity(
                 return Err(StoreError::GeometryMismatch(format!(
                     "block_size config {block_size} != meta {}",
                     meta.block_size
+                )));
+            }
+            if meta.compression != compression {
+                return Err(StoreError::GeometryMismatch(format!(
+                    "compression config {:?} != meta {:?}",
+                    compression.as_str(),
+                    meta.compression.as_str()
                 )));
             }
             if config_capacity < meta.capacity_bytes {
@@ -463,6 +476,7 @@ impl BlockStore for S3ChunkStore {
             capacity_bytes: new_capacity,
             chunk_size: self.chunk_size,
             block_size: self.block_size,
+            compression: self.compression,
         };
         self.put_meta(&meta)?;
         self.capacity.store(new_capacity, Ordering::SeqCst);
@@ -492,12 +506,14 @@ mod tests {
             capacity_bytes: cap,
             chunk_size: 4096,
             block_size: 512,
+            compression: Compression::None,
         }
     }
 
     #[test]
     fn plan_creates_on_missing() {
-        let (cap, write) = plan_capacity(None, 8192, 4096, 512).unwrap();
+        let (cap, write) =
+            plan_capacity(None, 8192, 4096, 512, Compression::None).unwrap();
         assert_eq!(cap, 8192);
         assert_eq!(write.unwrap().capacity_bytes, 8192);
     }
@@ -505,7 +521,8 @@ mod tests {
     #[test]
     fn plan_grows() {
         let m = meta(4096);
-        let (cap, write) = plan_capacity(Some(&m), 8192, 4096, 512).unwrap();
+        let (cap, write) =
+            plan_capacity(Some(&m), 8192, 4096, 512, Compression::None).unwrap();
         assert_eq!(cap, 8192);
         assert!(write.is_some());
     }
@@ -513,14 +530,22 @@ mod tests {
     #[test]
     fn plan_refuses_shrink() {
         let m = meta(8192);
-        let err = plan_capacity(Some(&m), 4096, 4096, 512).unwrap_err();
+        let err = plan_capacity(Some(&m), 4096, 4096, 512, Compression::None).unwrap_err();
         assert!(matches!(err, StoreError::ShrinkRefused { .. }));
     }
 
     #[test]
     fn plan_refuses_geometry_change() {
         let m = meta(8192);
-        let err = plan_capacity(Some(&m), 8192, 8192, 512).unwrap_err();
+        let err = plan_capacity(Some(&m), 8192, 8192, 512, Compression::None).unwrap_err();
+        assert!(matches!(err, StoreError::GeometryMismatch(_)));
+    }
+
+    #[test]
+    fn plan_refuses_compression_change() {
+        let m = meta(8192);
+        let err =
+            plan_capacity(Some(&m), 8192, 4096, 512, Compression::Lz4).unwrap_err();
         assert!(matches!(err, StoreError::GeometryMismatch(_)));
     }
 }

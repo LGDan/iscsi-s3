@@ -62,6 +62,7 @@ capacity = "10GiB"
 | `volumes[].capacity` | Size (`10GiB`, `64MiB`, or integer bytes). |
 | `volumes[].block_size` | SCSI block size (default 512; locked after first meta write). |
 | `volumes[].chunk_size` | S3 object size (default 4 MiB; locked after first meta write). |
+| `volumes[].compression` | Chunk compression: `none` (default), `lz4`, `zstd`, or `deflate`. Locked in `meta.json` like geometry; change requires a new prefix. |
 | `volumes[].auth` | Optional per-volume CHAP override (unset fields inherit from `[auth]`). |
 
 Sizes accept human strings (`64KiB`, `4MiB`, `10GiB`) or raw byte integers.

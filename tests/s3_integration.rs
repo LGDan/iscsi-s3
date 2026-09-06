@@ -69,6 +69,7 @@ fn s3_chunk_round_trip_and_grow() {
             capacity: 2 * 1024 * 1024,
             block_size: 512,
             chunk_size: 1024 * 1024,
+            compression: iscsi_s3::compression::Compression::None,
             labels: labels.clone(),
             metrics: Arc::clone(&metrics),
         },
@@ -96,6 +97,7 @@ fn s3_chunk_round_trip_and_grow() {
             capacity: 4 * 1024 * 1024,
             block_size: 512,
             chunk_size: 1024 * 1024,
+            compression: iscsi_s3::compression::Compression::None,
             labels,
             metrics,
         },
@@ -114,8 +116,16 @@ fn plan_capacity_unit() {
         capacity_bytes: 1024,
         chunk_size: 4096,
         block_size: 512,
+        compression: iscsi_s3::compression::Compression::None,
     };
-    let (cap, write) = plan_capacity(Some(&meta), 2048, 4096, 512).unwrap();
+    let (cap, write) = plan_capacity(
+        Some(&meta),
+        2048,
+        4096,
+        512,
+        iscsi_s3::compression::Compression::None,
+    )
+    .unwrap();
     assert_eq!(cap, 2048);
     assert!(write.is_some());
 }
