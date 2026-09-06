@@ -10,6 +10,9 @@ Initiator  --iSCSI-->  iscsi-s3  --Get/PutObject-->  S3 / MinIO
                      chunk objects + meta.json
 ```
 
+> [!WARNING]
+> 🤖 This project is vibe-coded and is essentially pre-alpha.
+
 ## Features
 
 - Layered config: defaults → TOML → `ISCSI_S3_*` env → CLI
@@ -69,4 +72,4 @@ Set `advertise` in the mounted config to an address clients can reach (for Docke
 
 ## License
 
-MIT OR Apache-2.0
+MIT
