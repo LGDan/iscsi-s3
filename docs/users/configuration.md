@@ -9,7 +9,7 @@ Lowest → highest:
 3. Environment (`ISCSI_S3_` prefix; nest with `__`)
 4. CLI flags
 
-Volumes (`[[volumes]]`) are defined only in TOML. Env/CLI override shared settings (bind, advertise, bucket, endpoint, region, path style, logging).
+Volumes (`[[volumes]]`) are defined only in TOML. Env/CLI override shared settings (bind, advertise, bucket, endpoint, region, path style, logging). Multi-portal lists (`portals`) and `instance` are TOML-only.
 
 `RUST_LOG` is preferred when set; otherwise `--log` applies (Compose commonly sets `RUST_LOG`).
 
@@ -41,14 +41,16 @@ capacity = "10GiB"
 
 | Key | Description |
 |-----|-------------|
-| `bind` | Listen address `host:port` for the shared portal (all IQNs). |
-| `advertise` | Portal returned in SendTargets (`host` or `host:port`). Host-only reuses the port from `bind`. Unset → socket `local_addr` (often a container IP behind Docker). |
+| `bind` | Listen address `host:port` for **this** process (all IQNs on one TCP port). |
+| `advertise` | Single portal in SendTargets when `portals` is empty (`host` or `host:port`). Host-only reuses the port from `bind`. Unset → socket `local_addr` (often a container IP behind Docker). |
+| `portals` | All client-reachable portals (`host` or `host:port`) listed in SendTargets for MPIO. Same list on every multi-instance peer. Takes precedence over `advertise`. |
+| `instance` | Optional label for logs (multi-instance deployments). |
 | `s3.bucket` | Required. Bucket name. |
 | `s3.region` | AWS region (also used with custom endpoints). |
 | `s3.endpoint` | Optional custom endpoint (MinIO, Ceph RGW, …). Omit for AWS. |
 | `s3.force_path_style` | Path-style URLs (`http://endpoint/bucket/key`). Usually `true` for MinIO. |
 | `s3.access_key_id` / `secret_access_key` | Optional static keys; otherwise AWS default credential chain / `AWS_*`. |
-| `cache.max_bytes` | Shared in-process LRU for whole chunks. |
+| `cache.max_bytes` | Shared in-process LRU for whole chunks. Use `0` for multi-instance MPIO (no cross-process invalidation). |
 | `volumes[].name` | Short label (logs, INQUIRY product id). |
 | `volumes[].iqn` | iSCSI target name (unique). |
 | `volumes[].prefix` | S3 key prefix (unique). |
@@ -60,9 +62,11 @@ Sizes accept human strings (`64KiB`, `4MiB`, `10GiB`) or raw byte integers.
 
 ## Port / portal
 
-All volumes share one listen address (`bind`). A single discovery against that portal returns every IQN with the same `TargetAddress`.
+All volumes on one process share one listen address (`bind`). Discovery against that portal returns every IQN; each IQN lists `portals` (or a single `advertise`) as `TargetAddress` values.
 
-Docker must publish that port (default `3260`).
+For dual-path MPIO, run two processes (often on two NICs or two published ports), identical volumes/S3 prefixes, identical `portals`, and `cache.max_bytes = 0`. See [tutorials — multipath](tutorials.md#tutorial-7--dual-path-mpio-multi-instance) and `docker-compose.mpio.yml`.
+
+Docker must publish each process’s portal port (default `3260`).
 
 ## Environment
 

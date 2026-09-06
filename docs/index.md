@@ -8,14 +8,14 @@ Userspace iSCSI target that presents virtual disks backed by S3 (or MinIO / othe
 |-----|----------|
 | [Getting started](users/getting-started.md) | Docker Compose or local binary; discover and login with open-iscsi |
 | [Configuration](users/configuration.md) | Precedence, field reference, env/CLI |
-| [Tutorials](users/tutorials.md) | Format/mount, grow, remote LAN, firmware iSCSI boot notes |
+| [Tutorials](users/tutorials.md) | Format/mount, grow, remote LAN, MPIO, firmware iSCSI boot notes |
 
 ## For developers
 
 | Doc | Contents |
 |-----|----------|
 | [Getting started](developers/getting-started.md) | Clone, build, project layout, vendored `iscsi-target` |
-| [Architecture](developers/architecture.md) | Ports, chunks, cache, login/advertise |
+| [Architecture](developers/architecture.md) | Ports, portals/MPIO, chunks, cache, login/advertise |
 | [Testing](developers/testing.md) | Unit tests, MinIO integration, smoke script |
 
 ## Examples
@@ -31,7 +31,9 @@ These live in the repository root (not rendered here):
 - `config.example.toml` — local MinIO-oriented sample
 - `config.docker.toml` — small Compose demo volumes
 - `config.integration.toml` — larger single-volume lab config
+- `config.mpio-a.toml` / `config.mpio-b.toml` — dual-instance MPIO lab
 - `docker-compose.yml` — MinIO + iscsi-s3
+- `docker-compose.mpio.yml` — MinIO + two iscsi-s3 paths
 - `scripts/smoke-test.sh` — automated smoke
 - `scripts/build-docs-site.sh` — build this static site via Docker
 - `scripts/serve-docs-site.sh` — live-reload docs preview via Docker

@@ -28,8 +28,19 @@ pub struct Config {
     pub bind: String,
     /// Host (or host:port) advertised in SendTargets. When unset, the target
     /// uses the socket's local address (often a container/NAT IP).
+    /// Ignored when `portals` is non-empty (except as documentation of this
+    /// instance's preferred address).
     #[serde(default)]
     pub advertise: Option<String>,
+    /// All client-reachable portals for SendTargets (MPIO / multi-instance).
+    /// Each entry is `host` or `host:port` (host-only reuses `bind`'s port).
+    /// Discovery lists every portal for each IQN so initiators can open
+    /// multiple paths. Each iscsi-s3 process still binds only `bind`.
+    #[serde(default)]
+    pub portals: Vec<String>,
+    /// Optional instance label (metrics / logs) for multi-instance deployments.
+    #[serde(default)]
+    pub instance: Option<String>,
     #[serde(default)]
     pub s3: S3Config,
     #[serde(default)]
@@ -210,6 +221,8 @@ impl Config {
         let defaults = Config {
             bind: DEFAULT_BIND.to_string(),
             advertise: None,
+            portals: Vec::new(),
+            instance: None,
             s3: S3Config {
                 bucket: None,
                 region: default_region(),

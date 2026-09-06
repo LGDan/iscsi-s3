@@ -56,6 +56,22 @@ pub trait ScsiBlockDevice: Send + Sync {
     fn product_rev(&self) -> &str {
         "1.0 "
     }
+
+    /// Unit serial number for INQUIRY VPD page 0x80 (exactly 16 ASCII bytes).
+    ///
+    /// Must be stable across processes/hosts for the same logical volume so
+    /// multipath (dm-multipath) can correlate paths.
+    fn serial_number(&self) -> &str {
+        "ISCSI00000000001"
+    }
+
+    /// 8-byte NAA identifier for INQUIRY VPD page 0x83.
+    ///
+    /// Default is a fixed placeholder; backends should override with a
+    /// volume-unique, instance-stable value.
+    fn naa_identifier(&self) -> [u8; 8] {
+        [0x60, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01]
+    }
 }
 
 /// SCSI command opcodes (subset needed for basic block storage)
@@ -397,7 +413,7 @@ impl ScsiHandler {
     }
 
     /// Handle INQUIRY VPD pages
-    fn handle_inquiry_vpd(page_code: u8, alloc_len: usize, _device: &dyn ScsiBlockDevice, target_name: Option<&str>) -> ScsiResult<ScsiResponse> {
+    fn handle_inquiry_vpd(page_code: u8, alloc_len: usize, device: &dyn ScsiBlockDevice, target_name: Option<&str>) -> ScsiResult<ScsiResponse> {
         match page_code {
             0x00 => {
                 // Supported VPD pages
@@ -407,9 +423,14 @@ impl ScsiHandler {
                 Ok(ScsiResponse::good(data))
             }
             0x80 => {
-                // Unit Serial Number
-                let mut data = vec![0x00, 0x80, 0x00, 16]; // Device type, page code, reserved, page length
-                data.extend_from_slice(b"ISCSI00000000001"); // 16-char serial
+                // Unit Serial Number — must be unique per volume and stable across instances
+                let mut serial = device.serial_number().as_bytes().to_vec();
+                serial.truncate(16);
+                while serial.len() < 16 {
+                    serial.push(b' ');
+                }
+                let mut data = vec![0x00, 0x80, 0x00, 16];
+                data.extend_from_slice(&serial);
                 data.truncate(alloc_len.min(data.len()));
                 Ok(ScsiResponse::good(data))
             }
@@ -417,11 +438,12 @@ impl ScsiHandler {
                 // Device Identification
                 let mut data = vec![0x00, 0x83, 0x00, 0x00]; // Header
 
-                // NAA descriptor (binary, NAA type)
-                let naa_desc = [
+                // NAA descriptor (binary) — volume-unique, instance-stable
+                let naa = device.naa_identifier();
+                let mut naa_desc = vec![
                     0x01, 0x03, 0x00, 0x08, // Code set=binary, type=NAA, length=8
-                    0x60, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, // NAA-6 identifier
                 ];
+                naa_desc.extend_from_slice(&naa);
                 data.extend_from_slice(&naa_desc);
 
                 // iSCSI target name descriptor (required for proper device identification)
@@ -430,7 +452,7 @@ impl ScsiHandler {
                     // Pad to 4-byte boundary
                     let padded_len = (name_bytes.len() + 3) & !3;
                     data.push(0x02); // Code set = ASCII
-                    data.push(0x05); // Association = target port, Designator type = SCSI name string
+                    data.push(0x05); // Association = LUN, Designator type = SCSI name string
                     data.push(0x00); // Reserved
                     data.push(padded_len as u8); // Designator length
                     data.extend_from_slice(name_bytes);

@@ -1075,16 +1075,27 @@ fn handle_text_request(
     target_name: &str,
     target_address: &str,
 ) -> ScsiResult<Vec<IscsiPdu>> {
+    handle_text_request_multi(session, pdu, target_name, &[target_address.to_string()])
+}
+
+/// SendTargets may list multiple TargetAddress values (MPIO portals).
+fn handle_text_request_multi(
+    session: &mut AnySession,
+    pdu: &IscsiPdu,
+    target_name: &str,
+    portals: &[String],
+) -> ScsiResult<Vec<IscsiPdu>> {
     let text_req = pdu.parse_text_request()?;
 
     let is_send_targets = text_req.parameters.iter()
         .any(|(k, v)| k == "SendTargets" && (v == "All" || v.is_empty()));
 
     let response_params = if is_send_targets {
-        vec![
-            ("TargetName".to_string(), target_name.to_string()),
-            ("TargetAddress".to_string(), format!("{},1", target_address)),
-        ]
+        let mut params = vec![("TargetName".to_string(), target_name.to_string())];
+        for portal in portals {
+            params.push(("TargetAddress".to_string(), format!("{},1", portal)));
+        }
+        params
     } else {
         vec![]
     };
@@ -1248,8 +1259,9 @@ pub trait SessionEventSink: Send + Sync {
 /// Serves multiple targets on a single port with IQN-based routing
 pub struct IscsiServer {
     bind_addr: String,
-    /// Optional host:port returned in SendTargets (defaults to socket local_addr).
-    advertise_addr: Option<String>,
+    /// Client-reachable portal addresses for SendTargets (host:port).
+    /// Empty = use the socket local_addr alone.
+    portal_addrs: Vec<String>,
     targets: Arc<Mutex<std::collections::HashMap<String, TargetInfo>>>,
     running: Arc<AtomicBool>,
     shutting_down: Arc<AtomicBool>,
@@ -1311,14 +1323,14 @@ impl IscsiServer {
                     let active_connections = Arc::clone(&self.active_connections);
                     let max_sessions = self.max_sessions;
                     let active_sessions = Arc::clone(&self.active_sessions);
-                    let advertise_addr = self.advertise_addr.clone();
+                    let portal_addrs = self.portal_addrs.clone();
                     let session_events = self.session_events.clone();
 
                     thread::spawn(move || {
                         let outcome = match handle_multi_target_connection(
                             stream,
                             targets,
-                            advertise_addr.as_deref(),
+                            portal_addrs,
                             running,
                             shutting_down,
                             max_sessions,
@@ -1400,12 +1412,12 @@ impl IscsiServer {
     }
 }
 
-/// Resolve the portal string used in SendTargets TargetAddress (host:port).
-fn resolve_portal_address(stream: &TcpStream, advertise: Option<&str>) -> ScsiResult<String> {
-    if let Some(addr) = advertise {
-        return Ok(addr.to_string());
+/// Resolve portal list for SendTargets. Configured portals win; otherwise socket local_addr.
+fn resolve_portal_addresses(stream: &TcpStream, configured: &[String]) -> ScsiResult<Vec<String>> {
+    if !configured.is_empty() {
+        return Ok(configured.to_vec());
     }
-    Ok(stream.local_addr().map_err(IscsiError::Io)?.to_string())
+    Ok(vec![stream.local_addr().map_err(IscsiError::Io)?.to_string()])
 }
 
 struct MultiTargetOutcome {
@@ -1417,7 +1429,7 @@ struct MultiTargetOutcome {
 fn handle_multi_target_connection(
     mut stream: TcpStream,
     targets: Arc<Mutex<std::collections::HashMap<String, TargetInfo>>>,
-    advertise_addr: Option<&str>,
+    portal_addrs: Vec<String>,
     running: Arc<AtomicBool>,
     shutting_down: Arc<AtomicBool>,
     max_sessions: u32,
@@ -1429,12 +1441,13 @@ fn handle_multi_target_connection(
     stream.set_read_timeout(Some(Duration::from_secs(5))).map_err(IscsiError::Io)?;
     stream.set_write_timeout(Some(Duration::from_secs(5))).map_err(IscsiError::Io)?;
 
-    let portal = resolve_portal_address(&stream, advertise_addr)?;
+    let portals = resolve_portal_addresses(&stream, &portal_addrs)?;
+    let primary_portal = portals.first().cloned().unwrap_or_else(|| "0.0.0.0:3260".into());
     log::info!(
-        "Handling multi-target connection from {} (portal={}, advertise={})",
+        "Handling multi-target connection from {} (local={}, portals={:?})",
         peer,
         stream.local_addr().map(|a| a.to_string()).unwrap_or_else(|_| "?".into()),
-        portal
+        portals
     );
 
     // Read first PDU to extract target name (login has no digests yet).
@@ -1467,7 +1480,7 @@ fn handle_multi_target_connection(
 
     if target_name.is_none() {
         log::info!("Discovery session from {}", peer);
-        let _ = handle_discovery_session(stream, targets, &portal, first_pdu, peer)?;
+        let _ = handle_discovery_session(stream, targets, &portals, first_pdu, peer)?;
         return Ok(MultiTargetOutcome {
             session_entered: false,
             target_iqn: None,
@@ -1517,7 +1530,8 @@ fn handle_multi_target_connection(
         active_sessions,
         allowed_initiators,
         first_pdu,
-        &portal,
+        &primary_portal,
+        &portals,
         session_events,
         peer,
     )?;
@@ -1532,7 +1546,7 @@ fn handle_multi_target_connection(
 fn handle_discovery_session(
     mut stream: TcpStream,
     targets: Arc<Mutex<std::collections::HashMap<String, TargetInfo>>>,
-    portal: &str,
+    portals: &[String],
     first_pdu: IscsiPdu,
     peer: std::net::SocketAddr,
 ) -> ScsiResult<bool> {
@@ -1595,16 +1609,19 @@ fn handle_discovery_session(
                         let mut response_params = Vec::new();
                         for (iqn, _) in targets_lock.iter() {
                             response_params.push(("TargetName".to_string(), iqn.clone()));
-                            // Same portal for every IQN on this shared listener.
-                            response_params
-                                .push(("TargetAddress".to_string(), format!("{},1", portal)));
+                            // All portals for this IQN (MPIO / multi-instance discovery).
+                            for portal in portals {
+                                response_params
+                                    .push(("TargetAddress".to_string(), format!("{},1", portal)));
+                            }
                         }
                         drop(targets_lock);
                         log::info!(
-                            "SendTargets for {}: {} target(s) at {}",
+                            "SendTargets for {}: {} target(s), {} portal(s) {:?}",
                             peer,
-                            response_params.len() / 2,
-                            portal
+                            response_params.iter().filter(|(k, _)| k == "TargetName").count(),
+                            portals.len(),
+                            portals
                         );
                         serialize_text_parameters(&response_params)
                     } else {
@@ -1690,6 +1707,7 @@ fn handle_connection_with_first_pdu_boxed(
     allowed_initiators: Option<Vec<String>>,
     first_pdu: IscsiPdu,
     portal: &str,
+    portals: &[String],
     session_events: Option<Arc<dyn SessionEventSink>>,
     peer: std::net::SocketAddr,
 ) -> ScsiResult<bool> {
@@ -1860,7 +1878,7 @@ fn handle_connection_with_first_pdu_boxed(
                 }
                 opcode::SCSI_DATA_OUT => handle_scsi_data_out_boxed(&mut session, &pdu, &device)?,
                 opcode::TEXT_REQUEST => {
-                    handle_text_request(&mut session, &pdu, target_name, portal)?
+                    handle_text_request_multi(&mut session, &pdu, target_name, portals)?
                 }
                 opcode::NOP_OUT => vec![session.process_nop_out(&pdu)?],
                 opcode::LOGOUT_REQUEST => {
@@ -2337,7 +2355,7 @@ fn handle_scsi_data_out_boxed(
 /// Builder for configuring a multi-target iSCSI server
 pub struct IscsiServerBuilder {
     bind_addr: Option<String>,
-    advertise_addr: Option<String>,
+    portal_addrs: Vec<String>,
     targets: std::collections::HashMap<String, (Box<dyn ScsiBlockDevice + Send>, String, crate::auth::AuthConfig, Option<Vec<String>>)>,
     max_connections: Option<u32>,
     max_sessions: Option<u32>,
@@ -2348,7 +2366,7 @@ impl IscsiServerBuilder {
     fn new() -> Self {
         Self {
             bind_addr: None,
-            advertise_addr: None,
+            portal_addrs: Vec::new(),
             targets: std::collections::HashMap::new(),
             max_connections: None,
             max_sessions: None,
@@ -2361,9 +2379,19 @@ impl IscsiServerBuilder {
         self
     }
 
-    /// Host:port returned in SendTargets for every IQN on this portal.
+    /// Single portal for SendTargets (convenience; overwrites `portal_addrs`).
     pub fn advertise_addr(mut self, addr: &str) -> Self {
-        self.advertise_addr = Some(addr.to_string());
+        self.portal_addrs = vec![addr.to_string()];
+        self
+    }
+
+    /// All client-reachable portals for SendTargets (MPIO / multi-instance).
+    pub fn portal_addrs<I, S>(mut self, addrs: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.portal_addrs = addrs.into_iter().map(Into::into).collect();
         self
     }
 
@@ -2433,7 +2461,7 @@ impl IscsiServerBuilder {
 
         Ok(IscsiServer {
             bind_addr,
-            advertise_addr: self.advertise_addr,
+            portal_addrs: self.portal_addrs,
             targets: Arc::new(Mutex::new(targets_map)),
             running: Arc::new(AtomicBool::new(false)),
             shutting_down: Arc::new(AtomicBool::new(false)),

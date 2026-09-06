@@ -14,10 +14,12 @@ Initiator  --iSCSI-->  iscsi-s3  --Get/PutObject-->  S3 / MinIO
 
 - Layered config: defaults → TOML → `ISCSI_S3_*` env → CLI
 - Multiple volumes on one TCP portal (IQN-based routing)
+- Multi-portal SendTargets + multi-instance Path-A MPIO (shared S3, CAS writes)
 - Grow-only capacity via `{prefix}/meta.json`
 - Sparse disks (missing chunks read as zeros)
-- Whole-chunk LRU cache
+- Whole-chunk LRU cache (disable for multi-instance)
 - AWS S3 and path-style / custom-endpoint backends
+- Prometheus metrics (`/metrics`)
 
 ## Quick start
 
@@ -36,7 +38,7 @@ Set `advertise` in the mounted config to an address clients can reach (for Docke
 | [Docs index](docs/README.md) | Full documentation map |
 | [User getting started](docs/users/getting-started.md) | Run the target and connect a Linux initiator |
 | [Configuration](docs/users/configuration.md) | TOML, env, CLI reference |
-| [User tutorials](docs/users/tutorials.md) | Mount disks, grow volumes, remote access, iSCSI boot |
+| [User tutorials](docs/users/tutorials.md) | Mount disks, grow volumes, remote access, MPIO, iSCSI boot |
 | [Developer getting started](docs/developers/getting-started.md) | Build, layout, vendored crate |
 | [Architecture](docs/developers/architecture.md) | How chunks, ports, and sessions work |
 | [Testing](docs/developers/testing.md) | Unit, integration, and smoke tests |
@@ -55,6 +57,8 @@ Set `advertise` in the mounted config to an address clients can reach (for Docke
 - No CHAP / initiator ACL UI yet (treat portals as trusted-network only).
 - No SCSI UNMAP/TRIM thin-provision reporting.
 - Shrink and geometry (`chunk_size` / `block_size`) changes are refused after first open.
+- Multi-instance MPIO requires `cache.max_bytes = 0` and identical IQN/prefix/portals on peers.
+- Not MCS (`MaxConnections > 1`); use separate sessions + dm-multipath.
 - Primary validation: Linux open-iscsi, Intel iSCSI Boot (with caveats), bundled smoke client.
 
 ## License

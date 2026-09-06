@@ -1,0 +1,16 @@
+# Scrape both MPIO path instances (docker-compose.mpio.yml).
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+scrape_configs:
+  - job_name: iscsi-s3
+    static_configs:
+      - targets: ["iscsi-s3-a:9090"]
+        labels:
+          instance: a
+          service: iscsi-s3
+      - targets: ["iscsi-s3-b:9090"]
+        labels:
+          instance: b
+          service: iscsi-s3

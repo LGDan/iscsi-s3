@@ -49,7 +49,7 @@ docs/              # this documentation
 
 Upstream crates.io `iscsi-target` 1.0.0 is vendored under `vendor/iscsi-target` with local fixes documented in `vendor/iscsi-target/VENDOR.md`, including:
 
-- `advertise_addr` for SendTargets behind Docker/NAT
+- `advertise_addr` / `portal_addrs` for SendTargets behind Docker/NAT and MPIO
 - Login Response ISID on the wire
 - `AuthMethod=None` transit into operational negotiation
 - `MaxConnections` negotiation / richer logging

@@ -204,7 +204,7 @@ impl S3ChunkStore {
         result
     }
 
-    fn get_chunk(&self, index: u64) -> Result<Vec<u8>, StoreError> {
+    fn get_chunk(&self, index: u64) -> Result<(Vec<u8>, Option<String>), StoreError> {
         let started = Instant::now();
         let key = self.chunk_key(index);
         let client = self.client.clone();
@@ -219,6 +219,7 @@ impl S3ChunkStore {
                 .await
             {
                 Ok(out) => {
+                    let etag = out.e_tag().map(|s| s.to_string());
                     let bytes = out
                         .body
                         .collect()
@@ -231,7 +232,7 @@ impl S3ChunkStore {
                             bytes.len()
                         )));
                     }
-                    Ok(bytes.to_vec())
+                    Ok((bytes.to_vec(), etag))
                 }
                 Err(e) => {
                     let msg = e.to_string();
@@ -240,20 +241,28 @@ impl S3ChunkStore {
                         || msg.contains("404")
                         || msg.contains("Not Found")
                     {
-                        Ok(vec![0u8; chunk_size])
+                        Ok((vec![0u8; chunk_size], None))
                     } else {
                         Err(StoreError::S3(msg))
                     }
                 }
             }
         });
-        let bytes = result.as_ref().map(|v| v.len() as u64).unwrap_or(0);
+        let bytes = result
+            .as_ref()
+            .map(|(v, _)| v.len() as u64)
+            .unwrap_or(0);
         self.metrics
             .observe_s3(&self.labels, "get", bytes, started, result.is_ok());
         result
     }
 
-    fn put_chunk(&self, index: u64, data: &[u8]) -> Result<(), StoreError> {
+    fn put_chunk(
+        &self,
+        index: u64,
+        data: &[u8],
+        if_match: Option<&str>,
+    ) -> Result<(), StoreError> {
         let started = Instant::now();
         if data.len() as u64 != self.chunk_size {
             self.metrics
@@ -269,13 +278,17 @@ impl S3ChunkStore {
         let bucket = self.bucket.clone();
         let body = data.to_vec();
         let bytes = body.len() as u64;
+        let if_match = if_match.map(|s| s.to_string());
         let result = self.run_async(async move {
-            client
+            let mut req = client
                 .put_object()
                 .bucket(&bucket)
                 .key(&key)
-                .body(ByteStream::from(body))
-                .send()
+                .body(ByteStream::from(body));
+            if let Some(etag) = if_match {
+                req = req.if_match(etag);
+            }
+            req.send()
                 .await
                 .map_err(|e| StoreError::S3(e.to_string()))?;
             Ok(())
@@ -283,6 +296,17 @@ impl S3ChunkStore {
         self.metrics
             .observe_s3(&self.labels, "put", bytes, started, result.is_ok());
         result
+    }
+
+    fn is_precondition_failed(err: &StoreError) -> bool {
+        match err {
+            StoreError::S3(msg) => {
+                msg.contains("PreconditionFailed")
+                    || msg.contains("412")
+                    || msg.contains("At least one of the pre-conditions")
+            }
+            _ => false,
+        }
     }
 }
 
@@ -349,7 +373,7 @@ impl BlockStore for S3ChunkStore {
             let within = (abs % self.chunk_size) as usize;
             let take = ((self.chunk_size as usize) - within).min(buf.len() - done);
             let _guard = self.stripe(chunk_idx).lock();
-            let chunk = self.get_chunk(chunk_idx)?;
+            let (chunk, _) = self.get_chunk(chunk_idx)?;
             buf[done..done + take].copy_from_slice(&chunk[within..within + take]);
             done += take;
         }
@@ -368,21 +392,41 @@ impl BlockStore for S3ChunkStore {
             let within = (abs % self.chunk_size) as usize;
             let take = (chunk_size - within).min(data.len() - done);
             let _guard = self.stripe(chunk_idx).lock();
-            let t0 = std::time::Instant::now();
-            let mut chunk = if within == 0 && take == chunk_size {
-                vec![0u8; chunk_size]
-            } else {
-                self.get_chunk(chunk_idx)?
-            };
-            let t1 = std::time::Instant::now();
-            chunk[within..within + take].copy_from_slice(&data[done..done + take]);
-            self.put_chunk(chunk_idx, &chunk)?;
-            tracing::info!(
-                chunk_idx,
-                get_ms = t1.duration_since(t0).as_millis(),
-                put_ms = t0.elapsed().as_millis(),
-                "s3 write_at chunk"
-            );
+            // Optimistic concurrency for multi-instance: RMW with If-Match ETag.
+            const MAX_CAS_ATTEMPTS: usize = 8;
+            let mut attempt = 0usize;
+            loop {
+                attempt += 1;
+                let t0 = std::time::Instant::now();
+                let (mut chunk, etag) = if within == 0 && take == chunk_size {
+                    (vec![0u8; chunk_size], None)
+                } else {
+                    self.get_chunk(chunk_idx)?
+                };
+                let t1 = std::time::Instant::now();
+                chunk[within..within + take].copy_from_slice(&data[done..done + take]);
+                match self.put_chunk(chunk_idx, &chunk, etag.as_deref()) {
+                    Ok(()) => {
+                        tracing::info!(
+                            chunk_idx,
+                            attempt,
+                            get_ms = t1.duration_since(t0).as_millis(),
+                            put_ms = t0.elapsed().as_millis(),
+                            "s3 write_at chunk"
+                        );
+                        break;
+                    }
+                    Err(e) if Self::is_precondition_failed(&e) && attempt < MAX_CAS_ATTEMPTS => {
+                        tracing::warn!(
+                            chunk_idx,
+                            attempt,
+                            "s3 chunk CAS conflict; retrying"
+                        );
+                        continue;
+                    }
+                    Err(e) => return Err(e),
+                }
+            }
             done += take;
         }
         tracing::info!(

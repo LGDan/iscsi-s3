@@ -12,7 +12,7 @@ use iscsi_s3::store::BlockStore;
 use iscsi_s3::volume::{build_s3_client, open_volume};
 use iscsi_target::IscsiServer;
 use std::sync::Arc;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 
 fn main() {
@@ -81,6 +81,23 @@ fn format_host_port(host: &str, port: u16) -> String {
     }
 }
 
+/// Resolve portal list for SendTargets (MPIO).
+///
+/// Preference: non-empty `portals` → each resolved; else single `advertise`;
+/// else empty (vendor falls back to socket local_addr).
+fn resolve_portals(cfg: &Config) -> Result<Vec<String>, String> {
+    if !cfg.portals.is_empty() {
+        cfg.portals
+            .iter()
+            .map(|p| resolve_advertise(p, &cfg.bind))
+            .collect()
+    } else if let Some(ref adv) = cfg.advertise {
+        Ok(vec![resolve_advertise(adv, &cfg.bind)?])
+    } else {
+        Ok(Vec::new())
+    }
+}
+
 fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     let cfg = Config::load(&cli)?;
 
@@ -94,15 +111,18 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     let cache = ChunkCache::new(cfg.cache.max_bytes);
     let metrics = Metrics::new().map_err(|e| e.to_string())?;
 
-    let advertise = cfg
-        .advertise
-        .as_deref()
-        .map(|a| resolve_advertise(a, &cfg.bind))
-        .transpose()?;
+    let portals = resolve_portals(&cfg)?;
+    if portals.len() > 1 && cfg.cache.max_bytes > 0 {
+        warn!(
+            cache_max_bytes = cfg.cache.max_bytes,
+            portals = portals.len(),
+            "multi-portal / multi-instance: per-process chunk cache can serve stale data after a peer write; set cache.max_bytes = 0 for correct failover"
+        );
+    }
 
     let mut builder = IscsiServer::builder().bind_addr(&cfg.bind);
-    if let Some(ref addr) = advertise {
-        builder = builder.advertise_addr(addr);
+    if !portals.is_empty() {
+        builder = builder.portal_addrs(portals.clone());
     }
 
     let mut volume_labels: Vec<VolumeLabels> = Vec::new();
@@ -121,7 +141,8 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             name = %opened.name,
             iqn = %opened.iqn,
             bind = %cfg.bind,
-            advertise = advertise.as_deref().unwrap_or("(socket local_addr)"),
+            instance = cfg.instance.as_deref().unwrap_or("-"),
+            portals = ?portals,
             capacity = opened.store.capacity(),
             "volume ready"
         );
@@ -139,7 +160,8 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     let server = Arc::new(builder.build().map_err(|e| e.to_string())?);
     info!(
         bind = %cfg.bind,
-        advertise = advertise.as_deref().unwrap_or("(socket local_addr)"),
+        instance = cfg.instance.as_deref().unwrap_or("-"),
+        portals = ?portals,
         volumes = cfg.volumes.len(),
         "starting shared-portal IscsiServer (one TCP port, many IQNs)"
     );
@@ -170,7 +192,8 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
 
 #[cfg(test)]
 mod tests {
-    use super::resolve_advertise;
+    use super::{resolve_advertise, resolve_portals};
+    use iscsi_s3::config::Config;
 
     #[test]
     fn advertise_host_only_uses_bind_port() {
@@ -185,6 +208,24 @@ mod tests {
         assert_eq!(
             resolve_advertise("10.0.0.5:4000", "0.0.0.0:3260").unwrap(),
             "10.0.0.5:4000"
+        );
+    }
+
+    #[test]
+    fn portals_list_takes_precedence() {
+        let cfg = Config {
+            bind: "0.0.0.0:3260".into(),
+            advertise: Some("10.0.0.1".into()),
+            portals: vec!["10.0.0.1".into(), "10.0.0.2:3260".into()],
+            instance: Some("a".into()),
+            s3: Default::default(),
+            cache: Default::default(),
+            metrics: Default::default(),
+            volumes: vec![],
+        };
+        assert_eq!(
+            resolve_portals(&cfg).unwrap(),
+            vec!["10.0.0.1:3260".to_string(), "10.0.0.2:3260".to_string()]
         );
     }
 }

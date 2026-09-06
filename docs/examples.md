@@ -527,6 +527,51 @@ If the peer EOFs before FullFeature, compare login response flags/ISID (see vend
 
 ---
 
+## 13. Dual-path MPIO (two daemons, shared S3)
+
+**Goal:** Resilience / rolling upgrades via Path-A multipath (not MCS).
+
+Use the lab stack:
+
+```bash
+docker compose -f docker-compose.mpio.yml up -d --build
+```
+
+Or dual-NIC on bare metal (same volume IQN/prefix on both; cache off):
+
+```toml
+# instance A — bind this NIC
+bind = "10.0.0.1:3260"
+instance = "a"
+portals = ["10.0.0.1:3260", "10.0.0.2:3260"]
+
+[cache]
+max_bytes = 0
+
+[[volumes]]
+name = "disk0"
+iqn = "iqn.2026-09.local.iscsi-s3:disk0"
+prefix = "disks/disk0"
+capacity = "100GiB"
+```
+
+```toml
+# instance B — bind the other NIC
+bind = "10.0.0.2:3260"
+instance = "b"
+portals = ["10.0.0.1:3260", "10.0.0.2:3260"]
+
+[cache]
+max_bytes = 0
+
+[[volumes]]
+# identical to A
+```
+
+Login both portals, then configure dm-multipath. Full walkthrough: [Tutorial 7](users/tutorials.md#tutorial-7--dual-path-mpio-multi-instance).
+
+---
+
 ## Related docs
 
 - [User getting started](users/getting-started.md)

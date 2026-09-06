@@ -2,6 +2,11 @@ bind = "0.0.0.0:3260"
 # Host (or host:port) returned in SendTargets for the shared portal.
 # Needed when clients cannot reach the listen address (Docker/NAT).
 # advertise = "127.0.0.1"
+#
+# Multi-instance MPIO: list every client-reachable portal (this process still
+# binds only `bind`). Discovery returns all of them for each IQN.
+# portals = ["10.0.0.1:3260", "10.0.0.2:3260"]
+# instance = "path-a"   # optional label for logs
 
 [s3]
 bucket = "iscsi"
@@ -14,6 +19,8 @@ force_path_style = true
 
 [cache]
 max_bytes = "256MiB"
+# For multi-instance MPIO set to 0 so peers cannot return stale chunks:
+# max_bytes = 0
 
 [metrics]
 # Prometheus scrape endpoint (GET /metrics). Disable with enabled = false.

@@ -23,16 +23,19 @@ S3 I/O runs on a dedicated Tokio runtime. iSCSI connection threads call into the
 
 ## One portal, many IQNs
 
-All volumes share `bind` (for example `0.0.0.0:3260`). Discovery lists every IQN with the same `TargetAddress` (from `advertise`, or the socket `local_addr`). Login includes `TargetName=<iqn>`; the server routes to that volume’s device.
+All volumes share `bind` (for example `0.0.0.0:3260`). Discovery lists every IQN with one or more `TargetAddress` values (from `portals`, else `advertise`, else the socket `local_addr`). Login includes `TargetName=<iqn>`; the server routes to that volume’s device.
 
 Earlier builds used one TCP port per volume to work around digest bugs in the multi-target path. Digests on `IscsiServer` are fixed; the shared portal is the default again.
 
-## Advertise vs bind
+## Advertise, portals, and multi-instance MPIO
 
-- `bind` — where the process listens (`0.0.0.0:3260` is typical in containers).
-- `advertise` — `TargetAddress` in SendTargets / related text. Required when `local_addr` is not client-reachable (Docker publish, NAT).
+- `bind` — where **this** process listens (`0.0.0.0:3260` is typical in containers).
+- `advertise` — single `TargetAddress` when `portals` is empty. Required when `local_addr` is not client-reachable (Docker publish, NAT).
+- `portals` — full list of client-reachable portals for SendTargets. Use the **same** list on every iscsi-s3 instance that fronts the same volumes so discovery teaches the initiator every path.
 
-Implementation: `advertise_addr` on `IscsiServer` / `IscsiTarget` builders in the vendored crate.
+**Path A (host multipath):** run one daemon per NIC/path; identical `[[volumes]]` and S3 prefix; SCSI serial/NAA derived from IQN so dm-multipath merges paths; chunk writes use S3 `If-Match` CAS for concurrent RMW. Set `cache.max_bytes = 0` (per-process LRU cannot see peer writes). This is **not** MCS (`MaxConnections > 1`).
+
+Implementation: `portal_addrs` / `advertise_addr` on `IscsiServer` / `IscsiTarget` builders in the vendored crate.
 
 ## Chunking and meta
 

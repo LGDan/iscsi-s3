@@ -1,5 +1,6 @@
 //! `ScsiBlockDevice` adapter over `BlockStore`.
 
+use crate::identity::{naa_from_iqn, serial_from_iqn};
 use crate::metrics::{Metrics, VolumeLabels};
 use crate::store::{BlockStore, StoreError};
 use iscsi_target::{ScsiBlockDevice, ScsiResult};
@@ -10,6 +11,8 @@ use tracing::error;
 pub struct S3BlockDevice<S: BlockStore> {
     store: Arc<S>,
     product: String,
+    serial: String,
+    naa: [u8; 8],
     labels: VolumeLabels,
     metrics: Arc<Metrics>,
 }
@@ -22,9 +25,13 @@ impl<S: BlockStore> S3BlockDevice<S> {
         while product.len() < 16 {
             product.push(' ');
         }
+        let serial = serial_from_iqn(&labels.iqn);
+        let naa = naa_from_iqn(&labels.iqn);
         Self {
             store,
             product,
+            serial,
+            naa,
             labels,
             metrics,
         }
@@ -156,5 +163,13 @@ impl<S: BlockStore + 'static> ScsiBlockDevice for S3BlockDevice<S> {
 
     fn product_rev(&self) -> &str {
         "0.1 "
+    }
+
+    fn serial_number(&self) -> &str {
+        &self.serial
+    }
+
+    fn naa_identifier(&self) -> [u8; 8] {
+        self.naa
     }
 }

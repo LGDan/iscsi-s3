@@ -6,14 +6,14 @@
 |-----|----------|
 | [Getting started](users/getting-started.md) | Docker Compose or local binary; discover and login with open-iscsi |
 | [Configuration](users/configuration.md) | Precedence, field reference, env/CLI |
-| [Tutorials](users/tutorials.md) | Format/mount, grow, remote LAN, firmware iSCSI boot notes |
+| [Tutorials](users/tutorials.md) | Format/mount, grow, remote LAN, MPIO, firmware iSCSI boot notes |
 
 ## For developers
 
 | Doc | Contents |
 |-----|----------|
 | [Getting started](developers/getting-started.md) | Clone, build, project layout, vendored `iscsi-target` |
-| [Architecture](developers/architecture.md) | Ports, chunks, cache, login/advertise |
+| [Architecture](developers/architecture.md) | Ports, portals/MPIO, chunks, cache, login/advertise |
 | [Testing](developers/testing.md) | Unit tests, MinIO integration, smoke script |
 
 ## Examples
@@ -39,7 +39,9 @@ Uses a temporary `squidfunk/mkdocs-material` container (no local Python required
 | [config.example.toml](../config.example.toml) | Local MinIO-oriented sample |
 | [config.docker.toml](../config.docker.toml) | Small Compose demo volumes |
 | [config.integration.toml](../config.integration.toml) | Larger single-volume lab config |
+| [config.mpio-a.toml](../config.mpio-a.toml) / [config.mpio-b.toml](../config.mpio-b.toml) | Dual-instance MPIO lab |
 | [docker-compose.yml](../docker-compose.yml) | MinIO + iscsi-s3 |
+| [docker-compose.mpio.yml](../docker-compose.mpio.yml) | MinIO + two iscsi-s3 paths |
 | [scripts/smoke-test.sh](../scripts/smoke-test.sh) | Automated smoke |
 | [scripts/build-docs-site.sh](../scripts/build-docs-site.sh) | Build static docs site via Docker |
 | [scripts/serve-docs-site.sh](../scripts/serve-docs-site.sh) | Live-reload docs preview via Docker |

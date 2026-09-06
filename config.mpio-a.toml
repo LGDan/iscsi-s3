@@ -1,8 +1,8 @@
-# Docker Compose / container defaults (MinIO service hostname)
+# Path A instance for dual-portal MPIO lab (see docker-compose.mpio.yml).
+# Same volumes / S3 prefix as config.mpio-b.toml; different bind publish + instance.
 bind = "0.0.0.0:3260"
-# Reachable address for SendTargets (host publishes 3260).
-advertise = "127.0.0.1"
-# For MPIO lab instead: portals = ["127.0.0.1:3260", "127.0.0.1:3261"]
+instance = "a"
+portals = ["127.0.0.1:3260", "127.0.0.1:3261"]
 
 [s3]
 bucket = "iscsi"
@@ -13,7 +13,8 @@ access_key_id = "minioadmin"
 secret_access_key = "minioadmin"
 
 [cache]
-max_bytes = "64MiB"
+# Required for multi-instance correctness (no cross-process invalidation).
+max_bytes = 0
 
 [metrics]
 enabled = true
@@ -24,11 +25,4 @@ name = "disk0"
 iqn = "iqn.2026-09.local.iscsi-s3:disk0"
 prefix = "disks/disk0"
 capacity = "64MiB"
-chunk_size = "64KiB"
-
-[[volumes]]
-name = "disk1"
-iqn = "iqn.2026-09.local.iscsi-s3:disk1"
-prefix = "disks/disk1"
-capacity = "32MiB"
 chunk_size = "64KiB"
