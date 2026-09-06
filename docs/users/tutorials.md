@@ -74,7 +74,7 @@ advertise = "192.168.88.15"   # address initiators will dial
 ```
 
 2. Publish/firewall TCP `3260` (shared portal for all IQNs).
-3. Prefer a trusted network or VPN — default builds do not enable CHAP.
+3. Prefer a trusted network or VPN, or enable [CHAP](configuration.md#chap-authentication).
 4. On the initiator:
 
 ```bash

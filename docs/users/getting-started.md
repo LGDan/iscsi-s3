@@ -109,5 +109,5 @@ sudo iscsiadm -m node -T iqn.2026-09.local.iscsi-s3:disk0 -p OLDHOST:3260 -o del
 
 - [Tutorials](tutorials.md) — format/mount, grow, remote, iSCSI boot
 - [MPIO setup](mpio.md) — dual-path multipath / multi-instance
-- [Configuration](configuration.md) — full reference
+- [Configuration](configuration.md) — full reference (including [CHAP](configuration.md#chap-authentication))
 - [Examples](../examples.md) — ready-made Compose + TOML recipes

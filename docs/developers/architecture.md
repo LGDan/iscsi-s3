@@ -63,4 +63,4 @@ Process-wide LRU of whole chunks (`cache.max_bytes`). Shared across volumes. Imp
 
 ## Security model (current)
 
-No CHAP or ACL in default configs. Bind to trusted interfaces / networks only until auth lands.
+Optional CHAP (one-way or mutual) and initiator ACL are configured via `[auth]` / `volumes[].auth`. Discovery sessions remain unauthenticated. Bind to trusted interfaces when auth is disabled.

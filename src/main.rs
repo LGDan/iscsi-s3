@@ -5,7 +5,7 @@
 
 use clap::Parser;
 use iscsi_s3::cache::ChunkCache;
-use iscsi_s3::config::{Cli, Config};
+use iscsi_s3::config::{resolve_auth, Cli, Config};
 use iscsi_s3::device::S3BlockDevice;
 use iscsi_s3::metrics::{spawn_metrics_server, Metrics, SessionMetricsSink, VolumeLabels};
 use iscsi_s3::store::BlockStore;
@@ -137,19 +137,28 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             index,
             vol,
         )?;
+        let capacity = opened.store.capacity();
+        volume_labels.push(opened.labels.clone());
+        let device = S3BlockDevice::new(opened.store, opened.labels, Arc::clone(&metrics));
+        let auth = resolve_auth(&cfg.auth, &vol.auth)?;
         info!(
             name = %opened.name,
             iqn = %opened.iqn,
             bind = %cfg.bind,
             instance = cfg.instance.as_deref().unwrap_or("-"),
             portals = ?portals,
-            capacity = opened.store.capacity(),
+            capacity,
+            auth = auth.mode.as_str(),
+            chap_user = auth.username.as_deref().unwrap_or("-"),
             "volume ready"
         );
-
-        volume_labels.push(opened.labels.clone());
-        let device = S3BlockDevice::new(opened.store, opened.labels, Arc::clone(&metrics));
-        builder = builder.add_target(opened.iqn, Box::new(device), Some(opened.name));
+        builder = builder.add_target_with_auth(
+            opened.iqn,
+            Box::new(device),
+            Some(opened.name),
+            auth.config,
+            auth.allowed_initiators,
+        );
     }
 
     builder = builder.session_events(SessionMetricsSink::new(
@@ -218,6 +227,7 @@ mod tests {
             advertise: Some("10.0.0.1".into()),
             portals: vec!["10.0.0.1".into(), "10.0.0.2:3260".into()],
             instance: Some("a".into()),
+            auth: None,
             s3: Default::default(),
             cache: Default::default(),
             metrics: Default::default(),

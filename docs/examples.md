@@ -2,7 +2,7 @@
 
 Copy-paste oriented recipes. Adjust hostnames, IQNs, capacities, and credentials before production use.
 
-Treat iSCSI portals as **trusted-network** endpoints until CHAP/ACLs are available.
+Treat iSCSI portals as **trusted-network** endpoints unless you enable [CHAP](users/configuration.md#chap-authentication).
 
 ---
 
@@ -569,6 +569,58 @@ max_bytes = 0
 ```
 
 Login both portals, then configure dm-multipath. Full walkthrough: **[MPIO setup](users/mpio.md)**.
+
+---
+
+## 14. Optional CHAP (open-iscsi)
+
+**Goal:** Require initiator CHAP on normal login (discovery stays open).
+
+```toml
+bind = "0.0.0.0:3260"
+advertise = "127.0.0.1"
+
+[auth]
+username = "iscsiuser"
+secret = "change-me"
+# allowed_initiators = ["iqn.1993-08.org.debian:01:host1"]
+
+[s3]
+bucket = "iscsi"
+region = "us-east-1"
+endpoint = "http://127.0.0.1:9000"
+force_path_style = true
+
+[[volumes]]
+name = "disk0"
+iqn = "iqn.2026-09.local.iscsi-s3:disk0"
+prefix = "disks/disk0"
+capacity = "10GiB"
+```
+
+Or inject secrets without putting them in the file:
+
+```bash
+export ISCSI_S3_AUTH__USERNAME=iscsiuser
+export ISCSI_S3_AUTH__SECRET='change-me'
+```
+
+Initiator:
+
+```bash
+IQN=iqn.2026-09.local.iscsi-s3:disk0
+HOST=127.0.0.1
+sudo iscsiadm -m discovery -t sendtargets -p ${HOST}:3260
+sudo iscsiadm -m node -T "$IQN" -p ${HOST}:3260 \
+  --op update -n node.session.auth.authmethod -v CHAP
+sudo iscsiadm -m node -T "$IQN" -p ${HOST}:3260 \
+  --op update -n node.session.auth.username -v iscsiuser
+sudo iscsiadm -m node -T "$IQN" -p ${HOST}:3260 \
+  --op update -n node.session.auth.password -v 'change-me'
+sudo iscsiadm -m node -T "$IQN" -p ${HOST}:3260 --login
+```
+
+Mutual CHAP: set `mutual_username` / `mutual_secret` on the target and `node.session.auth.username_in` / `password_in` on the initiator. See [configuration — CHAP](users/configuration.md#chap-authentication).
 
 ---
 

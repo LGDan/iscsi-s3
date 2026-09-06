@@ -15,6 +15,7 @@ Initiator  --iSCSI-->  iscsi-s3  --Get/PutObject-->  S3 / MinIO
 - Layered config: defaults → TOML → `ISCSI_S3_*` env → CLI
 - Multiple volumes on one TCP portal (IQN-based routing)
 - Multi-portal SendTargets + multi-instance Path-A MPIO (shared S3, CAS writes)
+- Optional one-way or mutual CHAP (per volume or global)
 - Grow-only capacity via `{prefix}/meta.json`
 - Sparse disks (missing chunks read as zeros)
 - Whole-chunk LRU cache (disable for multi-instance)
@@ -55,7 +56,7 @@ Set `advertise` in the mounted config to an address clients can reach (for Docke
 
 ## Limitations
 
-- No CHAP / initiator ACL UI yet (treat portals as trusted-network only).
+- Discovery sessions are unauthenticated; enable CHAP for normal login when portals are not fully trusted.
 - No SCSI UNMAP/TRIM thin-provision reporting.
 - Shrink and geometry (`chunk_size` / `block_size`) changes are refused after first open.
 - Multi-instance MPIO requires `cache.max_bytes = 0` and identical IQN/prefix/portals on peers.

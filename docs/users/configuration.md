@@ -9,7 +9,7 @@ Lowest → highest:
 3. Environment (`ISCSI_S3_` prefix; nest with `__`)
 4. CLI flags
 
-Volumes (`[[volumes]]`) are defined only in TOML. Env/CLI override shared settings (bind, advertise, bucket, endpoint, region, path style, logging). Multi-portal lists (`portals`) and `instance` are TOML-only.
+Volumes (`[[volumes]]`) are defined only in TOML. Env/CLI override shared settings (bind, advertise, bucket, endpoint, region, path style, logging). Multi-portal lists (`portals`), `instance`, and most auth fields are TOML-oriented; auth secrets may also come from env (`ISCSI_S3_AUTH__SECRET`, etc.). There are no CLI flags for CHAP secrets.
 
 `RUST_LOG` is preferred when set; otherwise `--log` applies (Compose commonly sets `RUST_LOG`).
 
@@ -45,6 +45,9 @@ capacity = "10GiB"
 | `advertise` | Single portal in SendTargets when `portals` is empty (`host` or `host:port`). Host-only reuses the port from `bind`. Unset → socket `local_addr` (often a container IP behind Docker). |
 | `portals` | All client-reachable portals (`host` or `host:port`) listed in SendTargets for MPIO. Same list on every multi-instance peer. Takes precedence over `advertise`. |
 | `instance` | Optional label for logs (multi-instance deployments). |
+| `auth.username` / `auth.secret` | One-way CHAP (both required). Omit `[auth]` for no authentication. |
+| `auth.mutual_username` / `auth.mutual_secret` | When both set with username/secret → mutual CHAP. |
+| `auth.allowed_initiators` | Optional list of initiator IQNs allowed after successful auth. |
 | `s3.bucket` | Required. Bucket name. |
 | `s3.region` | AWS region (also used with custom endpoints). |
 | `s3.endpoint` | Optional custom endpoint (MinIO, Ceph RGW, …). Omit for AWS. |
@@ -57,8 +60,47 @@ capacity = "10GiB"
 | `volumes[].capacity` | Size (`10GiB`, `64MiB`, or integer bytes). |
 | `volumes[].block_size` | SCSI block size (default 512; locked after first meta write). |
 | `volumes[].chunk_size` | S3 object size (default 4 MiB; locked after first meta write). |
+| `volumes[].auth` | Optional per-volume CHAP override (unset fields inherit from `[auth]`). |
 
 Sizes accept human strings (`64KiB`, `4MiB`, `10GiB`) or raw byte integers.
+
+## CHAP authentication
+
+Omit `[auth]` (default) → `AuthMethod=None`. Discovery sessions stay unauthenticated; CHAP applies to **normal** (non-discovery) login only.
+
+```toml
+[auth]
+username = "iscsiuser"
+secret = "change-me"
+# mutual_username = "targetid"
+# mutual_secret = "change-me-too"
+# allowed_initiators = ["iqn.1993-08.org.debian:01:host1"]
+```
+
+Prefer env for secrets:
+
+```bash
+export ISCSI_S3_AUTH__USERNAME=iscsiuser
+export ISCSI_S3_AUTH__SECRET='change-me'
+```
+
+open-iscsi after discovery:
+
+```bash
+IQN=iqn.2026-09.local.iscsi-s3:disk0
+HOST=127.0.0.1
+sudo iscsiadm -m node -T "$IQN" -p ${HOST}:3260 \
+  --op update -n node.session.auth.authmethod -v CHAP
+sudo iscsiadm -m node -T "$IQN" -p ${HOST}:3260 \
+  --op update -n node.session.auth.username -v iscsiuser
+sudo iscsiadm -m node -T "$IQN" -p ${HOST}:3260 \
+  --op update -n node.session.auth.password -v 'change-me'
+# Mutual CHAP also needs:
+#   node.session.auth.username_in / password_in
+sudo iscsiadm -m node -T "$IQN" -p ${HOST}:3260 --login
+```
+
+MPIO peers must use the **same** auth settings on every instance.
 
 ## Port / portal
 
@@ -77,6 +119,8 @@ export ISCSI_S3_S3__BUCKET=iscsi
 export ISCSI_S3_S3__ENDPOINT=http://minio:9000
 export ISCSI_S3_S3__FORCE_PATH_STYLE=true
 export ISCSI_S3_CACHE__MAX_BYTES=256MiB
+export ISCSI_S3_AUTH__USERNAME=iscsiuser
+export ISCSI_S3_AUTH__SECRET='change-me'
 export RUST_LOG=info,iscsi_s3=debug,iscsi_target=debug
 ```
 

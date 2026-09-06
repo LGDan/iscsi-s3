@@ -21,6 +21,7 @@ This is **not** MCS (`MaxConnections > 1` on a single session). That mode is uns
 |------|-----|
 | Identical `[[volumes]]` (same `iqn`, `prefix`, `capacity`, geometry) on every instance | Same LUN / same objects |
 | Identical `portals = [...]` on every instance | Discovery lists every path from either portal |
+| Identical `[auth]` / volume auth on every instance | Same CHAP secret so either path accepts login |
 | `cache.max_bytes = 0` | Per-process LRU cannot invalidate peers; stale reads after failover |
 | Shared S3 (or MinIO) credentials/bucket | Single source of truth; RMW uses `If-Match` CAS |
 | Distinct `bind` (or host port publish) per instance | Each path has its own TCP endpoint |
@@ -264,7 +265,7 @@ Keep `cache.max_bytes = 0` for the whole life of a multi-instance volume.
 
 ## Related
 
-- [Configuration](configuration.md) — `portals`, `advertise`, `cache`
+- [Configuration](configuration.md) — `portals`, `advertise`, `cache`, [CHAP](configuration.md#chap-authentication)
 - [Architecture](../developers/architecture.md) — identity and CAS notes
 - [Examples §13](../examples.md#13-dual-path-mpio-two-daemons-shared-s3) — dual-NIC TOML snippets
 - Repo files: `docker-compose.mpio.yml`, `config.mpio-a.toml`, `config.mpio-b.toml`

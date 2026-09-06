@@ -8,6 +8,15 @@ bind = "0.0.0.0:3260"
 # portals = ["10.0.0.1:3260", "10.0.0.2:3260"]
 # instance = "path-a"   # optional label for logs
 
+# Optional CHAP (omit = AuthMethod=None). Prefer env for secrets in production:
+#   ISCSI_S3_AUTH__USERNAME / ISCSI_S3_AUTH__SECRET
+# [auth]
+# username = "iscsiuser"
+# secret = "change-me"
+# mutual_username = "targetid"   # enables mutual CHAP when both mutual_* set
+# mutual_secret = "change-me-too"
+# allowed_initiators = ["iqn.1993-08.org.debian:01:example"]
+
 [s3]
 bucket = "iscsi"
 region = "us-east-1"

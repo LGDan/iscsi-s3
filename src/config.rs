@@ -41,6 +41,9 @@ pub struct Config {
     /// Optional instance label (metrics / logs) for multi-instance deployments.
     #[serde(default)]
     pub instance: Option<String>,
+    /// Optional CHAP (and mutual CHAP) defaults for all volumes.
+    #[serde(default)]
+    pub auth: Option<AuthSettings>,
     #[serde(default)]
     pub s3: S3Config,
     #[serde(default)]
@@ -117,6 +120,156 @@ fn default_metrics_bind() -> String {
     "0.0.0.0:9090".to_string()
 }
 
+/// Optional CHAP credentials (global or per-volume).
+///
+/// One-way CHAP when `username` + `secret` are set. Mutual CHAP when
+/// `mutual_username` + `mutual_secret` are also both set.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct AuthSettings {
+    #[serde(default)]
+    pub username: Option<String>,
+    #[serde(default)]
+    pub secret: Option<String>,
+    /// Username the target uses when proving identity (mutual CHAP).
+    #[serde(default)]
+    pub mutual_username: Option<String>,
+    #[serde(default)]
+    pub mutual_secret: Option<String>,
+    /// If set, only these initiator IQNs may login after auth.
+    #[serde(default)]
+    pub allowed_initiators: Option<Vec<String>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AuthMode {
+    None,
+    Chap,
+    MutualChap,
+}
+
+impl AuthMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            AuthMode::None => "none",
+            AuthMode::Chap => "chap",
+            AuthMode::MutualChap => "mutual-chap",
+        }
+    }
+}
+
+/// Resolved auth for one volume (ready for `add_target_with_auth`).
+#[derive(Debug, Clone)]
+pub struct ResolvedAuth {
+    pub config: iscsi_target::AuthConfig,
+    pub allowed_initiators: Option<Vec<String>>,
+    pub mode: AuthMode,
+    /// CHAP username when mode is chap/mutual-chap (safe to log).
+    pub username: Option<String>,
+}
+
+fn non_empty(opt: &Option<String>) -> Option<&str> {
+    opt.as_deref().map(str::trim).filter(|s| !s.is_empty())
+}
+
+/// Merge global and per-volume auth (volume fields win when set).
+pub fn merge_auth_settings(
+    global: &Option<AuthSettings>,
+    volume: &Option<AuthSettings>,
+) -> Option<AuthSettings> {
+    match (global, volume) {
+        (None, None) => None,
+        (Some(g), None) => Some(g.clone()),
+        (None, Some(v)) => Some(v.clone()),
+        (Some(g), Some(v)) => Some(AuthSettings {
+            username: v.username.clone().or_else(|| g.username.clone()),
+            secret: v.secret.clone().or_else(|| g.secret.clone()),
+            mutual_username: v
+                .mutual_username
+                .clone()
+                .or_else(|| g.mutual_username.clone()),
+            mutual_secret: v
+                .mutual_secret
+                .clone()
+                .or_else(|| g.mutual_secret.clone()),
+            allowed_initiators: v
+                .allowed_initiators
+                .clone()
+                .or_else(|| g.allowed_initiators.clone()),
+        }),
+    }
+}
+
+/// Build vendor `AuthConfig` from merged settings.
+pub fn resolve_auth(
+    global: &Option<AuthSettings>,
+    volume: &Option<AuthSettings>,
+) -> Result<ResolvedAuth, ConfigError> {
+    let merged = merge_auth_settings(global, volume);
+    let Some(settings) = merged else {
+        return Ok(ResolvedAuth {
+            config: iscsi_target::AuthConfig::None,
+            allowed_initiators: None,
+            mode: AuthMode::None,
+            username: None,
+        });
+    };
+
+    let user = non_empty(&settings.username);
+    let secret = non_empty(&settings.secret);
+    let mutual_user = non_empty(&settings.mutual_username);
+    let mutual_secret = non_empty(&settings.mutual_secret);
+
+    match (user, secret) {
+        (None, None) => {
+            if mutual_user.is_some() || mutual_secret.is_some() {
+                return Err(ConfigError::Invalid(
+                    "auth: mutual_username/mutual_secret require username and secret".into(),
+                ));
+            }
+            Ok(ResolvedAuth {
+                config: iscsi_target::AuthConfig::None,
+                allowed_initiators: settings.allowed_initiators.clone(),
+                mode: AuthMode::None,
+                username: None,
+            })
+        }
+        (Some(_), None) | (None, Some(_)) => Err(ConfigError::Invalid(
+            "auth: username and secret must both be set for CHAP".into(),
+        )),
+        (Some(username), Some(secret)) => {
+            let target_creds =
+                iscsi_target::ChapCredentials::new(username.to_string(), secret.to_string());
+            let acl = settings.allowed_initiators.clone();
+            match (mutual_user, mutual_secret) {
+                (None, None) => Ok(ResolvedAuth {
+                    config: iscsi_target::AuthConfig::Chap {
+                        credentials: target_creds,
+                    },
+                    allowed_initiators: acl,
+                    mode: AuthMode::Chap,
+                    username: Some(username.to_string()),
+                }),
+                (Some(mu), Some(ms)) => Ok(ResolvedAuth {
+                    config: iscsi_target::AuthConfig::MutualChap {
+                        target_credentials: target_creds,
+                        initiator_credentials: iscsi_target::ChapCredentials::new(
+                            mu.to_string(),
+                            ms.to_string(),
+                        ),
+                    },
+                    allowed_initiators: acl,
+                    mode: AuthMode::MutualChap,
+                    username: Some(username.to_string()),
+                }),
+                _ => Err(ConfigError::Invalid(
+                    "auth: mutual_username and mutual_secret must both be set for mutual CHAP"
+                        .into(),
+                )),
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VolumeConfig {
     pub name: String,
@@ -128,6 +281,9 @@ pub struct VolumeConfig {
     pub block_size: u32,
     #[serde(default = "default_chunk_size", with = "bytesize_serde")]
     pub chunk_size: u64,
+    /// Optional per-volume CHAP override (inherits unset fields from `[auth]`).
+    #[serde(default)]
+    pub auth: Option<AuthSettings>,
 }
 
 fn default_block_size() -> u32 {
@@ -223,6 +379,7 @@ impl Config {
             advertise: None,
             portals: Vec::new(),
             instance: None,
+            auth: None,
             s3: S3Config {
                 bucket: None,
                 region: default_region(),
@@ -321,6 +478,12 @@ impl Config {
                     vol.name
                 )));
             }
+            resolve_auth(&self.auth, &vol.auth).map_err(|e| match e {
+                ConfigError::Invalid(msg) => {
+                    ConfigError::Invalid(format!("volume {}: {}", vol.name, msg))
+                }
+                other => other,
+            })?;
         }
         Ok(())
     }
@@ -405,4 +568,153 @@ capacity = "1GiB"
         std::env::remove_var("ISCSI_S3_S3__BUCKET");
     }
 
+    #[test]
+    fn resolve_auth_none() {
+        let r = resolve_auth(&None, &None).unwrap();
+        assert_eq!(r.mode, AuthMode::None);
+        assert!(matches!(r.config, iscsi_target::AuthConfig::None));
+    }
+
+    #[test]
+    fn resolve_auth_chap() {
+        let global = Some(AuthSettings {
+            username: Some("u".into()),
+            secret: Some("s".into()),
+            ..Default::default()
+        });
+        let r = resolve_auth(&global, &None).unwrap();
+        assert_eq!(r.mode, AuthMode::Chap);
+        assert_eq!(r.username.as_deref(), Some("u"));
+        assert!(matches!(r.config, iscsi_target::AuthConfig::Chap { .. }));
+    }
+
+    #[test]
+    fn resolve_auth_mutual() {
+        let global = Some(AuthSettings {
+            username: Some("u".into()),
+            secret: Some("s".into()),
+            mutual_username: Some("tu".into()),
+            mutual_secret: Some("ts".into()),
+            allowed_initiators: Some(vec!["iqn.test:1".into()]),
+            ..Default::default()
+        });
+        let r = resolve_auth(&global, &None).unwrap();
+        assert_eq!(r.mode, AuthMode::MutualChap);
+        assert_eq!(r.allowed_initiators.as_ref().unwrap().len(), 1);
+        assert!(matches!(
+            r.config,
+            iscsi_target::AuthConfig::MutualChap { .. }
+        ));
+    }
+
+    #[test]
+    fn resolve_auth_partial_mutual_errors() {
+        let global = Some(AuthSettings {
+            username: Some("u".into()),
+            secret: Some("s".into()),
+            mutual_username: Some("tu".into()),
+            mutual_secret: None,
+            ..Default::default()
+        });
+        assert!(resolve_auth(&global, &None).is_err());
+    }
+
+    #[test]
+    fn resolve_auth_username_without_secret_errors() {
+        let global = Some(AuthSettings {
+            username: Some("u".into()),
+            secret: None,
+            ..Default::default()
+        });
+        assert!(resolve_auth(&global, &None).is_err());
+    }
+
+    #[test]
+    fn resolve_auth_volume_overrides_global() {
+        let global = Some(AuthSettings {
+            username: Some("global-u".into()),
+            secret: Some("global-s".into()),
+            ..Default::default()
+        });
+        let volume = Some(AuthSettings {
+            username: Some("vol-u".into()),
+            secret: None, // inherit secret
+            ..Default::default()
+        });
+        let r = resolve_auth(&global, &volume).unwrap();
+        assert_eq!(r.mode, AuthMode::Chap);
+        assert_eq!(r.username.as_deref(), Some("vol-u"));
+    }
+
+    #[test]
+    fn config_loads_auth_from_toml() {
+        let mut file = NamedTempFile::new().unwrap();
+        writeln!(
+            file,
+            r#"
+bind = "0.0.0.0:3260"
+[s3]
+bucket = "iscsi"
+[auth]
+username = "iscsiuser"
+secret = "sekrit"
+[[volumes]]
+name = "disk0"
+iqn = "iqn.2026-09.local:disk0"
+prefix = "disks/disk0"
+capacity = "1GiB"
+"#
+        )
+        .unwrap();
+        let cli = Cli {
+            config: Some(file.path().to_path_buf()),
+            bind: None,
+            advertise: None,
+            bucket: None,
+            endpoint: None,
+            region: None,
+            force_path_style: None,
+            log: "info".into(),
+            metrics_bind: None,
+            no_metrics: false,
+        };
+        let cfg = Config::load(&cli).unwrap();
+        let r = resolve_auth(&cfg.auth, &cfg.volumes[0].auth).unwrap();
+        assert_eq!(r.mode, AuthMode::Chap);
+        assert_eq!(r.username.as_deref(), Some("iscsiuser"));
+    }
+
+    #[test]
+    fn config_rejects_partial_auth() {
+        let mut file = NamedTempFile::new().unwrap();
+        writeln!(
+            file,
+            r#"
+bind = "0.0.0.0:3260"
+[s3]
+bucket = "iscsi"
+[auth]
+username = "iscsiuser"
+[[volumes]]
+name = "disk0"
+iqn = "iqn.2026-09.local:disk0"
+prefix = "disks/disk0"
+capacity = "1GiB"
+"#
+        )
+        .unwrap();
+        let cli = Cli {
+            config: Some(file.path().to_path_buf()),
+            bind: None,
+            advertise: None,
+            bucket: None,
+            endpoint: None,
+            region: None,
+            force_path_style: None,
+            log: "info".into(),
+            metrics_bind: None,
+            no_metrics: false,
+        };
+        assert!(Config::load(&cli).is_err());
+    }
 }
