@@ -64,7 +64,7 @@ Sizes accept human strings (`64KiB`, `4MiB`, `10GiB`) or raw byte integers.
 
 All volumes on one process share one listen address (`bind`). Discovery against that portal returns every IQN; each IQN lists `portals` (or a single `advertise`) as `TargetAddress` values.
 
-For dual-path MPIO, run two processes (often on two NICs or two published ports), identical volumes/S3 prefixes, identical `portals`, and `cache.max_bytes = 0`. See [tutorials — multipath](tutorials.md#tutorial-7--dual-path-mpio-multi-instance) and `docker-compose.mpio.yml`.
+For dual-path MPIO, run two processes (often on two NICs or two published ports), identical volumes/S3 prefixes, identical `portals`, and `cache.max_bytes = 0`. See **[MPIO setup](mpio.md)** and `docker-compose.mpio.yml`.
 
 Docker must publish each process’s portal port (default `3260`).
 

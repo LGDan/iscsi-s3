@@ -61,6 +61,7 @@ nav:
   - Users:
       - Getting started: users/getting-started.md
       - Configuration: users/configuration.md
+      - MPIO setup: users/mpio.md
       - Tutorials: users/tutorials.md
   - Developers:
       - Getting started: developers/getting-started.md

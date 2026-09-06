@@ -35,6 +35,8 @@ Earlier builds used one TCP port per volume to work around digest bugs in the mu
 
 **Path A (host multipath):** run one daemon per NIC/path; identical `[[volumes]]` and S3 prefix; SCSI serial/NAA derived from IQN so dm-multipath merges paths; chunk writes use S3 `If-Match` CAS for concurrent RMW. Set `cache.max_bytes = 0` (per-process LRU cannot see peer writes). This is **not** MCS (`MaxConnections > 1`).
 
+Operator guide: [MPIO setup](../users/mpio.md).
+
 Implementation: `portal_addrs` / `advertise_addr` on `IscsiServer` / `IscsiTarget` builders in the vendored crate.
 
 ## Chunking and meta

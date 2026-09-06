@@ -38,7 +38,8 @@ Set `advertise` in the mounted config to an address clients can reach (for Docke
 | [Docs index](docs/README.md) | Full documentation map |
 | [User getting started](docs/users/getting-started.md) | Run the target and connect a Linux initiator |
 | [Configuration](docs/users/configuration.md) | TOML, env, CLI reference |
-| [User tutorials](docs/users/tutorials.md) | Mount disks, grow volumes, remote access, MPIO, iSCSI boot |
+| [MPIO setup](docs/users/mpio.md) | Dual-path multipath, lab Compose, dual-NIC, rolling upgrade |
+| [User tutorials](docs/users/tutorials.md) | Mount disks, grow volumes, remote access, iSCSI boot |
 | [Developer getting started](docs/developers/getting-started.md) | Build, layout, vendored crate |
 | [Architecture](docs/developers/architecture.md) | How chunks, ports, and sessions work |
 | [Testing](docs/developers/testing.md) | Unit, integration, and smoke tests |

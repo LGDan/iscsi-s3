@@ -568,7 +568,7 @@ max_bytes = 0
 # identical to A
 ```
 
-Login both portals, then configure dm-multipath. Full walkthrough: [Tutorial 7](users/tutorials.md#tutorial-7--dual-path-mpio-multi-instance).
+Login both portals, then configure dm-multipath. Full walkthrough: **[MPIO setup](users/mpio.md)**.
 
 ---
 

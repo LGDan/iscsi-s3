@@ -6,7 +6,8 @@
 |-----|----------|
 | [Getting started](users/getting-started.md) | Docker Compose or local binary; discover and login with open-iscsi |
 | [Configuration](users/configuration.md) | Precedence, field reference, env/CLI |
-| [Tutorials](users/tutorials.md) | Format/mount, grow, remote LAN, MPIO, firmware iSCSI boot notes |
+| [MPIO setup](users/mpio.md) | Dual-path multipath: lab Compose, dual-NIC, rolling upgrade |
+| [Tutorials](users/tutorials.md) | Format/mount, grow, remote LAN, firmware iSCSI boot notes |
 
 ## For developers
 

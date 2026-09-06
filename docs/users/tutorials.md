@@ -170,50 +170,23 @@ You should see `meta.json` and `chunks/…` after writes.
 
 ## Tutorial 7 — Dual-path MPIO (multi-instance)
 
-**Goal:** Two iscsi-s3 processes advertise both portals; Linux dm-multipath bonds them so you can restart one path at a time.
+Full procedures (lab Compose, dual-NIC, rolling upgrade, checklist) live in **[MPIO setup](mpio.md)**.
 
-This is **host multipath** (separate sessions per portal), not MCS (`MaxConnections > 1`).
-
-### Lab Compose
+Quick lab start:
 
 ```bash
 docker compose -f docker-compose.mpio.yml up -d --build
-```
-
-Configs `config.mpio-a.toml` / `config.mpio-b.toml` share the same IQN/prefix, list both portals, and set `cache.max_bytes = 0`.
-
-### Discover and login both paths
-
-```bash
 IQN=iqn.2026-09.local.iscsi-s3:disk0
 sudo iscsiadm -m discovery -t sendtargets -p 127.0.0.1:3260
-# Expect TargetAddress for :3260 and :3261
 sudo iscsiadm -m node -T "$IQN" -p 127.0.0.1:3260 --login
 sudo iscsiadm -m node -T "$IQN" -p 127.0.0.1:3261 --login
-lsblk   # two sd* with the same serial (IQN-derived)
-```
-
-### Multipath
-
-```bash
-sudo apt-get install -y multipath-tools   # or dnf install device-mapper-multipath
-# Confirm identical SCSI serial / NAA on both paths (sg_inq / multipath -ll)
 sudo multipath -ll
 ```
-
-Prefer a **failover** policy while validating; active/active is possible because chunk RMW uses S3 `If-Match`, but keep the cache disabled.
-
-### Rolling upgrade
-
-1. Fail I/O off path A (or stop `iscsi-s3-a` / take the path offline in multipath).
-2. Upgrade/restart instance A; wait until healthy and path recovers.
-3. Repeat for instance B.
-
-Production dual-NIC: bind each process to its NIC IP on `:3260` and set the same `portals = ["a-ip:3260", "b-ip:3260"]` on both.
 
 ---
 
 ## See also
 
 - [Getting started](getting-started.md)
+- [MPIO setup](mpio.md)
 - [Examples](../examples.md)
