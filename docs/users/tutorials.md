@@ -138,13 +138,15 @@ sudo iscsiadm -m node -T iqn.2026-09.local.iscsi-s3:disk1 -p 127.0.0.1:3260 --lo
 
 ## Tutorial 5 — Firmware iSCSI boot (Intel NIC / NUC)
 
-High-level flow that has been exercised with this project:
+For a full **live ISO → install to LUN → chroot GRUB/initrd fixup** walkthrough (Ubuntu, Debian, Alpine) plus helper scripts, see **[Install OS on iSCSI](iscsi-os-install.md)**.
+
+High-level firmware checklist that has been exercised with this project:
 
 1. Target reachable with correct `advertise` (LAN IP of the host publishing the ports).
 2. Firmware iSCSI boot: portal, target IQN, **Boot LUN = 0** (this stack exposes one LUN per IQN).
 3. Digests: firmware typically wants `HeaderDigest=None` / `DataDigest=None` (negotiated if the initiator offers `None`).
-4. Install an OS onto the LUN (live USB, or a helper VM that sees the LUN as a disk). Prefer installing in a way that includes **iSCSI/iBFT** support in the initramfs when the machine will boot via Option ROM.
-5. If you land in an initramfs shell after GRUB: the OS likely lacks iBFT/open-iscsi in the initramfs. From a rescue/chroot on the root filesystem (Debian/MX):
+4. Install an OS onto the LUN (live USB, or a helper VM that sees the LUN as a disk). Prefer iSCSI/iBFT in the initramfs for Option ROM boot — or use the [chroot fixup scripts](iscsi-os-install.md).
+5. If you land in an initramfs shell after GRUB: re-chroot and run [`scripts/iscsi-boot-fixup-debian.sh`](../../scripts/iscsi-boot-fixup-debian.sh), or manually:
 
 ```bash
 apt-get install -y open-iscsi initramfs-tools

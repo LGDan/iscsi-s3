@@ -12,6 +12,7 @@ Userspace iSCSI target that presents virtual disks backed by S3 (or MinIO / othe
 | [Admin control](users/admin-ctl.md) | `iscsi-s3-ctl`: stats, cache toggle, safe reload |
 | [Volume snapshots](users/snapshots.md) | CoW snapshots, `legacy` vs `cow`, migrate |
 | [Tutorials](users/tutorials.md) | Format/mount, grow, remote LAN, firmware iSCSI boot notes |
+| [Install OS on iSCSI](users/iscsi-os-install.md) | Live ISO → install to LUN → chroot fixup (Ubuntu, Debian, Alpine) |
 
 ## For developers
 

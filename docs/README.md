@@ -9,6 +9,7 @@
 | [MPIO setup](users/mpio.md) | Dual-path multipath: lab Compose, dual-NIC, rolling upgrade |
 | [Admin control](users/admin-ctl.md) | `iscsi-s3-ctl`: stats, cache toggle, safe reload |
 | [Tutorials](users/tutorials.md) | Format/mount, grow, remote LAN, firmware iSCSI boot notes |
+| [Install OS on iSCSI](users/iscsi-os-install.md) | Live ISO → install to LUN → chroot fixup (Ubuntu, Debian, Alpine) |
 
 ## For developers
 
