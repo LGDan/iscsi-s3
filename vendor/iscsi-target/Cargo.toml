@@ -1,0 +1,23 @@
+# Vendored from crates.io iscsi-target 1.0.0 (MIT OR Apache-2.0)
+# with an advertise_addr() builder option for SendTargets TargetAddress.
+[package]
+name = "iscsi-target"
+version = "1.0.0"
+edition = "2021"
+authors = ["Matt Lawless"]
+description = "A pure Rust iSCSI target implementation (vendored with advertise_addr)"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/lawless-m/iscsi-crate"
+
+[lib]
+name = "iscsi_target"
+path = "src/lib.rs"
+
+[dependencies]
+byteorder = "1.5"
+crc32c = "0.6"
+hex = "0.4"
+log = "0.4"
+md5 = "0.7"
+rand = "0.8"
+thiserror = "1.0"
