@@ -10,6 +10,7 @@ Userspace iSCSI target that presents virtual disks backed by S3 (or MinIO / othe
 | [Configuration](users/configuration.md) | Precedence, field reference, env/CLI |
 | [MPIO setup](users/mpio.md) | Dual-path multipath: lab Compose, dual-NIC, rolling upgrade |
 | [Admin control](users/admin-ctl.md) | `iscsi-s3-ctl`: stats, cache toggle, safe reload |
+| [Volume snapshots](users/snapshots.md) | CoW snapshots, `legacy` vs `cow`, migrate |
 | [Tutorials](users/tutorials.md) | Format/mount, grow, remote LAN, firmware iSCSI boot notes |
 
 ## For developers

@@ -39,6 +39,7 @@ tiny_http = "0.12"
 lz4_flex = "0.11"
 zstd = "0.13"
 flate2 = "1"
+blake3 = "1"
 
 [dev-dependencies]
 tempfile = "3"

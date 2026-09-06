@@ -315,6 +315,9 @@ pub struct VolumeConfig {
     /// Chunk object compression (`none`, `lz4`, `zstd`, `deflate`). Locked in meta.json.
     #[serde(default)]
     pub compression: crate::compression::Compression,
+    /// On-disk layout: `legacy` (flat chunks, default) or `cow` (snapshots). Locked in meta.json.
+    #[serde(default)]
+    pub storage: crate::storage_mode::StorageMode,
     /// Optional per-volume CHAP override (inherits unset fields from `[auth]`).
     #[serde(default)]
     pub auth: Option<AuthSettings>,

@@ -7,5 +7,7 @@ pub mod config;
 pub mod device;
 pub mod identity;
 pub mod metrics;
+pub mod snapshot;
+pub mod storage_mode;
 pub mod store;
 pub mod volume;

@@ -104,6 +104,21 @@ impl ChunkCache {
         inner.used_bytes = 0;
     }
 
+    /// Drop all cached chunks for one volume (snapshot create/restore/clone).
+    pub fn invalidate_volume(&self, volume: &str) {
+        let mut inner = self.inner.lock();
+        let mut remove_bytes = 0u64;
+        inner.entries.retain(|k, e| {
+            if k.volume == volume {
+                remove_bytes += e.data.len() as u64;
+                false
+            } else {
+                true
+            }
+        });
+        inner.used_bytes = inner.used_bytes.saturating_sub(remove_bytes);
+    }
+
     /// Disable caching and flush (alias for `set_max_bytes(0)`).
     pub fn disable(&self) {
         self.set_max_bytes(0);
@@ -206,6 +221,18 @@ impl<S: BlockStore> CachedStore<S> {
             labels,
             metrics,
         }
+    }
+
+    pub fn inner(&self) -> &S {
+        &self.inner
+    }
+
+    pub fn cache(&self) -> &Arc<ChunkCache> {
+        &self.cache
+    }
+
+    pub fn volume_name(&self) -> &str {
+        &self.labels.volume
     }
 
     fn load_chunk(&self, chunk_idx: u64) -> Result<Vec<u8>, StoreError> {

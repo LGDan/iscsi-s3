@@ -1,14 +1,21 @@
-//! S3-backed chunk store with per-volume meta.json.
+//! S3-backed chunk store with per-volume meta.json (legacy flat or COW).
 
 use super::{check_range, BlockStore, StoreError};
 use crate::compression::{decode_chunk, encode_chunk, Compression};
 use crate::metrics::{Metrics, VolumeLabels};
+use crate::snapshot::{
+    decode_pointer, encode_pointer, hash_hex, hash_object_bytes, read_chunks_bin, require_cow,
+    write_chunks_bin, ChunkRef, SnapshotManifest, SnapshotState, HASH_LEN,
+};
+use crate::storage_mode::StorageMode;
 use aws_sdk_s3::error::SdkError;
 use aws_sdk_s3::operation::get_object::GetObjectError;
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::Client;
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
+use std::io::Cursor;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::sync::Arc;
@@ -101,15 +108,18 @@ pub fn list_prefix_stats(
     )
 }
 
-/// List present chunk indices under `{prefix}/chunks/` (hex object names).
+/// List present chunk indices under `{chunks_prefix}` (must end with `/chunks/` or similar).
 pub fn list_chunk_indices(
     client: Client,
     runtime: Handle,
     bucket: String,
-    prefix: &str,
+    chunks_prefix: &str,
 ) -> Result<Vec<u64>, StoreError> {
-    let prefix = prefix.trim_matches('/').to_string();
-    let chunks_prefix = format!("{prefix}/chunks/");
+    let chunks_prefix = if chunks_prefix.ends_with('/') {
+        chunks_prefix.to_string()
+    } else {
+        format!("{chunks_prefix}/")
+    };
     run_on_runtime(
         &runtime,
         async move {
@@ -184,6 +194,9 @@ pub struct VolumeMeta {
     /// Locked at first meta write; missing in old meta → `none`.
     #[serde(default)]
     pub compression: Compression,
+    /// Locked layout; missing in old meta → `legacy`.
+    #[serde(default)]
+    pub storage: StorageMode,
 }
 
 pub struct S3StoreConfig {
@@ -193,6 +206,7 @@ pub struct S3StoreConfig {
     pub block_size: u32,
     pub chunk_size: u64,
     pub compression: Compression,
+    pub storage: StorageMode,
     pub labels: VolumeLabels,
     pub metrics: Arc<Metrics>,
 }
@@ -204,6 +218,7 @@ pub struct S3ChunkStore {
     block_size: u32,
     chunk_size: u64,
     compression: Compression,
+    storage: Mutex<StorageMode>,
     capacity: AtomicU64,
     runtime: Handle,
     locks: Arc<[Mutex<()>; LOCK_STRIPES]>,
@@ -217,13 +232,15 @@ impl S3ChunkStore {
         let locks: Arc<[Mutex<()>; LOCK_STRIPES]> =
             Arc::new(std::array::from_fn(|_| Mutex::new(())));
 
+        let prefix = cfg.prefix.trim_matches('/').to_string();
         let store = Self {
             client,
             bucket: cfg.bucket,
-            prefix: cfg.prefix.trim_matches('/').to_string(),
+            prefix,
             block_size: cfg.block_size,
             chunk_size: cfg.chunk_size,
             compression: cfg.compression,
+            storage: Mutex::new(cfg.storage),
             capacity: AtomicU64::new(cfg.capacity),
             runtime,
             locks,
@@ -231,26 +248,112 @@ impl S3ChunkStore {
             metrics: cfg.metrics,
         };
 
-        let effective = store.resolve_meta(cfg.capacity)?;
+        let (mode, existing) = store.probe_layout(cfg.storage)?;
+        *store.storage.lock() = mode;
+        let effective = store.resolve_meta(cfg.capacity, existing)?;
         store.capacity.store(effective, Ordering::SeqCst);
         Ok(store)
     }
 
-    fn meta_key(&self) -> String {
+    pub fn storage_mode(&self) -> StorageMode {
+        *self.storage.lock()
+    }
+
+    pub fn family_prefix(&self) -> &str {
+        &self.prefix
+    }
+
+    pub fn bucket_name(&self) -> &str {
+        &self.bucket
+    }
+
+    fn probe_layout(
+        &self,
+        config: StorageMode,
+    ) -> Result<(StorageMode, Option<VolumeMeta>), StoreError> {
+        let live = self.get_meta_at(&self.live_meta_key())?;
+        let flat = self.get_meta_at(&self.flat_meta_key())?;
+        match (live, flat) {
+            (Some(m), _) => {
+                if m.storage != StorageMode::Cow {
+                    return Err(StoreError::Meta(
+                        "live/meta.json present but storage is not cow".into(),
+                    ));
+                }
+                if config != StorageMode::Cow {
+                    return Err(StoreError::GeometryMismatch(
+                        "volume meta is storage=cow; set volumes[].storage = \"cow\"".into(),
+                    ));
+                }
+                Ok((StorageMode::Cow, Some(m)))
+            }
+            (None, Some(m)) => {
+                if m.storage == StorageMode::Cow {
+                    return Err(StoreError::Meta(
+                        "flat meta.json claims storage=cow; expected live/ layout".into(),
+                    ));
+                }
+                if config == StorageMode::Cow {
+                    return Err(StoreError::GeometryMismatch(
+                        "volume is storage=legacy on S3; run `iscsi-s3-ctl volume migrate-cow` \
+                         then set storage=\"cow\" and restart"
+                            .into(),
+                    ));
+                }
+                Ok((StorageMode::Legacy, Some(m)))
+            }
+            (None, None) => Ok((config, None)),
+        }
+    }
+
+    fn flat_meta_key(&self) -> String {
         format!("{}/meta.json", self.prefix)
     }
 
+    fn live_meta_key(&self) -> String {
+        format!("{}/live/meta.json", self.prefix)
+    }
+
+    fn meta_key(&self) -> String {
+        match self.storage_mode() {
+            StorageMode::Legacy => self.flat_meta_key(),
+            StorageMode::Cow => self.live_meta_key(),
+        }
+    }
+
+    fn chunks_prefix(&self) -> String {
+        match self.storage_mode() {
+            StorageMode::Legacy => format!("{}/chunks/", self.prefix),
+            StorageMode::Cow => format!("{}/live/chunks/", self.prefix),
+        }
+    }
+
     fn chunk_key(&self, index: u64) -> String {
-        format!("{}/chunks/{index:016x}", self.prefix)
+        format!("{}{index:016x}", self.chunks_prefix())
+    }
+
+    fn object_key(&self, hash: &[u8; HASH_LEN]) -> String {
+        format!("{}/objects/{}", self.prefix, hash_hex(hash))
+    }
+
+    fn snapshot_prefix(&self, id: &str) -> String {
+        format!("{}/snapshots/{}", self.prefix, id)
+    }
+
+    fn snapshot_manifest_key(&self, id: &str) -> String {
+        format!("{}/manifest.json", self.snapshot_prefix(id))
+    }
+
+    fn snapshot_chunks_key(&self, id: &str) -> String {
+        format!("{}/chunks.bin", self.snapshot_prefix(id))
     }
 
     fn stripe(&self, chunk_idx: u64) -> &Mutex<()> {
         &self.locks[(chunk_idx as usize) % LOCK_STRIPES]
     }
 
-    fn delete_chunk_object(&self, index: u64) -> Result<(), StoreError> {
+    fn delete_object_key(&self, key: String) -> Result<(), StoreError> {
         let started = Instant::now();
-        let key = self.chunk_key(index);
         let client = self.client.clone();
         let bucket = self.bucket.clone();
         let result = self.run_async(async move {
@@ -268,6 +371,10 @@ impl S3ChunkStore {
         result
     }
 
+    fn delete_chunk_object(&self, index: u64) -> Result<(), StoreError> {
+        self.delete_object_key(self.chunk_key(index))
+    }
+
     /// Run an async S3 op on the Tokio runtime without nesting `block_on` on the
     /// caller thread (iSCSI connection threads are sync and must stay responsive).
     fn run_async<F, T>(&self, fut: F) -> Result<T, StoreError>
@@ -278,14 +385,27 @@ impl S3ChunkStore {
         run_on_runtime(&self.runtime, fut, Duration::from_secs(60))
     }
 
-    fn resolve_meta(&self, config_capacity: u64) -> Result<u64, StoreError> {
-        let existing = self.get_meta()?;
+    fn run_async_long<F, T>(&self, fut: F, timeout: Duration) -> Result<T, StoreError>
+    where
+        F: std::future::Future<Output = Result<T, StoreError>> + Send + 'static,
+        T: Send + 'static,
+    {
+        run_on_runtime(&self.runtime, fut, timeout)
+    }
+
+    fn resolve_meta(
+        &self,
+        config_capacity: u64,
+        existing: Option<VolumeMeta>,
+    ) -> Result<u64, StoreError> {
+        let mode = self.storage_mode();
         let (effective, to_write) = plan_capacity(
             existing.as_ref(),
             config_capacity,
             self.chunk_size,
             self.block_size,
             self.compression,
+            mode,
         )?;
         if let Some(meta) = to_write {
             self.put_meta(&meta)?;
@@ -293,6 +413,7 @@ impl S3ChunkStore {
                 tracing::info!(
                     prefix = %self.prefix,
                     capacity = effective,
+                    storage = mode.as_str(),
                     "created volume metadata"
                 );
             } else {
@@ -306,9 +427,9 @@ impl S3ChunkStore {
         Ok(effective)
     }
 
-    fn get_meta(&self) -> Result<Option<VolumeMeta>, StoreError> {
+    fn get_meta_at(&self, key: &str) -> Result<Option<VolumeMeta>, StoreError> {
         let started = Instant::now();
-        let key = self.meta_key();
+        let key = key.to_string();
         let client = self.client.clone();
         let bucket = self.bucket.clone();
         let result = self.run_async(async move {
@@ -342,7 +463,6 @@ impl S3ChunkStore {
                     Ok(None)
                 }
                 Err(e) => {
-                    // MinIO / some S3 clones return 404 as unhandled / generic
                     let msg = e.to_string();
                     if msg.contains("NoSuchKey")
                         || msg.contains("404")
@@ -384,13 +504,10 @@ impl S3ChunkStore {
         result
     }
 
-    fn get_chunk(&self, index: u64) -> Result<(Vec<u8>, Option<String>), StoreError> {
+    fn get_bytes(&self, key: String) -> Result<Option<(Vec<u8>, Option<String>)>, StoreError> {
         let started = Instant::now();
-        let key = self.chunk_key(index);
         let client = self.client.clone();
         let bucket = self.bucket.clone();
-        let chunk_size = self.chunk_size as usize;
-        let compression = self.compression;
         let result = self.run_async(async move {
             match client
                 .get_object()
@@ -406,9 +523,9 @@ impl S3ChunkStore {
                         .collect()
                         .await
                         .map_err(|e| StoreError::S3(e.to_string()))?
-                        .into_bytes();
-                    let plain = decode_chunk(compression, &bytes, chunk_size)?;
-                    Ok((plain, etag))
+                        .into_bytes()
+                        .to_vec();
+                    Ok(Some((bytes, etag)))
                 }
                 Err(e) => {
                     let msg = e.to_string();
@@ -417,7 +534,7 @@ impl S3ChunkStore {
                         || msg.contains("404")
                         || msg.contains("Not Found")
                     {
-                        Ok((vec![0u8; chunk_size], None))
+                        Ok(None)
                     } else {
                         Err(StoreError::S3(msg))
                     }
@@ -426,6 +543,8 @@ impl S3ChunkStore {
         });
         let bytes = result
             .as_ref()
+            .ok()
+            .and_then(|o| o.as_ref())
             .map(|(v, _)| v.len() as u64)
             .unwrap_or(0);
         self.metrics
@@ -433,34 +552,28 @@ impl S3ChunkStore {
         result
     }
 
-    fn put_chunk(
+    fn put_bytes(
         &self,
-        index: u64,
-        data: &[u8],
+        key: String,
+        body: Vec<u8>,
+        content_type: Option<&str>,
         if_match: Option<&str>,
     ) -> Result<(), StoreError> {
         let started = Instant::now();
-        if data.len() as u64 != self.chunk_size {
-            self.metrics
-                .observe_s3(&self.labels, "put", 0, started, false);
-            return Err(StoreError::Other(format!(
-                "put_chunk length {} != chunk_size {}",
-                data.len(),
-                self.chunk_size
-            )));
-        }
-        let key = self.chunk_key(index);
+        let bytes = body.len() as u64;
         let client = self.client.clone();
         let bucket = self.bucket.clone();
-        let body = encode_chunk(self.compression, data)?;
-        let bytes = body.len() as u64;
         let if_match = if_match.map(|s| s.to_string());
+        let content_type = content_type.map(|s| s.to_string());
         let result = self.run_async(async move {
             let mut req = client
                 .put_object()
                 .bucket(&bucket)
                 .key(&key)
                 .body(ByteStream::from(body));
+            if let Some(ct) = content_type {
+                req = req.content_type(ct);
+            }
             if let Some(etag) = if_match {
                 req = req.if_match(etag);
             }
@@ -474,6 +587,70 @@ impl S3ChunkStore {
         result
     }
 
+    fn get_chunk(&self, index: u64) -> Result<(Vec<u8>, Option<String>), StoreError> {
+        let chunk_size = self.chunk_size as usize;
+        match self.storage_mode() {
+            StorageMode::Legacy => {
+                let key = self.chunk_key(index);
+                match self.get_bytes(key)? {
+                    Some((bytes, etag)) => {
+                        let plain = decode_chunk(self.compression, &bytes, chunk_size)?;
+                        Ok((plain, etag))
+                    }
+                    None => Ok((vec![0u8; chunk_size], None)),
+                }
+            }
+            StorageMode::Cow => {
+                let ptr_key = self.chunk_key(index);
+                match self.get_bytes(ptr_key)? {
+                    None => Ok((vec![0u8; chunk_size], None)),
+                    Some((ptr_bytes, etag)) => {
+                        let hash = decode_pointer(&ptr_bytes)?;
+                        let obj_key = self.object_key(&hash);
+                        let Some((body, _)) = self.get_bytes(obj_key)? else {
+                            return Err(StoreError::Other(format!(
+                                "missing cow object for chunk {index}"
+                            )));
+                        };
+                        let plain = decode_chunk(self.compression, &body, chunk_size)?;
+                        Ok((plain, etag))
+                    }
+                }
+            }
+        }
+    }
+
+    fn put_chunk(
+        &self,
+        index: u64,
+        data: &[u8],
+        if_match: Option<&str>,
+    ) -> Result<(), StoreError> {
+        if data.len() as u64 != self.chunk_size {
+            return Err(StoreError::Other(format!(
+                "put_chunk length {} != chunk_size {}",
+                data.len(),
+                self.chunk_size
+            )));
+        }
+        match self.storage_mode() {
+            StorageMode::Legacy => {
+                let key = self.chunk_key(index);
+                let body = encode_chunk(self.compression, data)?;
+                self.put_bytes(key, body, None, if_match)
+            }
+            StorageMode::Cow => {
+                let body = encode_chunk(self.compression, data)?;
+                let hash = hash_object_bytes(&body);
+                let obj_key = self.object_key(&hash);
+                // Immutable content-addressed put (overwrite of identical bytes is fine).
+                self.put_bytes(obj_key, body, None, None)?;
+                let ptr = encode_pointer(&hash);
+                self.put_bytes(self.chunk_key(index), ptr, None, if_match)
+            }
+        }
+    }
+
     fn is_precondition_failed(err: &StoreError) -> bool {
         match err {
             StoreError::S3(msg) => {
@@ -484,17 +661,445 @@ impl S3ChunkStore {
             _ => false,
         }
     }
+
+    fn read_pointer_hash(&self, index: u64) -> Result<Option<[u8; HASH_LEN]>, StoreError> {
+        match self.get_bytes(self.chunk_key(index))? {
+            None => Ok(None),
+            Some((bytes, _)) => Ok(Some(decode_pointer(&bytes)?)),
+        }
+    }
+
+    fn put_pointer(&self, index: u64, hash: &[u8; HASH_LEN]) -> Result<(), StoreError> {
+        self.put_bytes(self.chunk_key(index), encode_pointer(hash), None, None)
+    }
+
+    fn collect_live_refs(&self) -> Result<Vec<ChunkRef>, StoreError> {
+        require_cow_store(self)?;
+        let indices = self.present_chunks()?;
+        let mut refs = Vec::with_capacity(indices.len());
+        for idx in indices {
+            if let Some(hash) = self.read_pointer_hash(idx)? {
+                refs.push(ChunkRef { index: idx, hash });
+            }
+        }
+        refs.sort_by_key(|r| r.index);
+        Ok(refs)
+    }
+
+    /// Create a crash-consistent snapshot from live pointers (caller must quiesce).
+    pub fn snapshot_create(
+        &self,
+        id: &str,
+        source_volume: &str,
+    ) -> Result<SnapshotManifest, StoreError> {
+        require_cow_store(self)?;
+        validate_snapshot_id(id)?;
+        if self.get_bytes(self.snapshot_manifest_key(id))?.is_some() {
+            return Err(StoreError::Other(format!(
+                "snapshot {id} already exists"
+            )));
+        }
+
+        let mut manifest = SnapshotManifest::new_creating(
+            id.to_string(),
+            source_volume.to_string(),
+            self.capacity(),
+            self.chunk_size,
+            self.block_size,
+            self.compression,
+        );
+        self.put_bytes(
+            self.snapshot_manifest_key(id),
+            serde_json::to_vec_pretty(&manifest).map_err(|e| StoreError::Meta(e.to_string()))?,
+            Some("application/json"),
+            None,
+        )?;
+
+        let refs = self.collect_live_refs()?;
+        let mut bin = Vec::new();
+        write_chunks_bin(&mut bin, &refs)?;
+        self.put_bytes(self.snapshot_chunks_key(id), bin, None, None)?;
+
+        manifest.chunk_count = refs.len() as u64;
+        manifest.state = SnapshotState::Ready;
+        self.put_bytes(
+            self.snapshot_manifest_key(id),
+            serde_json::to_vec_pretty(&manifest).map_err(|e| StoreError::Meta(e.to_string()))?,
+            Some("application/json"),
+            None,
+        )?;
+        Ok(manifest)
+    }
+
+    pub fn snapshot_list(&self) -> Result<Vec<SnapshotManifest>, StoreError> {
+        require_cow_store(self)?;
+        let list_prefix = format!("{}/snapshots/", self.prefix);
+        let client = self.client.clone();
+        let bucket = self.bucket.clone();
+        let keys: Vec<String> = self.run_async_long(
+            async move {
+                let mut keys = Vec::new();
+                let mut token: Option<String> = None;
+                loop {
+                    let mut req = client
+                        .list_objects_v2()
+                        .bucket(&bucket)
+                        .prefix(&list_prefix);
+                    if let Some(t) = token.take() {
+                        req = req.continuation_token(t);
+                    }
+                    let out = req
+                        .send()
+                        .await
+                        .map_err(|e| StoreError::S3(e.to_string()))?;
+                    for obj in out.contents() {
+                        let key = obj.key().unwrap_or("").to_string();
+                        if key.ends_with("/manifest.json") {
+                            keys.push(key);
+                        }
+                    }
+                    if out.is_truncated().unwrap_or(false) {
+                        token = out.next_continuation_token().map(|s| s.to_string());
+                        if token.is_none() {
+                            break;
+                        }
+                    } else {
+                        break;
+                    }
+                }
+                Ok(keys)
+            },
+            Duration::from_secs(300),
+        )?;
+
+        let mut out = Vec::new();
+        for key in keys {
+            if let Some((bytes, _)) = self.get_bytes(key)? {
+                let m: SnapshotManifest = serde_json::from_slice(&bytes)
+                    .map_err(|e| StoreError::Meta(e.to_string()))?;
+                out.push(m);
+            }
+        }
+        out.sort_by(|a, b| a.id.cmp(&b.id));
+        Ok(out)
+    }
+
+    pub fn snapshot_get(&self, id: &str) -> Result<SnapshotManifest, StoreError> {
+        require_cow_store(self)?;
+        let Some((bytes, _)) = self.get_bytes(self.snapshot_manifest_key(id))? else {
+            return Err(StoreError::Other(format!("snapshot {id} not found")));
+        };
+        serde_json::from_slice(&bytes).map_err(|e| StoreError::Meta(e.to_string()))
+    }
+
+    fn load_snapshot_refs(&self, id: &str) -> Result<Vec<ChunkRef>, StoreError> {
+        let Some((bytes, _)) = self.get_bytes(self.snapshot_chunks_key(id))? else {
+            return Err(StoreError::Other(format!(
+                "snapshot {id} chunks.bin missing"
+            )));
+        };
+        read_chunks_bin(&mut Cursor::new(bytes))
+    }
+
+    /// Delete snapshot metadata and GC unreferenced objects.
+    pub fn snapshot_delete(&self, id: &str) -> Result<GcStats, StoreError> {
+        require_cow_store(self)?;
+        let _ = self.snapshot_get(id)?;
+        self.delete_object_key(self.snapshot_chunks_key(id))?;
+        self.delete_object_key(self.snapshot_manifest_key(id))?;
+        self.gc_unreferenced_objects()
+    }
+
+    /// Replace live pointers from a snapshot (grow-only capacity if needed).
+    pub fn snapshot_restore(&self, id: &str) -> Result<RestoreStats, StoreError> {
+        require_cow_store(self)?;
+        let manifest = self.snapshot_get(id)?;
+        if manifest.state != SnapshotState::Ready {
+            return Err(StoreError::Other(format!(
+                "snapshot {id} is not ready ({:?})",
+                manifest.state
+            )));
+        }
+        if manifest.chunk_size != self.chunk_size || manifest.block_size != self.block_size {
+            return Err(StoreError::GeometryMismatch(
+                "snapshot geometry does not match live volume".into(),
+            ));
+        }
+        if manifest.compression != self.compression {
+            return Err(StoreError::GeometryMismatch(
+                "snapshot compression does not match live volume".into(),
+            ));
+        }
+        if self.capacity() < manifest.capacity_bytes {
+            self.set_capacity(manifest.capacity_bytes)?;
+        }
+
+        let refs = self.load_snapshot_refs(id)?;
+        let snap_set: HashSet<u64> = refs.iter().map(|r| r.index).collect();
+        let live = self.present_chunks()?;
+        let mut pointers_written = 0u64;
+        let mut pointers_deleted = 0u64;
+
+        for r in &refs {
+            self.put_pointer(r.index, &r.hash)?;
+            pointers_written += 1;
+        }
+        for idx in live {
+            if !snap_set.contains(&idx) {
+                self.delete_chunk_object(idx)?;
+                pointers_deleted += 1;
+            }
+        }
+        Ok(RestoreStats {
+            pointers_written,
+            pointers_deleted,
+            capacity: self.capacity(),
+        })
+    }
+
+    /// Install snapshot pointers into an empty destination COW volume (shared objects).
+    pub fn snapshot_clone_into(
+        &self,
+        dest: &S3ChunkStore,
+        id: &str,
+    ) -> Result<CloneStats, StoreError> {
+        require_cow_store(self)?;
+        require_cow_store(dest)?;
+        if self.prefix == dest.prefix {
+            return Err(StoreError::Other(
+                "clone destination must be a different volume prefix".into(),
+            ));
+        }
+        if dest.chunk_size != self.chunk_size
+            || dest.block_size != self.block_size
+            || dest.compression != self.compression
+        {
+            return Err(StoreError::GeometryMismatch(
+                "clone destination geometry/compression must match snapshot source".into(),
+            ));
+        }
+        let manifest = self.snapshot_get(id)?;
+        if manifest.state != SnapshotState::Ready {
+            return Err(StoreError::Other(format!(
+                "snapshot {id} is not ready"
+            )));
+        }
+        if dest.capacity() < manifest.capacity_bytes {
+            dest.set_capacity(manifest.capacity_bytes)?;
+        }
+        let existing = dest.present_chunks()?;
+        if !existing.is_empty() {
+            return Err(StoreError::Other(
+                "clone destination must be empty (no live chunk pointers)".into(),
+            ));
+        }
+
+        let refs = self.load_snapshot_refs(id)?;
+        // Same family objects/ only if prefixes share a parent — plan uses per-volume family.
+        // Clone across volumes: copy missing object bytes into dest family, then write pointers.
+        let mut objects_copied = 0u64;
+        let mut pointers_written = 0u64;
+        for r in &refs {
+            let src_key = self.object_key(&r.hash);
+            let dst_key = dest.object_key(&r.hash);
+            if dest.get_bytes(dst_key.clone())?.is_none() {
+                let Some((body, _)) = self.get_bytes(src_key)? else {
+                    return Err(StoreError::Other(format!(
+                        "missing object for hash {}",
+                        hash_hex(&r.hash)
+                    )));
+                };
+                dest.put_bytes(dst_key, body, None, None)?;
+                objects_copied += 1;
+            }
+            dest.put_pointer(r.index, &r.hash)?;
+            pointers_written += 1;
+        }
+        Ok(CloneStats {
+            pointers_written,
+            objects_copied,
+        })
+    }
+
+    /// Migrate a live legacy volume to COW layout (objects + pointers + live/meta).
+    pub fn migrate_to_cow(&self) -> Result<MigrateStats, StoreError> {
+        if self.storage_mode() != StorageMode::Legacy {
+            return Err(StoreError::Other(
+                "volume is already storage=cow".into(),
+            ));
+        }
+        let indices = list_chunk_indices(
+            self.client.clone(),
+            self.runtime.clone(),
+            self.bucket.clone(),
+            &format!("{}/chunks/", self.prefix),
+        )?;
+        let mut chunks_migrated = 0u64;
+        for idx in &indices {
+            let key = format!("{}/chunks/{:016x}", self.prefix, idx);
+            let Some((body, _)) = self.get_bytes(key.clone())? else {
+                continue;
+            };
+            let hash = hash_object_bytes(&body);
+            self.put_bytes(self.object_key(&hash), body, None, None)?;
+            let ptr_key = format!("{}/live/chunks/{:016x}", self.prefix, idx);
+            self.put_bytes(ptr_key, encode_pointer(&hash), None, None)?;
+            chunks_migrated += 1;
+        }
+
+        let meta = VolumeMeta {
+            version: META_VERSION,
+            capacity_bytes: self.capacity(),
+            chunk_size: self.chunk_size,
+            block_size: self.block_size,
+            compression: self.compression,
+            storage: StorageMode::Cow,
+        };
+        // Write live meta, flip mode, then remove flat layout.
+        let live_key = self.live_meta_key();
+        let body =
+            serde_json::to_vec_pretty(&meta).map_err(|e| StoreError::Meta(e.to_string()))?;
+        self.put_bytes(live_key, body, Some("application/json"), None)?;
+        *self.storage.lock() = StorageMode::Cow;
+
+        for idx in &indices {
+            let key = format!("{}/chunks/{:016x}", self.prefix, idx);
+            let _ = self.delete_object_key(key);
+        }
+        let _ = self.delete_object_key(self.flat_meta_key());
+
+        Ok(MigrateStats {
+            chunks_migrated,
+            note: "set volumes[].storage = \"cow\" before next restart".into(),
+        })
+    }
+
+    pub fn gc_unreferenced_objects(&self) -> Result<GcStats, StoreError> {
+        require_cow_store(self)?;
+        let mut referenced: HashSet<[u8; HASH_LEN]> = HashSet::new();
+        for idx in self.present_chunks()? {
+            if let Some(h) = self.read_pointer_hash(idx)? {
+                referenced.insert(h);
+            }
+        }
+        for m in self.snapshot_list()? {
+            if let Ok(refs) = self.load_snapshot_refs(&m.id) {
+                for r in refs {
+                    referenced.insert(r.hash);
+                }
+            }
+        }
+
+        let obj_prefix = format!("{}/objects/", self.prefix);
+        let client = self.client.clone();
+        let bucket = self.bucket.clone();
+        let keys: Vec<String> = self.run_async_long(
+            async move {
+                let mut keys = Vec::new();
+                let mut token: Option<String> = None;
+                loop {
+                    let mut req = client
+                        .list_objects_v2()
+                        .bucket(&bucket)
+                        .prefix(&obj_prefix);
+                    if let Some(t) = token.take() {
+                        req = req.continuation_token(t);
+                    }
+                    let out = req
+                        .send()
+                        .await
+                        .map_err(|e| StoreError::S3(e.to_string()))?;
+                    for obj in out.contents() {
+                        if let Some(k) = obj.key() {
+                            keys.push(k.to_string());
+                        }
+                    }
+                    if out.is_truncated().unwrap_or(false) {
+                        token = out.next_continuation_token().map(|s| s.to_string());
+                        if token.is_none() {
+                            break;
+                        }
+                    } else {
+                        break;
+                    }
+                }
+                Ok(keys)
+            },
+            Duration::from_secs(300),
+        )?;
+
+        let mut deleted = 0u64;
+        for key in keys {
+            let Some(hex) = key.rsplit('/').next() else {
+                continue;
+            };
+            let Ok(hash) = crate::snapshot::parse_hash_hex(hex) else {
+                continue;
+            };
+            if !referenced.contains(&hash) {
+                self.delete_object_key(key)?;
+                deleted += 1;
+            }
+        }
+        Ok(GcStats {
+            objects_deleted: deleted,
+            objects_referenced: referenced.len() as u64,
+        })
+    }
+}
+
+fn require_cow_store(store: &S3ChunkStore) -> Result<(), StoreError> {
+    require_cow(store.storage_mode(), store.labels.volume.as_str())
+        .map_err(StoreError::Other)
+}
+
+fn validate_snapshot_id(id: &str) -> Result<(), StoreError> {
+    if id.is_empty()
+        || id.len() > 128
+        || !id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.')
+    {
+        return Err(StoreError::Other(
+            "snapshot id must be 1-128 chars of [A-Za-z0-9._-]".into(),
+        ));
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct GcStats {
+    pub objects_deleted: u64,
+    pub objects_referenced: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct RestoreStats {
+    pub pointers_written: u64,
+    pub pointers_deleted: u64,
+    pub capacity: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct CloneStats {
+    pub pointers_written: u64,
+    pub objects_copied: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct MigrateStats {
+    pub chunks_migrated: u64,
+    pub note: String,
 }
 
 /// Decide effective capacity and whether meta must be rewritten.
-///
-/// Returns `(effective_capacity, Some(new_meta_to_write))` or an error.
 pub fn plan_capacity(
     existing: Option<&VolumeMeta>,
     config_capacity: u64,
     chunk_size: u64,
     block_size: u32,
     compression: Compression,
+    storage: StorageMode,
 ) -> Result<(u64, Option<VolumeMeta>), StoreError> {
     match existing {
         None => {
@@ -504,6 +1109,7 @@ pub fn plan_capacity(
                 chunk_size,
                 block_size,
                 compression,
+                storage,
             };
             Ok((config_capacity, Some(meta)))
         }
@@ -525,6 +1131,13 @@ pub fn plan_capacity(
                     "compression config {:?} != meta {:?}",
                     compression.as_str(),
                     meta.compression.as_str()
+                )));
+            }
+            if meta.storage != storage {
+                return Err(StoreError::GeometryMismatch(format!(
+                    "storage config {} != meta {}",
+                    storage.as_str(),
+                    meta.storage.as_str()
                 )));
             }
             if config_capacity < meta.capacity_bytes {
@@ -577,7 +1190,6 @@ impl BlockStore for S3ChunkStore {
             let within = (abs % self.chunk_size) as usize;
             let take = (chunk_size - within).min(data.len() - done);
             let _guard = self.stripe(chunk_idx).lock();
-            // Optimistic concurrency for multi-instance: RMW with If-Match ETag.
             const MAX_CAS_ATTEMPTS: usize = 8;
             let mut attempt = 0usize;
             loop {
@@ -649,6 +1261,7 @@ impl BlockStore for S3ChunkStore {
             chunk_size: self.chunk_size,
             block_size: self.block_size,
             compression: self.compression,
+            storage: self.storage_mode(),
         };
         self.put_meta(&meta)?;
         self.capacity.store(new_capacity, Ordering::SeqCst);
@@ -672,7 +1285,7 @@ impl BlockStore for S3ChunkStore {
             self.client.clone(),
             self.runtime.clone(),
             self.bucket.clone(),
-            &self.prefix,
+            &self.chunks_prefix(),
         )
     }
 
@@ -693,13 +1306,21 @@ mod tests {
             chunk_size: 4096,
             block_size: 512,
             compression: Compression::None,
+            storage: StorageMode::Legacy,
         }
     }
 
     #[test]
     fn plan_creates_on_missing() {
-        let (cap, write) =
-            plan_capacity(None, 8192, 4096, 512, Compression::None).unwrap();
+        let (cap, write) = plan_capacity(
+            None,
+            8192,
+            4096,
+            512,
+            Compression::None,
+            StorageMode::Legacy,
+        )
+        .unwrap();
         assert_eq!(cap, 8192);
         assert_eq!(write.unwrap().capacity_bytes, 8192);
     }
@@ -707,8 +1328,15 @@ mod tests {
     #[test]
     fn plan_grows() {
         let m = meta(4096);
-        let (cap, write) =
-            plan_capacity(Some(&m), 8192, 4096, 512, Compression::None).unwrap();
+        let (cap, write) = plan_capacity(
+            Some(&m),
+            8192,
+            4096,
+            512,
+            Compression::None,
+            StorageMode::Legacy,
+        )
+        .unwrap();
         assert_eq!(cap, 8192);
         assert!(write.is_some());
     }
@@ -716,22 +1344,60 @@ mod tests {
     #[test]
     fn plan_refuses_shrink() {
         let m = meta(8192);
-        let err = plan_capacity(Some(&m), 4096, 4096, 512, Compression::None).unwrap_err();
+        let err = plan_capacity(
+            Some(&m),
+            4096,
+            4096,
+            512,
+            Compression::None,
+            StorageMode::Legacy,
+        )
+        .unwrap_err();
         assert!(matches!(err, StoreError::ShrinkRefused { .. }));
     }
 
     #[test]
     fn plan_refuses_geometry_change() {
         let m = meta(8192);
-        let err = plan_capacity(Some(&m), 8192, 8192, 512, Compression::None).unwrap_err();
+        let err = plan_capacity(
+            Some(&m),
+            8192,
+            8192,
+            512,
+            Compression::None,
+            StorageMode::Legacy,
+        )
+        .unwrap_err();
         assert!(matches!(err, StoreError::GeometryMismatch(_)));
     }
 
     #[test]
     fn plan_refuses_compression_change() {
         let m = meta(8192);
-        let err =
-            plan_capacity(Some(&m), 8192, 4096, 512, Compression::Lz4).unwrap_err();
+        let err = plan_capacity(
+            Some(&m),
+            8192,
+            4096,
+            512,
+            Compression::Lz4,
+            StorageMode::Legacy,
+        )
+        .unwrap_err();
+        assert!(matches!(err, StoreError::GeometryMismatch(_)));
+    }
+
+    #[test]
+    fn plan_refuses_storage_change() {
+        let m = meta(8192);
+        let err = plan_capacity(
+            Some(&m),
+            8192,
+            4096,
+            512,
+            Compression::None,
+            StorageMode::Cow,
+        )
+        .unwrap_err();
         assert!(matches!(err, StoreError::GeometryMismatch(_)));
     }
 

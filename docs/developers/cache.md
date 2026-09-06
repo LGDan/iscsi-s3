@@ -102,6 +102,7 @@ Full-chunk writes use `etag = None` (no precondition). Concurrent full overwrite
 3. **Two or more daemons on the same volume (rolling upgrades):** `cache.max_bytes = 0` on every instance — [MPIO Setup B/C](../users/mpio.md). Use `iscsi-s3-ctl cache disable` on a live single-process instance before adding a peer ([admin control](../users/admin-ctl.md)).
 4. **Suspect stale data:** restart the daemon (clears LRU) or set cache to 0 and restart; confirm no second caching peer shares the prefix.
 5. **Metrics:** cache hit/miss counters are per volume; use them to see whether the LRU is doing useful work, not as a coherence signal across instances.
+6. **Snapshots (COW):** `volume snapshot create|restore|clone` invalidate that volume’s entries in **this** process’s LRU. Multi-instance peers still need `cache.max_bytes = 0` — there is no cross-process invalidate. See [snapshots](../users/snapshots.md).
 
 ## Summary
 

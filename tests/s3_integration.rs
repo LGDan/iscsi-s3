@@ -70,6 +70,7 @@ fn s3_chunk_round_trip_and_grow() {
             block_size: 512,
             chunk_size: 1024 * 1024,
             compression: iscsi_s3::compression::Compression::None,
+            storage: iscsi_s3::storage_mode::StorageMode::Legacy,
             labels: labels.clone(),
             metrics: Arc::clone(&metrics),
         },
@@ -98,6 +99,7 @@ fn s3_chunk_round_trip_and_grow() {
             block_size: 512,
             chunk_size: 1024 * 1024,
             compression: iscsi_s3::compression::Compression::None,
+            storage: iscsi_s3::storage_mode::StorageMode::Legacy,
             labels,
             metrics,
         },
@@ -117,6 +119,7 @@ fn plan_capacity_unit() {
         chunk_size: 4096,
         block_size: 512,
         compression: iscsi_s3::compression::Compression::None,
+        storage: iscsi_s3::storage_mode::StorageMode::Legacy,
     };
     let (cap, write) = plan_capacity(
         Some(&meta),
@@ -124,8 +127,66 @@ fn plan_capacity_unit() {
         4096,
         512,
         iscsi_s3::compression::Compression::None,
+        iscsi_s3::storage_mode::StorageMode::Legacy,
     )
     .unwrap();
     assert_eq!(cap, 2048);
     assert!(write.is_some());
+}
+
+#[test]
+fn cow_snapshot_roundtrip() {
+    if std::env::var("ISCSI_S3_INTEGRATION").ok().as_deref() != Some("1") {
+        eprintln!("skip cow_snapshot_roundtrip (set ISCSI_S3_INTEGRATION=1)");
+        return;
+    }
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let handle = rt.handle().clone();
+    let client = rt.block_on(make_client());
+    let prefix = unique_prefix();
+    let metrics = Metrics::new().unwrap();
+    let labels = VolumeLabels::new("cow", "iqn.test:cow");
+
+    let store = S3ChunkStore::open(
+        client.clone(),
+        handle.clone(),
+        S3StoreConfig {
+            bucket: "iscsi".into(),
+            prefix: prefix.clone(),
+            capacity: 2 * 1024 * 1024,
+            block_size: 512,
+            chunk_size: 1024 * 1024,
+            compression: iscsi_s3::compression::Compression::Lz4,
+            storage: iscsi_s3::storage_mode::StorageMode::Cow,
+            labels: labels.clone(),
+            metrics: Arc::clone(&metrics),
+        },
+    )
+    .expect("open cow");
+
+    let pattern: Vec<u8> = (0..4096).map(|i| (i % 251) as u8).collect();
+    store.write_at(0, &pattern).expect("write");
+    let manifest = store
+        .snapshot_create("snap1", "cow")
+        .expect("snapshot create");
+    assert_eq!(manifest.chunk_count, 1);
+    assert_eq!(manifest.state, iscsi_s3::snapshot::SnapshotState::Ready);
+
+    let other: Vec<u8> = vec![0xAAu8; 4096];
+    store.write_at(0, &other).expect("cow write");
+    let mut buf = vec![0u8; 4096];
+    store.read_at(0, &mut buf).expect("read live");
+    assert_eq!(buf, other);
+
+    store.snapshot_restore("snap1").expect("restore");
+    store.read_at(0, &mut buf).expect("read restored");
+    assert_eq!(buf, pattern);
+
+    let list = store.snapshot_list().expect("list");
+    assert_eq!(list.len(), 1);
+    let gc = store.snapshot_delete("snap1").expect("delete");
+    assert!(gc.objects_referenced >= 1 || gc.objects_deleted >= 0);
 }

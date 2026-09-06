@@ -163,6 +163,70 @@ enum VolumeCmd {
         #[arg(long, default_value = "5")]
         wait: u64,
     },
+    /// Snapshot create / list / delete / restore / clone (storage=cow volumes)
+    Snapshot {
+        #[command(subcommand)]
+        action: SnapshotCmd,
+    },
+    /// Migrate a legacy volume to COW layout (then set storage=\"cow\" and restart)
+    #[command(name = "migrate-cow")]
+    MigrateCow {
+        /// Volume name or IQN
+        volume: String,
+        /// Skip interactive confirmation
+        #[arg(long, short = 'f')]
+        force: bool,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum SnapshotCmd {
+    /// Create a snapshot from live pointers
+    Create {
+        /// Volume name or IQN
+        volume: String,
+        /// Snapshot id (default: snap-<unix>)
+        #[arg(long, short)]
+        name: Option<String>,
+        /// Allow create with active sessions (crash-consistent best-effort)
+        #[arg(long, short = 'f')]
+        force: bool,
+    },
+    /// List snapshot headers for a volume
+    List {
+        /// Volume name or IQN
+        volume: String,
+    },
+    /// Delete a snapshot and GC unreferenced objects
+    Delete {
+        /// Volume name or IQN
+        volume: String,
+        /// Snapshot id
+        id: String,
+        /// Reserved for confirmation patterns (delete is metadata+GC)
+        #[arg(long, short = 'f')]
+        force: bool,
+    },
+    /// Restore live volume from a snapshot
+    Restore {
+        /// Volume name or IQN
+        volume: String,
+        /// Snapshot id
+        id: String,
+        /// Allow restore with active sessions
+        #[arg(long, short = 'f')]
+        force: bool,
+    },
+    /// Clone a snapshot into an empty destination volume
+    Clone {
+        /// Source volume name or IQN
+        volume: String,
+        /// Snapshot id
+        id: String,
+        /// Destination volume name or IQN (must be empty, storage=cow)
+        #[arg(long)]
+        to: String,
+    },
 }
 
 fn socket_path(cli: &CtlCli) -> PathBuf {
@@ -277,6 +341,68 @@ fn main() -> ExitCode {
             ),
             *force,
             "volume wipe",
+        ) {
+            eprintln!("error: {e}");
+            return ExitCode::from(2);
+        }
+    }
+
+    if let Commands::Volume {
+        action:
+            VolumeCmd::Snapshot {
+                action:
+                    SnapshotCmd::Delete {
+                        volume,
+                        id,
+                        force,
+                    },
+            },
+    } = &cli.command
+    {
+        if let Err(e) = confirm_yes(
+            &format!("This will DELETE snapshot '{id}' on volume '{volume}' and GC unreferenced objects."),
+            *force,
+            "snapshot delete",
+        ) {
+            eprintln!("error: {e}");
+            return ExitCode::from(2);
+        }
+    }
+
+    if let Commands::Volume {
+        action:
+            VolumeCmd::Snapshot {
+                action:
+                    SnapshotCmd::Restore {
+                        volume,
+                        id,
+                        force,
+                    },
+            },
+    } = &cli.command
+    {
+        if let Err(e) = confirm_yes(
+            &format!(
+                "This will RESTORE volume '{volume}' from snapshot '{id}' (live data replaced)."
+            ),
+            *force,
+            "snapshot restore",
+        ) {
+            eprintln!("error: {e}");
+            return ExitCode::from(2);
+        }
+    }
+
+    if let Commands::Volume {
+        action: VolumeCmd::MigrateCow { volume, force },
+    } = &cli.command
+    {
+        if let Err(e) = confirm_yes(
+            &format!(
+                "This will MIGRATE volume '{volume}' from legacy flat chunks to COW (objects + pointers)."
+            ),
+            *force,
+            "migrate-cow",
         ) {
             eprintln!("error: {e}");
             return ExitCode::from(2);
@@ -464,6 +590,56 @@ fn build_request(cmd: &Commands) -> Result<serde_json::Value, String> {
                 }
                 req
             }
+            VolumeCmd::Snapshot { action } => match action {
+                SnapshotCmd::Create {
+                    volume,
+                    name,
+                    force,
+                } => {
+                    let mut req = json!({
+                        "op": "volume.snapshot.create",
+                        "volume": volume,
+                        "force": force,
+                    });
+                    if let Some(n) = name {
+                        req["id"] = json!(n);
+                    }
+                    req
+                }
+                SnapshotCmd::List { volume } => {
+                    json!({ "op": "volume.snapshot.list", "volume": volume })
+                }
+                SnapshotCmd::Delete { volume, id, .. } => {
+                    json!({
+                        "op": "volume.snapshot.delete",
+                        "volume": volume,
+                        "id": id,
+                    })
+                }
+                SnapshotCmd::Restore {
+                    volume,
+                    id,
+                    force,
+                } => {
+                    json!({
+                        "op": "volume.snapshot.restore",
+                        "volume": volume,
+                        "id": id,
+                        "force": force,
+                    })
+                }
+                SnapshotCmd::Clone { volume, id, to } => {
+                    json!({
+                        "op": "volume.snapshot.clone",
+                        "volume": volume,
+                        "id": id,
+                        "to": to,
+                    })
+                }
+            },
+            VolumeCmd::MigrateCow { volume, .. } => {
+                json!({ "op": "volume.migrate_cow", "volume": volume })
+            }
             VolumeCmd::Connect { .. }
             | VolumeCmd::Disconnect { .. }
             | VolumeCmd::Device { .. } => {
@@ -536,6 +712,20 @@ fn print_text(cmd: &Commands, resp: &serde_json::Value) -> Result<(), String> {
             action: VolumeCmd::Sessions { .. },
         } => {
             print_volume_sessions(&data);
+        }
+        Commands::Volume {
+            action: VolumeCmd::Snapshot { action },
+        } => match action {
+            SnapshotCmd::Create { .. } => print_snapshot_create(&data),
+            SnapshotCmd::List { .. } => print_snapshot_list(&data),
+            SnapshotCmd::Delete { .. } => print_snapshot_delete(&data),
+            SnapshotCmd::Restore { .. } => print_snapshot_restore(&data),
+            SnapshotCmd::Clone { .. } => print_snapshot_clone(&data),
+        },
+        Commands::Volume {
+            action: VolumeCmd::MigrateCow { .. },
+        } => {
+            print_migrate_cow(&data);
         }
         Commands::Volume {
             action:
@@ -651,11 +841,12 @@ fn print_volume_list(data: &serde_json::Value) {
     if let Some(vols) = data.get("volumes").and_then(|v| v.as_array()) {
         for v in vols {
             println!(
-                "  - {}  iqn={}  capacity={}  prefix={}  compression={}  auth={}",
+                "  - {}  iqn={}  capacity={}  prefix={}  storage={}  compression={}  auth={}",
                 v.get("name").and_then(|x| x.as_str()).unwrap_or("?"),
                 v.get("iqn").and_then(|x| x.as_str()).unwrap_or("?"),
                 v.get("capacity").and_then(|x| x.as_u64()).unwrap_or(0),
                 v.get("prefix").and_then(|x| x.as_str()).unwrap_or("?"),
+                v.get("storage").and_then(|x| x.as_str()).unwrap_or("legacy"),
                 v.get("compression")
                     .and_then(|x| x.as_str())
                     .unwrap_or("none"),
@@ -808,6 +999,123 @@ fn print_volume_grow(data: &serde_json::Value) {
     );
     if let Some(n) = data.get("note").and_then(|v| v.as_str()) {
         println!("note: {n}");
+    }
+}
+
+fn print_snapshot_create(data: &serde_json::Value) {
+    let snap = data.get("snapshot");
+    println!(
+        "created snapshot {} on volume {}",
+        snap.and_then(|s| s.get("id")).and_then(|v| v.as_str()).unwrap_or("?"),
+        data.get("volume").and_then(|v| v.as_str()).unwrap_or("?")
+    );
+    println!(
+        "chunk_count={}  state={}",
+        snap.and_then(|s| s.get("chunk_count"))
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0),
+        snap.and_then(|s| s.get("state"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("?")
+    );
+}
+
+fn print_snapshot_list(data: &serde_json::Value) {
+    println!(
+        "volume {} (storage={}): {} snapshot(s)",
+        data.get("volume").and_then(|v| v.as_str()).unwrap_or("?"),
+        data.get("storage").and_then(|v| v.as_str()).unwrap_or("?"),
+        data.get("count").and_then(|v| v.as_u64()).unwrap_or(0)
+    );
+    if let Some(arr) = data.get("snapshots").and_then(|v| v.as_array()) {
+        for s in arr {
+            println!(
+                "  - {}  created_at={}  chunks={}  state={}",
+                s.get("id").and_then(|v| v.as_str()).unwrap_or("?"),
+                s.get("created_at_unix")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0),
+                s.get("chunk_count").and_then(|v| v.as_u64()).unwrap_or(0),
+                s.get("state").and_then(|v| v.as_str()).unwrap_or("?")
+            );
+        }
+    }
+}
+
+fn print_snapshot_delete(data: &serde_json::Value) {
+    println!(
+        "deleted snapshot {} on volume {}",
+        data.get("id").and_then(|v| v.as_str()).unwrap_or("?"),
+        data.get("volume").and_then(|v| v.as_str()).unwrap_or("?")
+    );
+    if let Some(gc) = data.get("gc") {
+        println!(
+            "gc: objects_deleted={}  objects_referenced={}",
+            gc.get("objects_deleted")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0),
+            gc.get("objects_referenced")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0)
+        );
+    }
+}
+
+fn print_snapshot_restore(data: &serde_json::Value) {
+    println!(
+        "restored volume {} from snapshot {}",
+        data.get("volume").and_then(|v| v.as_str()).unwrap_or("?"),
+        data.get("id").and_then(|v| v.as_str()).unwrap_or("?")
+    );
+    if let Some(r) = data.get("restore") {
+        println!(
+            "pointers_written={}  pointers_deleted={}  capacity={}",
+            r.get("pointers_written")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0),
+            r.get("pointers_deleted")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0),
+            r.get("capacity").and_then(|v| v.as_u64()).unwrap_or(0)
+        );
+    }
+}
+
+fn print_snapshot_clone(data: &serde_json::Value) {
+    println!(
+        "cloned snapshot {} from {} → {}",
+        data.get("id").and_then(|v| v.as_str()).unwrap_or("?"),
+        data.get("from").and_then(|v| v.as_str()).unwrap_or("?"),
+        data.get("to").and_then(|v| v.as_str()).unwrap_or("?")
+    );
+    if let Some(c) = data.get("clone") {
+        println!(
+            "pointers_written={}  objects_copied={}",
+            c.get("pointers_written")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0),
+            c.get("objects_copied")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0)
+        );
+    }
+}
+
+fn print_migrate_cow(data: &serde_json::Value) {
+    println!(
+        "migrated volume {} to storage=cow",
+        data.get("volume").and_then(|v| v.as_str()).unwrap_or("?")
+    );
+    if let Some(m) = data.get("migrate") {
+        println!(
+            "chunks_migrated={}",
+            m.get("chunks_migrated")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0)
+        );
+        if let Some(n) = m.get("note").and_then(|v| v.as_str()) {
+            println!("note: {n}");
+        }
     }
 }
 

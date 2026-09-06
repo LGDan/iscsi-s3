@@ -15,11 +15,20 @@ S3BlockDevice
 ChunkCache (optional hit)
     │
     ▼
-S3Store  →  {prefix}/chunks/{index:016x}
-         →  {prefix}/meta.json
+S3ChunkStore  →  legacy: `{prefix}/chunks/{index:016x}` + `{prefix}/meta.json`
+              →  cow:    `{prefix}/live/…` + `{prefix}/objects/{blake3}` + snapshots
 ```
 
 S3 I/O runs on a dedicated Tokio runtime. iSCSI connection threads call into the store via a spawn + channel pattern so they never nest `block_on` on the runtime.
+
+## Storage modes (legacy vs cow)
+
+Per-volume `volumes[].storage` (default **`legacy`**) selects the on-disk layout:
+
+- **legacy** — flat full-payload chunk objects (max I/O performance; no snapshots).
+- **cow** — content-addressed `objects/` pool + thin live pointers; snapshot create/list/delete/restore/clone via compact `chunks.bin` indexes (BLAKE3 over on-disk payload bytes).
+
+Operator guide: [Volume snapshots](../users/snapshots.md).
 
 ## One portal, many IQNs
 
@@ -45,6 +54,7 @@ Implementation: `portal_addrs` / `advertise_addr` on `IscsiServer` / `IscsiTarge
 - Split into `chunk_size` objects (default 4 MiB).
 - Missing objects read as zeros (sparse).
 - Optional per-volume chunk compression (`none` / `lz4` / `zstd` / `deflate`); compressed objects use an `ISC3` header. Locked in `meta.json`.
+- Optional `storage` (`legacy` | `cow`); locked in `meta.json`. COW volumes store pointers under `live/chunks/` and payloads under `objects/`.
 - Writes RMW partial chunks as needed.
 - `meta.json` locks capacity/geometry grow-only rules (see user configuration docs).
 

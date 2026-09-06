@@ -37,7 +37,7 @@ Docker: install both `iscsi-s3` and `iscsi-s3-ctl` in the image. Mount/share the
 | `cache disable` | Set `max_bytes = 0` and **clear** all cached chunks |
 | `cache enable [--max-bytes 256MiB]` | Enable cache (cold); default size is last non-zero budget |
 | `cache set --max-bytes …` | Set budget (`0` disables + clears) |
-| `volume list` | List configured volumes (name, IQN, capacity, prefix, compression, auth) |
+| `volume list` | List configured volumes (name, IQN, capacity, prefix, storage, compression, auth) |
 | `volume sessions [name\|iqn]` | Active FullFeature sessions (initiator, peer, age) |
 | `volume s3-stats <name\|iqn>` | List S3 objects under the volume prefix: chunk/meta counts and bytes |
 | `volume write-image <name\|iqn> --file PATH` | Stream a raw disk image into a volume that has **no chunk objects** yet |
@@ -45,6 +45,12 @@ Docker: install both `iscsi-s3` and `iscsi-s3-ctl` in the image. Mount/share the
 | `volume grow <name\|iqn> --capacity SIZE` | Grow-only capacity update (meta.json + live READ CAPACITY) |
 | `volume copy <from> <to> [--force]` | 1:1 sparse copy; **overwrites** destination (prompts unless `--force`) |
 | `volume wipe <name\|iqn> [--force]` | Delete all chunk objects; keeps `meta.json` (prompts unless `--force`) |
+| `volume snapshot create <vol> [--name ID] [--force]` | Create CoW snapshot (`storage=cow` only); quiesce unless `--force` |
+| `volume snapshot list <vol>` | List snapshot headers |
+| `volume snapshot delete <vol> <id> [--force]` | Delete snapshot + GC unreferenced objects |
+| `volume snapshot restore <vol> <id> [--force]` | Restore live pointers from snapshot |
+| `volume snapshot clone <vol> <id> --to <dest>` | Clone snapshot into empty matching COW volume |
+| `volume migrate-cow <vol> [--force]` | Convert legacy flat layout → COW (then set `storage=cow` and restart) |
 | `volume connect <name\|iqn> [--portal …] [--username …] [--password …]` | Local helper: `iscsiadm` discovery + optional CHAP + login |
 | `volume disconnect <name\|iqn> [--portal HOST:PORT]` | Local helper: `iscsiadm` logout |
 | `volume device <name\|iqn> [--wait SECS]` | Print local `/dev` path(s) for a connected volume |

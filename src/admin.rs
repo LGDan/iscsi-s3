@@ -1,9 +1,12 @@
 //! Local Unix-domain admin control plane for `iscsi-s3-ctl`.
 
-use crate::cache::ChunkCache;
+use crate::cache::{CachedStore, ChunkCache};
 use crate::config::{parse_byte_size, Config};
 use crate::metrics::{Metrics, SessionMetricsSink};
-use crate::store::{list_prefix_stats, BlockStore, PrefixObjectStats};
+use crate::store::{
+    list_prefix_stats, BlockStore, S3ChunkStore, PrefixObjectStats,
+};
+use crate::storage_mode::StorageMode;
 use iscsi_target::IscsiServer;
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
@@ -25,13 +28,14 @@ pub struct VolumeSummary {
     pub prefix: String,
     pub chunk_size: u64,
     pub compression: String,
+    pub storage: String,
 }
 
 /// Live store handle used by admin write paths (same Arc as the iSCSI device).
 pub struct AdminVolumeHandle {
     pub name: String,
     pub iqn: String,
-    pub store: Arc<dyn BlockStore>,
+    pub store: Arc<CachedStore<S3ChunkStore>>,
 }
 
 pub struct AdminState {
@@ -80,6 +84,15 @@ struct AdminRequest {
     /// New capacity for `volume.grow` (number or size string via JSON string/number).
     #[serde(default)]
     capacity: Option<serde_json::Value>,
+    /// Snapshot id (`volume.snapshot.*`).
+    #[serde(default)]
+    id: Option<String>,
+    /// Optional snapshot name / id override for create.
+    #[serde(default)]
+    name: Option<String>,
+    /// Skip quiesce checks for snapshot create/restore.
+    #[serde(default)]
+    force: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -266,22 +279,17 @@ fn prepare_write_image(state: &AdminState, req: &AdminRequest) -> Result<WriteIm
         size,
         capacity,
         chunk_size: handle.store.chunk_size(),
-        store: Arc::clone(&handle.store),
+        store: Arc::clone(&handle.store) as Arc<dyn BlockStore>,
     })
 }
 
-/// Volume is seedable when it has no chunk (block) objects yet. `meta.json` is allowed.
+/// Volume is seedable when it has no live chunk/pointer objects yet.
+/// `meta.json` and COW `objects/` / `snapshots/` are allowed (e.g. after wipe).
 pub fn ensure_prefix_empty_for_seed(stats: &PrefixObjectStats) -> Result<(), String> {
     if stats.chunk_count > 0 {
         return Err(format!(
             "volume is not empty: {} chunk object(s) already exist under the prefix",
             stats.chunk_count
-        ));
-    }
-    if stats.other_count > 0 {
-        return Err(format!(
-            "volume prefix has {} unexpected non-chunk/non-meta object(s); refuse to seed",
-            stats.other_count
         ));
     }
     Ok(())
@@ -394,6 +402,30 @@ fn dispatch(state: &AdminState, req: &AdminRequest) -> serde_json::Value {
             Err(e) => err(e),
         },
         "volume.sessions" => ok(volume_sessions_json(state, req.volume.as_deref())),
+        "volume.snapshot.create" => match volume_snapshot_create(state, req) {
+            Ok(v) => ok(v),
+            Err(e) => err(e),
+        },
+        "volume.snapshot.list" => match volume_snapshot_list(state, req.volume.as_deref()) {
+            Ok(v) => ok(v),
+            Err(e) => err(e),
+        },
+        "volume.snapshot.delete" => match volume_snapshot_delete(state, req) {
+            Ok(v) => ok(v),
+            Err(e) => err(e),
+        },
+        "volume.snapshot.restore" => match volume_snapshot_restore(state, req) {
+            Ok(v) => ok(v),
+            Err(e) => err(e),
+        },
+        "volume.snapshot.clone" => match volume_snapshot_clone(state, req) {
+            Ok(v) => ok(v),
+            Err(e) => err(e),
+        },
+        "volume.migrate_cow" => match volume_migrate_cow(state, req.volume.as_deref()) {
+            Ok(v) => ok(v),
+            Err(e) => err(e),
+        },
         "health" => match health_json(state) {
             Ok(v) => ok(v),
             Err(e) => err(e),
@@ -657,6 +689,201 @@ fn volume_sessions_json(state: &AdminState, selector: Option<&str>) -> serde_jso
     })
 }
 
+fn require_quiesced(state: &AdminState, volume: &str, iqn: &str, force: bool) -> Result<(), String> {
+    if force {
+        return Ok(());
+    }
+    let sessions = state.sessions.list_sessions(Some(volume));
+    let by_iqn = if sessions.is_empty() {
+        state.sessions.list_sessions(Some(iqn))
+    } else {
+        sessions
+    };
+    if !by_iqn.is_empty() {
+        return Err(format!(
+            "volume {volume} has {} active FullFeature session(s); disconnect first or pass force=true for crash-consistent best-effort",
+            by_iqn.len()
+        ));
+    }
+    Ok(())
+}
+
+fn volume_snapshot_create(
+    state: &AdminState,
+    req: &AdminRequest,
+) -> Result<serde_json::Value, String> {
+    let snap = state.snapshot.lock().clone();
+    let vol = find_volume(&snap.volumes, req.volume.as_deref())?.clone();
+    require_quiesced(state, &vol.name, &vol.iqn, req.force)?;
+    let handle = find_volume_store(&state.volume_stores, &vol)?;
+    let id = req
+        .id
+        .clone()
+        .or_else(|| req.name.clone())
+        .unwrap_or_else(|| {
+            let ts = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            format!("snap-{ts}")
+        });
+    handle.store.cache().invalidate_volume(&vol.name);
+    let manifest = handle
+        .store
+        .inner()
+        .snapshot_create(&id, &vol.name)
+        .map_err(|e| e.to_string())?;
+    Ok(json!({
+        "volume": vol.name,
+        "snapshot": manifest,
+    }))
+}
+
+fn volume_snapshot_list(
+    state: &AdminState,
+    selector: Option<&str>,
+) -> Result<serde_json::Value, String> {
+    let snap = state.snapshot.lock().clone();
+    let vol = find_volume(&snap.volumes, selector)?.clone();
+    let handle = find_volume_store(&state.volume_stores, &vol)?;
+    let list = handle
+        .store
+        .inner()
+        .snapshot_list()
+        .map_err(|e| e.to_string())?;
+    Ok(json!({
+        "volume": vol.name,
+        "storage": vol.storage,
+        "snapshots": list,
+        "count": list.len(),
+    }))
+}
+
+fn volume_snapshot_delete(
+    state: &AdminState,
+    req: &AdminRequest,
+) -> Result<serde_json::Value, String> {
+    let snap = state.snapshot.lock().clone();
+    let vol = find_volume(&snap.volumes, req.volume.as_deref())?.clone();
+    let id = req
+        .id
+        .as_deref()
+        .ok_or_else(|| "snapshot id is required".to_string())?;
+    let handle = find_volume_store(&state.volume_stores, &vol)?;
+    let gc = handle
+        .store
+        .inner()
+        .snapshot_delete(id)
+        .map_err(|e| e.to_string())?;
+    Ok(json!({
+        "volume": vol.name,
+        "id": id,
+        "gc": gc,
+    }))
+}
+
+fn volume_snapshot_restore(
+    state: &AdminState,
+    req: &AdminRequest,
+) -> Result<serde_json::Value, String> {
+    let snap = state.snapshot.lock().clone();
+    let vol = find_volume(&snap.volumes, req.volume.as_deref())?.clone();
+    require_quiesced(state, &vol.name, &vol.iqn, req.force)?;
+    let id = req
+        .id
+        .as_deref()
+        .ok_or_else(|| "snapshot id is required".to_string())?;
+    let handle = find_volume_store(&state.volume_stores, &vol)?;
+    handle.store.cache().invalidate_volume(&vol.name);
+    let stats = handle
+        .store
+        .inner()
+        .snapshot_restore(id)
+        .map_err(|e| e.to_string())?;
+    handle.store.cache().invalidate_volume(&vol.name);
+    // Keep summary capacity in sync if restore grew the volume.
+    {
+        let mut snap = state.snapshot.lock();
+        if let Some(v) = snap.volumes.iter_mut().find(|v| v.name == vol.name) {
+            v.capacity = stats.capacity;
+        }
+    }
+    Ok(json!({
+        "volume": vol.name,
+        "id": id,
+        "restore": stats,
+    }))
+}
+
+fn volume_snapshot_clone(
+    state: &AdminState,
+    req: &AdminRequest,
+) -> Result<serde_json::Value, String> {
+    let snap = state.snapshot.lock().clone();
+    let src = find_volume(&snap.volumes, req.volume.as_deref())?.clone();
+    let dst = find_volume(&snap.volumes, req.to.as_deref())?.clone();
+    if src.name == dst.name {
+        return Err("clone source and destination must differ".into());
+    }
+    let id = req
+        .id
+        .as_deref()
+        .ok_or_else(|| "snapshot id is required".to_string())?;
+    let src_h = find_volume_store(&state.volume_stores, &src)?;
+    let dst_h = find_volume_store(&state.volume_stores, &dst)?;
+    dst_h.store.cache().invalidate_volume(&dst.name);
+    let stats = src_h
+        .store
+        .inner()
+        .snapshot_clone_into(dst_h.store.inner(), id)
+        .map_err(|e| e.to_string())?;
+    {
+        let mut snap = state.snapshot.lock();
+        if let Some(v) = snap.volumes.iter_mut().find(|v| v.name == dst.name) {
+            v.capacity = dst_h.store.capacity();
+        }
+    }
+    Ok(json!({
+        "from": src.name,
+        "to": dst.name,
+        "id": id,
+        "clone": stats,
+    }))
+}
+
+fn volume_migrate_cow(
+    state: &AdminState,
+    selector: Option<&str>,
+) -> Result<serde_json::Value, String> {
+    let snap = state.snapshot.lock().clone();
+    let vol = find_volume(&snap.volumes, selector)?.clone();
+    if vol.storage != StorageMode::Legacy.as_str() {
+        return Err(format!(
+            "volume {} config storage={} — migrate-cow runs while the volume is still open as legacy",
+            vol.name, vol.storage
+        ));
+    }
+    require_quiesced(state, &vol.name, &vol.iqn, false)?;
+    let handle = find_volume_store(&state.volume_stores, &vol)?;
+    handle.store.cache().invalidate_volume(&vol.name);
+    let stats = handle
+        .store
+        .inner()
+        .migrate_to_cow()
+        .map_err(|e| e.to_string())?;
+    {
+        let mut snap = state.snapshot.lock();
+        if let Some(v) = snap.volumes.iter_mut().find(|v| v.name == vol.name) {
+            v.storage = StorageMode::Cow.as_str().to_string();
+        }
+    }
+    Ok(json!({
+        "volume": vol.name,
+        "migrate": stats,
+        "storage": "cow",
+    }))
+}
+
 fn volume_grow(
     state: &AdminState,
     selector: Option<&str>,
@@ -834,7 +1061,7 @@ fn prepare_export(state: &AdminState, req: &AdminRequest) -> Result<ExportPrep, 
         size,
         capacity,
         chunk_size: handle.store.chunk_size(),
-        store: Arc::clone(&handle.store),
+        store: Arc::clone(&handle.store) as Arc<dyn BlockStore>,
     })
 }
 
@@ -1087,6 +1314,7 @@ fn volumes_structurally_changed(current: &AdminSnapshot, new_cfg: &Config) -> bo
             || cur.capacity != vol.capacity
             || cur.chunk_size != vol.chunk_size
             || cur.compression != vol.compression.as_str()
+            || cur.storage != vol.storage.as_str()
         {
             return true;
         }
@@ -1237,6 +1465,7 @@ mod tests {
                 prefix: "disks/disk0".into(),
                 chunk_size: 4096,
                 compression: "none".into(),
+                storage: "legacy".into(),
             }],
             cache_max_bytes: 1024,
             s3_bucket: None,
@@ -1263,6 +1492,7 @@ mod tests {
                 chunk_size: 4096,
                 auth: None,
                 compression: Default::default(),
+                storage: Default::default(),
             }],
         };
         let r = apply_safe_reload(&snap, &cfg, &cache).unwrap();

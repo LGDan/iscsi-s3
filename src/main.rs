@@ -147,11 +147,12 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             vol,
         )?;
         let capacity = opened.store.capacity();
+        let storage = opened.store.inner().storage_mode().as_str().to_string();
         volume_labels.push(opened.labels.clone());
         volume_stores.push(AdminVolumeHandle {
             name: opened.name.clone(),
             iqn: opened.iqn.clone(),
-            store: Arc::clone(&opened.store) as Arc<dyn BlockStore>,
+            store: Arc::clone(&opened.store),
         });
         let device = S3BlockDevice::new(opened.store, opened.labels, Arc::clone(&metrics));
         let auth = resolve_auth(&cfg.auth, &vol.auth)?;
@@ -163,6 +164,7 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             prefix: vol.prefix.trim_matches('/').to_string(),
             chunk_size: vol.chunk_size,
             compression: vol.compression.as_str().to_string(),
+            storage,
         });
         info!(
             name = %opened.name,
