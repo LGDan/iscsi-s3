@@ -69,13 +69,17 @@ Snapshot ops invalidate the local volume’s cache entries. That does **not** in
 
 ## Migrate legacy → cow
 
-While the volume is still open as **legacy**:
+While the volume is still open as **legacy** (and preferably with no sessions):
 
 ```bash
 iscsi-s3-ctl volume migrate-cow disk0 --force
 ```
 
-Then set `storage = "cow"` in config and restart. After migrate, flat chunk keys are removed; live pointers + object pool remain.
+Then set `storage = "cow"` in config and restart.
+
+**Space:** each legacy flat chunk is deleted as soon as its content-addressed object + live pointer are written, so peak usage stays near **1×** (not a full second copy).
+
+**I/O lock:** the volume is locked for iSCSI (and other BlockStore admin paths) for the whole migrate. On failure it **stays locked** so clients cannot read zeros for chunks already removed from the legacy layout. Re-run `migrate-cow` to resume, or restart the daemon (open auto-resumes when `live/migrating.json` is present). Unlock happens only after a successful commit to `live/meta.json`.
 
 ## Interactions
 

@@ -24,3 +24,11 @@ iqn = "iqn.2026-09.local.iscsi-s3:disk0"
 prefix = "disks/disk0"
 capacity = "16GiB"
 chunk_size = "256KiB"
+storage = "cow"
+
+[[volumes]]
+name = "disk1"
+iqn = "iqn.2026-09.local.iscsi-s3:disk1"
+prefix = "disks/disk1"
+capacity = "16GiB"
+chunk_size = "256KiB"

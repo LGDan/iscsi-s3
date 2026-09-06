@@ -94,6 +94,9 @@ enum VolumeCmd {
         /// Skip interactive confirmation
         #[arg(long, short = 'f')]
         force: bool,
+        /// Resume from this chunk index (skip copying source chunks with a lower index)
+        #[arg(long = "resume-from")]
+        resume_from: Option<u64>,
     },
     /// Delete all chunk objects on a volume (keeps meta.json)
     Wipe {
@@ -316,12 +319,21 @@ fn main() -> ExitCode {
     }
 
     if let Commands::Volume {
-        action: VolumeCmd::Copy { from, to, force },
+        action:
+            VolumeCmd::Copy {
+                from,
+                to,
+                force,
+                resume_from,
+            },
     } = &cli.command
     {
+        let resume_note = resume_from
+            .map(|i| format!(" Resuming from chunk index {i}."))
+            .unwrap_or_default();
         if let Err(e) = confirm_yes(
             &format!(
-                "This will OVERWRITE volume '{to}' with a 1:1 copy of '{from}'."
+                "This will OVERWRITE volume '{to}' with a 1:1 copy of '{from}'.{resume_note}"
             ),
             *force,
             "volume copy",
@@ -573,8 +585,17 @@ fn build_request(cmd: &Commands) -> Result<serde_json::Value, String> {
             VolumeCmd::Export { .. } => {
                 unreachable!("export uses call_admin_export")
             }
-            VolumeCmd::Copy { from, to, .. } => {
-                json!({ "op": "volume.copy", "volume": from, "to": to })
+            VolumeCmd::Copy {
+                from,
+                to,
+                resume_from,
+                ..
+            } => {
+                let mut req = json!({ "op": "volume.copy", "volume": from, "to": to });
+                if let Some(idx) = resume_from {
+                    req["resume_from"] = json!(idx);
+                }
+                req
             }
             VolumeCmd::Wipe { volume, .. } => {
                 json!({ "op": "volume.wipe", "volume": volume })
@@ -957,6 +978,15 @@ fn print_volume_copy(data: &serde_json::Value) {
             .and_then(|v| v.as_u64())
             .unwrap_or(0)
     );
+    if let Some(idx) = data.get("resume_from").and_then(|v| v.as_u64()) {
+        println!(
+            "resume_from={}  chunks_skipped={}",
+            idx,
+            data.get("chunks_skipped")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0)
+        );
+    }
     if let Some(n) = data.get("note").and_then(|v| v.as_str()) {
         println!("note: {n}");
     }
@@ -1108,8 +1138,11 @@ fn print_migrate_cow(data: &serde_json::Value) {
     );
     if let Some(m) = data.get("migrate") {
         println!(
-            "chunks_migrated={}",
+            "chunks_migrated={}  legacy_chunks_deleted={}",
             m.get("chunks_migrated")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0),
+            m.get("chunks_deleted")
                 .and_then(|v| v.as_u64())
                 .unwrap_or(0)
         );

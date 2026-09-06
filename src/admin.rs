@@ -93,6 +93,9 @@ struct AdminRequest {
     /// Skip quiesce checks for snapshot create/restore.
     #[serde(default)]
     force: bool,
+    /// Resume `volume.copy` from this chunk index (inclusive).
+    #[serde(default)]
+    resume_from: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -108,6 +111,8 @@ pub struct CopyVolumeResult {
     pub chunks_copied: u64,
     pub chunks_deleted: u64,
     pub bytes_copied: u64,
+    /// Source chunks skipped because their index was below `resume_from`.
+    pub chunks_skipped: u64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -389,7 +394,12 @@ fn dispatch(state: &AdminState, req: &AdminRequest) -> serde_json::Value {
             Err(e) => err(e),
         },
         "volume.list" => ok(volume_list_json(state)),
-        "volume.copy" => match volume_copy(state, req.volume.as_deref(), req.to.as_deref()) {
+        "volume.copy" => match volume_copy(
+            state,
+            req.volume.as_deref(),
+            req.to.as_deref(),
+            req.resume_from,
+        ) {
             Ok(v) => ok(v),
             Err(e) => err(e),
         },
@@ -513,6 +523,7 @@ fn volume_copy(
     state: &AdminState,
     from: Option<&str>,
     to: Option<&str>,
+    resume_from: Option<u64>,
 ) -> Result<serde_json::Value, String> {
     let snap = state.snapshot.lock().clone();
     let src_sum = find_volume(&snap.volumes, from)?.clone();
@@ -524,18 +535,21 @@ fn volume_copy(
     let src = find_volume_store(&state.volume_stores, &src_sum)?;
     let dst = find_volume_store(&state.volume_stores, &dst_sum)?;
 
-    let result = copy_volume(src.store.as_ref(), dst.store.as_ref()).map_err(|e| e.to_string())?;
+    let result = copy_volume(src.store.as_ref(), dst.store.as_ref(), resume_from)
+        .map_err(|e| e.to_string())?;
 
     info!(
         from = %src_sum.name,
         to = %dst_sum.name,
         chunks_copied = result.chunks_copied,
         chunks_deleted = result.chunks_deleted,
+        chunks_skipped = result.chunks_skipped,
         bytes_copied = result.bytes_copied,
+        resume_from = ?resume_from,
         "volume copy complete"
     );
 
-    Ok(json!({
+    let mut out = json!({
         "from": {
             "volume": src_sum.name,
             "iqn": src_sum.iqn,
@@ -552,15 +566,28 @@ fn volume_copy(
         },
         "chunks_copied": result.chunks_copied,
         "chunks_deleted": result.chunks_deleted,
+        "chunks_skipped": result.chunks_skipped,
         "bytes_copied": result.bytes_copied,
         "note": "destination overwritten to match source sparsity; compression may be re-encoded per destination config",
-    }))
+    });
+    if let Some(idx) = resume_from {
+        out["resume_from"] = json!(idx);
+        out["note"] = json!(
+            "resumed copy: source chunks below resume_from were skipped; dest-only chunks still reconciled"
+        );
+    }
+    Ok(out)
 }
 
 /// Sparse 1:1 copy: copy present source chunks, delete destination-only chunks.
+///
+/// When `resume_from` is set, source chunks with index `< resume_from` are not
+/// re-copied (assumed already done). Destination-only chunk deletion still runs
+/// fully so a failed mid-copy can finish sparsity cleanup on resume.
 pub fn copy_volume(
     src: &dyn BlockStore,
     dst: &dyn BlockStore,
+    resume_from: Option<u64>,
 ) -> Result<CopyVolumeResult, String> {
     if src.chunk_size() != dst.chunk_size() {
         return Err(format!(
@@ -599,10 +626,15 @@ pub fn copy_volume(
 
     let src_set: std::collections::HashSet<u64> = src_chunks.iter().copied().collect();
     let mut chunks_copied = 0u64;
+    let mut chunks_skipped = 0u64;
     let mut bytes_copied = 0u64;
     let mut buf = vec![0u8; chunk_size as usize];
 
     for &idx in &src_chunks {
+        if resume_from.is_some_and(|start| idx < start) {
+            chunks_skipped += 1;
+            continue;
+        }
         let offset = idx.checked_mul(chunk_size).ok_or_else(|| {
             format!("chunk index {idx} overflows with chunk_size {chunk_size}")
         })?;
@@ -610,10 +642,16 @@ pub fn copy_volume(
             continue;
         }
         let len = ((capacity - offset) as usize).min(buf.len());
-        src.read_at(offset, &mut buf[..len])
-            .map_err(|e| format!("read source chunk {idx}: {e}"))?;
-        dst.write_at(offset, &buf[..len])
-            .map_err(|e| format!("write destination chunk {idx}: {e}"))?;
+        src.read_at(offset, &mut buf[..len]).map_err(|e| {
+            format!(
+                "read source chunk {idx}: {e} (resume with --resume-from {idx})"
+            )
+        })?;
+        dst.write_at(offset, &buf[..len]).map_err(|e| {
+            format!(
+                "write destination chunk {idx}: {e} (resume with --resume-from {idx})"
+            )
+        })?;
         chunks_copied += 1;
         bytes_copied += len as u64;
     }
@@ -635,6 +673,7 @@ pub fn copy_volume(
         chunks_copied,
         chunks_deleted,
         bytes_copied,
+        chunks_skipped,
     })
 }
 
@@ -857,20 +896,27 @@ fn volume_migrate_cow(
 ) -> Result<serde_json::Value, String> {
     let snap = state.snapshot.lock().clone();
     let vol = find_volume(&snap.volumes, selector)?.clone();
-    if vol.storage != StorageMode::Legacy.as_str() {
-        return Err(format!(
-            "volume {} config storage={} — migrate-cow runs while the volume is still open as legacy",
-            vol.name, vol.storage
-        ));
-    }
     require_quiesced(state, &vol.name, &vol.iqn, false)?;
     let handle = find_volume_store(&state.volume_stores, &vol)?;
+    if handle.store.inner().storage_mode() != StorageMode::Legacy {
+        return Err(format!(
+            "volume {} is already storage=cow",
+            vol.name
+        ));
+    }
     handle.store.cache().invalidate_volume(&vol.name);
-    let stats = handle
-        .store
-        .inner()
-        .migrate_to_cow()
-        .map_err(|e| e.to_string())?;
+    // Lock initiator I/O for the whole migration. Stays locked on failure so
+    // clients cannot read zeros for chunks already deleted from the legacy layout.
+    handle.store.lock_io();
+    let stats = match handle.store.inner().migrate_to_cow() {
+        Ok(s) => s,
+        Err(e) => {
+            return Err(format!(
+                "{e} (volume remains I/O-locked; re-run migrate-cow to resume, or restart the daemon to auto-resume)"
+            ));
+        }
+    };
+    handle.store.unlock_io();
     {
         let mut snap = state.snapshot.lock();
         if let Some(v) = snap.volumes.iter_mut().find(|v| v.name == vol.name) {
@@ -881,6 +927,7 @@ fn volume_migrate_cow(
         "volume": vol.name,
         "migrate": stats,
         "storage": "cow",
+        "io_locked": false,
     }))
 }
 
@@ -1611,8 +1658,9 @@ mod tests {
         dst.write_at(4096, &[9u8; 4096]).unwrap();
         dst.write_at(8192, &[8u8; 4096]).unwrap();
 
-        let result = copy_volume(&src, &dst).unwrap();
+        let result = copy_volume(&src, &dst, None).unwrap();
         assert_eq!(result.chunks_copied, 2);
+        assert_eq!(result.chunks_skipped, 0);
         assert_eq!(result.chunks_deleted, 1); // dest-only chunk1
 
         let mut buf = [0u8; 1];
@@ -1626,11 +1674,38 @@ mod tests {
     }
 
     #[test]
+    fn copy_volume_resume_from_skips_lower_indices() {
+        use crate::store::MemoryStore;
+
+        let src = MemoryStore::new(16 * 1024, 512, 4 * 1024).unwrap();
+        let dst = MemoryStore::new(16 * 1024, 512, 4 * 1024).unwrap();
+
+        src.write_at(0, &[1u8; 4096]).unwrap();
+        src.write_at(8192, &[2u8; 4096]).unwrap();
+        // Simulate a prior partial copy: chunk 0 already on dest; stale dest-only at 1.
+        dst.write_at(0, &[1u8; 4096]).unwrap();
+        dst.write_at(4096, &[9u8; 4096]).unwrap();
+
+        let result = copy_volume(&src, &dst, Some(2)).unwrap();
+        assert_eq!(result.chunks_skipped, 1); // source chunk 0
+        assert_eq!(result.chunks_copied, 1); // source chunk 2
+        assert_eq!(result.chunks_deleted, 1); // dest-only chunk 1
+
+        let mut buf = [0u8; 1];
+        dst.read_at(0, &mut buf).unwrap();
+        assert_eq!(buf[0], 1);
+        dst.read_at(4096, &mut buf).unwrap();
+        assert_eq!(buf[0], 0);
+        dst.read_at(8192, &mut buf).unwrap();
+        assert_eq!(buf[0], 2);
+    }
+
+    #[test]
     fn copy_volume_rejects_capacity_mismatch() {
         use crate::store::MemoryStore;
         let src = MemoryStore::new(8192, 512, 4096).unwrap();
         let dst = MemoryStore::new(16384, 512, 4096).unwrap();
-        let err = copy_volume(&src, &dst).unwrap_err();
+        let err = copy_volume(&src, &dst, None).unwrap_err();
         assert!(err.contains("capacity mismatch"));
     }
 

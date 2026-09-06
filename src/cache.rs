@@ -4,6 +4,7 @@ use crate::metrics::{Metrics, VolumeLabels};
 use crate::store::{check_range, BlockStore, StoreError};
 use parking_lot::Mutex;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 struct CacheEntry {
@@ -206,6 +207,8 @@ pub struct CachedStore<S: BlockStore> {
     cache: Arc<ChunkCache>,
     labels: VolumeLabels,
     metrics: Arc<Metrics>,
+    /// When set, SCSI / BlockStore I/O is refused (e.g. during COW migration).
+    io_locked: AtomicBool,
 }
 
 impl<S: BlockStore> CachedStore<S> {
@@ -220,6 +223,7 @@ impl<S: BlockStore> CachedStore<S> {
             cache,
             labels,
             metrics,
+            io_locked: AtomicBool::new(false),
         }
     }
 
@@ -235,7 +239,32 @@ impl<S: BlockStore> CachedStore<S> {
         &self.labels.volume
     }
 
+    pub fn is_io_locked(&self) -> bool {
+        self.io_locked.load(Ordering::SeqCst)
+    }
+
+    /// Block initiator-facing I/O (and admin paths that use BlockStore).
+    pub fn lock_io(&self) {
+        self.io_locked.store(true, Ordering::SeqCst);
+        self.cache.invalidate_volume(&self.labels.volume);
+    }
+
+    pub fn unlock_io(&self) {
+        self.io_locked.store(false, Ordering::SeqCst);
+    }
+
+    fn ensure_unlocked(&self) -> Result<(), StoreError> {
+        if self.is_io_locked() {
+            return Err(StoreError::Other(format!(
+                "volume {} is locked (migration in progress); wait for migrate-cow to finish",
+                self.labels.volume
+            )));
+        }
+        Ok(())
+    }
+
     fn load_chunk(&self, chunk_idx: u64) -> Result<Vec<u8>, StoreError> {
+        self.ensure_unlocked()?;
         if let Some(data) = self.cache.get(&self.labels.volume, chunk_idx) {
             self.metrics.observe_cache(&self.labels, true);
             return Ok(data);
@@ -263,6 +292,7 @@ impl<S: BlockStore> CachedStore<S> {
 
 impl<S: BlockStore> BlockStore for CachedStore<S> {
     fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<(), StoreError> {
+        self.ensure_unlocked()?;
         check_range(self.inner.capacity(), offset, buf.len())?;
         let chunk_size = self.inner.chunk_size();
         let mut done = 0usize;
@@ -279,6 +309,7 @@ impl<S: BlockStore> BlockStore for CachedStore<S> {
     }
 
     fn write_at(&self, offset: u64, data: &[u8]) -> Result<(), StoreError> {
+        self.ensure_unlocked()?;
         self.inner.write_at(offset, data)?;
         let chunk_size = self.inner.chunk_size();
         let mut done = 0usize;
@@ -304,10 +335,12 @@ impl<S: BlockStore> BlockStore for CachedStore<S> {
     }
 
     fn set_capacity(&self, new_capacity: u64) -> Result<(), StoreError> {
+        self.ensure_unlocked()?;
         self.inner.set_capacity(new_capacity)
     }
 
     fn flush(&self) -> Result<(), StoreError> {
+        self.ensure_unlocked()?;
         self.inner.flush()
     }
 
@@ -320,10 +353,12 @@ impl<S: BlockStore> BlockStore for CachedStore<S> {
     }
 
     fn present_chunks(&self) -> Result<Vec<u64>, StoreError> {
+        self.ensure_unlocked()?;
         self.inner.present_chunks()
     }
 
     fn delete_chunk(&self, index: u64) -> Result<(), StoreError> {
+        self.ensure_unlocked()?;
         self.inner.delete_chunk(index)?;
         self.cache.invalidate(&self.labels.volume, index);
         Ok(())
@@ -371,5 +406,25 @@ mod tests {
         assert!(cache.is_enabled());
         assert_eq!(cache.max_bytes(), 1024 * 1024);
         assert_eq!(cache.stats(), (0, 0));
+    }
+
+    #[test]
+    fn io_lock_blocks_reads_and_writes() {
+        let mem = MemoryStore::new(8192, 512, 4096).unwrap();
+        mem.write_at(0, &[7u8; 100]).unwrap();
+        let cache = ChunkCache::new(1024 * 1024);
+        let metrics = Metrics::new().unwrap();
+        let labels = VolumeLabels::new("v0", "iqn.test:v0");
+        let cached = CachedStore::new(mem, cache, labels, metrics);
+        cached.lock_io();
+        assert!(cached.is_io_locked());
+        let mut buf = [0u8; 100];
+        let err = cached.read_at(0, &mut buf).unwrap_err();
+        assert!(err.to_string().contains("locked"));
+        let err = cached.write_at(0, &[1u8; 10]).unwrap_err();
+        assert!(err.to_string().contains("locked"));
+        cached.unlock_io();
+        cached.read_at(0, &mut buf).unwrap();
+        assert_eq!(buf[0], 7);
     }
 }

@@ -43,6 +43,7 @@ services:
     volumes:
       #- ./config.docker.toml:/etc/iscsi-s3/config.toml:ro
       - ./config.integration.toml:/etc/iscsi-s3/config.toml:ro
+      - /Volumes/Music/Misc/S3:/ext-hd
     environment:
       AWS_ACCESS_KEY_ID: minioadmin
       AWS_SECRET_ACCESS_KEY: minioadmin

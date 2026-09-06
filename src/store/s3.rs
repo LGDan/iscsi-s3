@@ -252,6 +252,16 @@ impl S3ChunkStore {
         *store.storage.lock() = mode;
         let effective = store.resolve_meta(cfg.capacity, existing)?;
         store.capacity.store(effective, Ordering::SeqCst);
+
+        // Incomplete migrate (inplace after crash / space failure): finish before serving.
+        if store.storage_mode() == StorageMode::Legacy && store.has_migration_marker()? {
+            tracing::warn!(
+                prefix = %store.prefix,
+                "resuming incomplete legacy→cow migration before volume is online"
+            );
+            store.migrate_to_cow()?;
+        }
+
         Ok(store)
     }
 
@@ -346,6 +356,14 @@ impl S3ChunkStore {
 
     fn snapshot_chunks_key(&self, id: &str) -> String {
         format!("{}/chunks.bin", self.snapshot_prefix(id))
+    }
+
+    fn migrating_key(&self) -> String {
+        format!("{}/live/migrating.json", self.prefix)
+    }
+
+    pub fn has_migration_marker(&self) -> Result<bool, StoreError> {
+        Ok(self.get_bytes(self.migrating_key())?.is_some())
     }
 
     fn stripe(&self, chunk_idx: u64) -> &Mutex<()> {
@@ -922,12 +940,28 @@ impl S3ChunkStore {
     }
 
     /// Migrate a live legacy volume to COW layout (objects + pointers + live/meta).
+    ///
+    /// Deletes each legacy flat chunk immediately after its object+pointer are
+    /// written so peak S3 usage stays near 1× (not 2×). Safe to re-run: remaining
+    /// flat chunks are migrated; already-migrated flats are simply absent from
+    /// the list. Writes `live/migrating.json` until commit so a restart can resume.
     pub fn migrate_to_cow(&self) -> Result<MigrateStats, StoreError> {
         if self.storage_mode() != StorageMode::Legacy {
+            // Already committed; drop a stale marker if present.
+            let _ = self.delete_object_key(self.migrating_key());
             return Err(StoreError::Other(
                 "volume is already storage=cow".into(),
             ));
         }
+
+        let marker = br#"{"state":"migrating"}"#.to_vec();
+        self.put_bytes(
+            self.migrating_key(),
+            marker,
+            Some("application/json"),
+            None,
+        )?;
+
         let indices = list_chunk_indices(
             self.client.clone(),
             self.runtime.clone(),
@@ -935,16 +969,20 @@ impl S3ChunkStore {
             &format!("{}/chunks/", self.prefix),
         )?;
         let mut chunks_migrated = 0u64;
+        let mut chunks_deleted = 0u64;
         for idx in &indices {
             let key = format!("{}/chunks/{:016x}", self.prefix, idx);
             let Some((body, _)) = self.get_bytes(key.clone())? else {
                 continue;
             };
             let hash = hash_object_bytes(&body);
+            // Object then pointer, then free the legacy blob (space-neutral step).
             self.put_bytes(self.object_key(&hash), body, None, None)?;
             let ptr_key = format!("{}/live/chunks/{:016x}", self.prefix, idx);
             self.put_bytes(ptr_key, encode_pointer(&hash), None, None)?;
+            self.delete_object_key(key)?;
             chunks_migrated += 1;
+            chunks_deleted += 1;
         }
 
         let meta = VolumeMeta {
@@ -955,22 +993,20 @@ impl S3ChunkStore {
             compression: self.compression,
             storage: StorageMode::Cow,
         };
-        // Write live meta, flip mode, then remove flat layout.
         let live_key = self.live_meta_key();
         let body =
             serde_json::to_vec_pretty(&meta).map_err(|e| StoreError::Meta(e.to_string()))?;
         self.put_bytes(live_key, body, Some("application/json"), None)?;
         *self.storage.lock() = StorageMode::Cow;
 
-        for idx in &indices {
-            let key = format!("{}/chunks/{:016x}", self.prefix, idx);
-            let _ = self.delete_object_key(key);
-        }
         let _ = self.delete_object_key(self.flat_meta_key());
+        let _ = self.delete_object_key(self.migrating_key());
 
         Ok(MigrateStats {
             chunks_migrated,
-            note: "set volumes[].storage = \"cow\" before next restart".into(),
+            chunks_deleted,
+            note: "set volumes[].storage = \"cow\" before next restart; legacy chunks were deleted as they migrated"
+                .into(),
         })
     }
 
@@ -1089,6 +1125,8 @@ pub struct CloneStats {
 #[derive(Debug, Clone, Serialize)]
 pub struct MigrateStats {
     pub chunks_migrated: u64,
+    /// Legacy flat chunk objects deleted after each successful migrate step.
+    pub chunks_deleted: u64,
     pub note: String,
 }
 
