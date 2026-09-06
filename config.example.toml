@@ -7,6 +7,11 @@ bind = "0.0.0.0:3260"
 # binds only `bind`). Discovery returns all of them for each IQN.
 # portals = ["10.0.0.1:3260", "10.0.0.2:3260"]
 # instance = "path-a"   # optional label for logs
+#
+# Single-process dual-NIC (keep cache): bind all interfaces and advertise both IPs
+# — see config.mpio-single.toml and docs/users/mpio.md Setup A.
+# bind = "0.0.0.0:3260"
+# portals = ["10.0.0.1:3260", "10.0.0.2:3260"]
 
 # Optional CHAP (omit = AuthMethod=None). Prefer env for secrets in production:
 #   ISCSI_S3_AUTH__USERNAME / ISCSI_S3_AUTH__SECRET

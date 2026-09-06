@@ -1,0 +1,33 @@
+# Single-process dual-portal MPIO (network path resilience + chunk cache).
+#
+# One daemon listens on all interfaces; SendTargets advertises both NIC IPs.
+# Both initiator sessions hit the same process → cache is safe.
+# Trade-off: no rolling upgrade (one process = one maintenance window).
+#
+# See docs/users/mpio.md § "Single-process dual-NIC".
+
+bind = "0.0.0.0:3260"
+portals = ["10.0.0.1:3260", "10.0.0.2:3260"]
+# instance = "single"   # optional
+
+[s3]
+bucket = "iscsi"
+region = "us-east-1"
+endpoint = "http://127.0.0.1:9000"
+force_path_style = true
+# access_key_id = "minioadmin"
+# secret_access_key = "minioadmin"
+
+[cache]
+# Keep acceleration — both paths share this process's LRU.
+max_bytes = "256MiB"
+
+[metrics]
+enabled = true
+bind = "0.0.0.0:9090"
+
+[[volumes]]
+name = "disk0"
+iqn = "iqn.2026-09.local.iscsi-s3:disk0"
+prefix = "disks/disk0"
+capacity = "100GiB"

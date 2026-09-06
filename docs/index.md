@@ -16,7 +16,8 @@ Userspace iSCSI target that presents virtual disks backed by S3 (or MinIO / othe
 | Doc | Contents |
 |-----|----------|
 | [Getting started](developers/getting-started.md) | Clone, build, project layout, vendored `iscsi-target` |
-| [Architecture](developers/architecture.md) | Ports, portals/MPIO, chunks, cache, login/advertise |
+| [Architecture](developers/architecture.md) | Ports, portals/MPIO, chunks, login/advertise |
+| [Chunk cache](developers/cache.md) | Write-through LRU, coherence, multi-instance risks |
 | [Testing](developers/testing.md) | Unit tests, MinIO integration, smoke script |
 
 ## Examples
@@ -32,6 +33,7 @@ These live in the repository root (not rendered here):
 - `config.example.toml` — local MinIO-oriented sample
 - `config.docker.toml` — small Compose demo volumes
 - `config.integration.toml` — larger single-volume lab config
+- `config.mpio-single.toml` — single-process dual-portal MPIO (cache OK)
 - `config.mpio-a.toml` / `config.mpio-b.toml` — dual-instance MPIO lab
 - `docker-compose.yml` — MinIO + iscsi-s3
 - `docker-compose.mpio.yml` — MinIO + two iscsi-s3 paths

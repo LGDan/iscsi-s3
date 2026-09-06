@@ -527,17 +527,42 @@ If the peer EOFs before FullFeature, compare login response flags/ISID (see vend
 
 ---
 
-## 13. Dual-path MPIO (two daemons, shared S3)
+## 13. Dual-path MPIO
 
-**Goal:** Resilience / rolling upgrades via Path-A multipath (not MCS).
+Two shapes — pick based on whether you need rolling upgrades or want to keep the chunk cache. Full detail: **[MPIO setup](users/mpio.md)**.
 
-Use the lab stack:
+### 13a. Single process, dual NIC (keep the cache)
+
+**Goal:** Network path resilience with warm cache. One maintenance window for upgrades.
+
+```toml
+bind = "0.0.0.0:3260"
+portals = ["10.0.0.1:3260", "10.0.0.2:3260"]
+
+[cache]
+max_bytes = "256MiB"
+
+[s3]
+bucket = "iscsi"
+region = "us-east-1"
+# ...
+
+[[volumes]]
+name = "disk0"
+iqn = "iqn.2026-09.local.iscsi-s3:disk0"
+prefix = "disks/disk0"
+capacity = "100GiB"
+```
+
+Repo template: `config.mpio-single.toml`. Run on the host (or `network_mode: host`) so both NIC IPs are real. Login both portals, then dm-multipath.
+
+### 13b. Two daemons, shared S3 (rolling upgrades; cache off)
 
 ```bash
 docker compose -f docker-compose.mpio.yml up -d --build
 ```
 
-Or dual-NIC on bare metal (same volume IQN/prefix on both; cache off):
+Or dual-NIC bare metal (same volume IQN/prefix on both; cache off):
 
 ```toml
 # instance A — bind this NIC
@@ -568,7 +593,7 @@ max_bytes = 0
 # identical to A
 ```
 
-Login both portals, then configure dm-multipath. Full walkthrough: **[MPIO setup](users/mpio.md)**.
+Login both portals, then configure dm-multipath.
 
 ---
 

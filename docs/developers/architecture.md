@@ -33,7 +33,7 @@ Earlier builds used one TCP port per volume to work around digest bugs in the mu
 - `advertise` — single `TargetAddress` when `portals` is empty. Required when `local_addr` is not client-reachable (Docker publish, NAT).
 - `portals` — full list of client-reachable portals for SendTargets. Use the **same** list on every iscsi-s3 instance that fronts the same volumes so discovery teaches the initiator every path.
 
-**Path A (host multipath):** run one daemon per NIC/path; identical `[[volumes]]` and S3 prefix; SCSI serial/NAA derived from IQN so dm-multipath merges paths; chunk writes use S3 `If-Match` CAS for concurrent RMW. Set `cache.max_bytes = 0` (per-process LRU cannot see peer writes). This is **not** MCS (`MaxConnections > 1`).
+**Path A (host multipath):** either (1) one daemon on `0.0.0.0` advertising two NIC portals (cache OK; no rolling upgrade), or (2) one daemon per path with shared S3 and `cache.max_bytes = 0` (rolling upgrades). SCSI serial/NAA derived from IQN so dm-multipath merges paths; chunk RMW uses S3 `If-Match` CAS. This is **not** MCS (`MaxConnections > 1`).
 
 Operator guide: [MPIO setup](../users/mpio.md).
 
@@ -59,7 +59,9 @@ Header/data digests use CRC32C in little-endian wire order for open-iscsi/tgt in
 
 ## Cache
 
-Process-wide LRU of whole chunks (`cache.max_bytes`). Shared across volumes. Improves repeated reads; first touch after restart still hits S3.
+See **[Chunk cache: behavior and safety](cache.md)** for the full model (write-through, LRU, multi-instance risks).
+
+Short version: process-wide whole-chunk LRU (`cache.max_bytes`), shared across volumes. Writes hit S3 first, then patch or invalidate the local entry. **Safe for a single daemon** (including dual-portal / dual-NIC on one process). **Unsafe across multi-instance peers** — use `cache.max_bytes = 0` when multiple processes share a volume prefix.
 
 ## Security model (current)
 

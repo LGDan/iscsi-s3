@@ -14,7 +14,8 @@
 | Doc | Contents |
 |-----|----------|
 | [Getting started](developers/getting-started.md) | Clone, build, project layout, vendored `iscsi-target` |
-| [Architecture](developers/architecture.md) | Ports, portals/MPIO, chunks, cache, login/advertise |
+| [Architecture](developers/architecture.md) | Ports, portals/MPIO, chunks, login/advertise |
+| [Chunk cache](developers/cache.md) | Write-through LRU, coherence, multi-instance risks |
 | [Testing](developers/testing.md) | Unit tests, MinIO integration, smoke script |
 
 ## Examples
@@ -40,6 +41,7 @@ Uses a temporary `squidfunk/mkdocs-material` container (no local Python required
 | [config.example.toml](../config.example.toml) | Local MinIO-oriented sample |
 | [config.docker.toml](../config.docker.toml) | Small Compose demo volumes |
 | [config.integration.toml](../config.integration.toml) | Larger single-volume lab config |
+| [config.mpio-single.toml](../config.mpio-single.toml) | Single-process dual-portal MPIO (cache OK) |
 | [config.mpio-a.toml](../config.mpio-a.toml) / [config.mpio-b.toml](../config.mpio-b.toml) | Dual-instance MPIO lab |
 | [docker-compose.yml](../docker-compose.yml) | MinIO + iscsi-s3 |
 | [docker-compose.mpio.yml](../docker-compose.mpio.yml) | MinIO + two iscsi-s3 paths |

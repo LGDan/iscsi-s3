@@ -116,7 +116,7 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         warn!(
             cache_max_bytes = cfg.cache.max_bytes,
             portals = portals.len(),
-            "multi-portal / multi-instance: per-process chunk cache can serve stale data after a peer write; set cache.max_bytes = 0 for correct failover"
+            "multiple portals advertised with chunk cache enabled: safe for a single process (dual-NIC); if another iscsi-s3 instance serves the same volume prefix, set cache.max_bytes = 0 on every peer"
         );
     }
 

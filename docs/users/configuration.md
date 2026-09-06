@@ -53,7 +53,7 @@ capacity = "10GiB"
 | `s3.endpoint` | Optional custom endpoint (MinIO, Ceph RGW, …). Omit for AWS. |
 | `s3.force_path_style` | Path-style URLs (`http://endpoint/bucket/key`). Usually `true` for MinIO. |
 | `s3.access_key_id` / `secret_access_key` | Optional static keys; otherwise AWS default credential chain / `AWS_*`. |
-| `cache.max_bytes` | Shared in-process LRU for whole chunks. Use `0` for multi-instance MPIO (no cross-process invalidation). |
+| `cache.max_bytes` | Shared in-process LRU for whole chunks. Safe with one process (including dual-portal). Use `0` when multiple daemons share a volume. Details: [cache safety](../developers/cache.md), [MPIO Setup A](mpio.md#setup-a--single-process-dual-nic-keep-the-cache). |
 | `volumes[].name` | Short label (logs, INQUIRY product id). |
 | `volumes[].iqn` | iSCSI target name (unique). |
 | `volumes[].prefix` | S3 key prefix (unique). |
@@ -106,7 +106,7 @@ MPIO peers must use the **same** auth settings on every instance.
 
 All volumes on one process share one listen address (`bind`). Discovery against that portal returns every IQN; each IQN lists `portals` (or a single `advertise`) as `TargetAddress` values.
 
-For dual-path MPIO, run two processes (often on two NICs or two published ports), identical volumes/S3 prefixes, identical `portals`, and `cache.max_bytes = 0`. See **[MPIO setup](mpio.md)** and `docker-compose.mpio.yml`.
+For dual-path MPIO see **[MPIO setup](mpio.md)** (single-process + cache, or multi-instance + rolling upgrades) and `docker-compose.mpio.yml` / `config.mpio-single.toml`.
 
 Docker must publish each process’s portal port (default `3260`).
 

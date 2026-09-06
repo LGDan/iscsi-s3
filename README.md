@@ -43,6 +43,7 @@ Set `advertise` in the mounted config to an address clients can reach (for Docke
 | [User tutorials](docs/users/tutorials.md) | Mount disks, grow volumes, remote access, iSCSI boot |
 | [Developer getting started](docs/developers/getting-started.md) | Build, layout, vendored crate |
 | [Architecture](docs/developers/architecture.md) | How chunks, ports, and sessions work |
+| [Chunk cache](docs/developers/cache.md) | Write-through LRU and multi-instance safety |
 | [Testing](docs/developers/testing.md) | Unit, integration, and smoke tests |
 | [Examples](docs/examples.md) | Use cases with config + Compose YAML |
 

@@ -170,9 +170,9 @@ You should see `meta.json` and `chunks/…` after writes.
 
 ## Tutorial 7 — Dual-path MPIO (multi-instance)
 
-Full procedures (lab Compose, dual-NIC, rolling upgrade, checklist) live in **[MPIO setup](mpio.md)**.
+Full procedures live in **[MPIO setup](mpio.md)** — including **Setup A** (one process, dual NIC, **keep the cache**) vs multi-instance (rolling upgrades, cache off).
 
-Quick lab start:
+Quick multi-instance lab start:
 
 ```bash
 docker compose -f docker-compose.mpio.yml up -d --build

@@ -1,4 +1,6 @@
 # Dual-instance Path-A MPIO lab (two portals, shared S3, rolling restart).
+# Cache is off. For dual-NIC + warm cache in one process, see config.mpio-single.toml
+# and docs/users/mpio.md Setup A instead.
 #
 #   docker compose -f docker-compose.mpio.yml up -d --build
 #
