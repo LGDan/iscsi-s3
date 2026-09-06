@@ -38,7 +38,8 @@ services:
         condition: service_completed_successfully
     ports:
       - "3260:3260"
-      - "9090:9090"
+      # Host 9091 avoids clashing with Prometheus on 9090
+      - "9091:9090"
     volumes:
       #- ./config.docker.toml:/etc/iscsi-s3/config.toml:ro
       - ./config.integration.toml:/etc/iscsi-s3/config.toml:ro
@@ -46,6 +47,38 @@ services:
       AWS_ACCESS_KEY_ID: minioadmin
       AWS_SECRET_ACCESS_KEY: minioadmin
       RUST_LOG: info,iscsi_s3=debug,iscsi_target=debug
+    restart: unless-stopped
+
+  prometheus:
+    image: prom/prometheus:v2.55.1
+    depends_on:
+      - iscsi-s3
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./deploy/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --web.enable-lifecycle
+    restart: unless-stopped
+
+  grafana:
+    image: grafana/grafana:11.3.1
+    depends_on:
+      - prometheus
+    ports:
+      - "3000:3000"
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: admin
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
+    volumes:
+      - ./deploy/grafana/provisioning:/etc/grafana/provisioning:ro
+      - grafana-data:/var/lib/grafana
     restart: unless-stopped
 
   # One-shot smoke against the shared portal (default IQN on :3260)
@@ -61,3 +94,5 @@ services:
 
 volumes:
   minio-data:
+  prometheus-data:
+  grafana-data:
