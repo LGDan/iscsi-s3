@@ -4,7 +4,9 @@
 use aws_config::BehaviorVersion;
 use aws_sdk_s3::config::{Credentials, Region};
 use aws_sdk_s3::Client;
+use iscsi_s3::metrics::{Metrics, VolumeLabels};
 use iscsi_s3::store::{plan_capacity, BlockStore, S3ChunkStore, S3StoreConfig, StoreError, VolumeMeta};
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 fn endpoint() -> String {
@@ -55,6 +57,9 @@ fn s3_chunk_round_trip_and_grow() {
     let client = rt.block_on(make_client());
     let prefix = unique_prefix();
 
+    let metrics = Metrics::new().unwrap();
+    let labels = VolumeLabels::new("itest", "iqn.test:itest");
+
     let store = S3ChunkStore::open(
         client.clone(),
         handle.clone(),
@@ -64,6 +69,8 @@ fn s3_chunk_round_trip_and_grow() {
             capacity: 2 * 1024 * 1024,
             block_size: 512,
             chunk_size: 1024 * 1024,
+            labels: labels.clone(),
+            metrics: Arc::clone(&metrics),
         },
     )
     .expect("open");
@@ -89,6 +96,8 @@ fn s3_chunk_round_trip_and_grow() {
             capacity: 4 * 1024 * 1024,
             block_size: 512,
             chunk_size: 1024 * 1024,
+            labels,
+            metrics,
         },
     )
     .expect("reopen");

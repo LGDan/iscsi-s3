@@ -1,5 +1,6 @@
 //! Whole-chunk LRU cache in front of a BlockStore.
 
+use crate::metrics::{Metrics, VolumeLabels};
 use crate::store::{check_range, BlockStore, StoreError};
 use parking_lot::Mutex;
 use std::collections::HashMap;
@@ -41,17 +42,25 @@ impl ChunkCache {
         })
     }
 
+    pub fn stats(&self) -> (u64, usize) {
+        let inner = self.inner.lock();
+        (inner.used_bytes, inner.entries.len())
+    }
+
     fn get(&self, volume: &str, chunk_idx: u64) -> Option<Vec<u8>> {
         let mut inner = self.inner.lock();
         inner.tick += 1;
         let tick = inner.tick;
-        inner.entries.get_mut(&CacheKey {
-            volume: volume.to_string(),
-            chunk_idx,
-        }).map(|e| {
-            e.tick = tick;
-            e.data.clone()
-        })
+        inner
+            .entries
+            .get_mut(&CacheKey {
+                volume: volume.to_string(),
+                chunk_idx,
+            })
+            .map(|e| {
+                e.tick = tick;
+                e.data.clone()
+            })
     }
 
     fn put(&self, volume: &str, chunk_idx: u64, data: Vec<u8>) {
@@ -109,22 +118,31 @@ impl ChunkCache {
 pub struct CachedStore<S: BlockStore> {
     inner: S,
     cache: Arc<ChunkCache>,
-    volume_id: String,
+    labels: VolumeLabels,
+    metrics: Arc<Metrics>,
 }
 
 impl<S: BlockStore> CachedStore<S> {
-    pub fn new(inner: S, cache: Arc<ChunkCache>, volume_id: impl Into<String>) -> Self {
+    pub fn new(
+        inner: S,
+        cache: Arc<ChunkCache>,
+        labels: VolumeLabels,
+        metrics: Arc<Metrics>,
+    ) -> Self {
         Self {
             inner,
             cache,
-            volume_id: volume_id.into(),
+            labels,
+            metrics,
         }
     }
 
     fn load_chunk(&self, chunk_idx: u64) -> Result<Vec<u8>, StoreError> {
-        if let Some(data) = self.cache.get(&self.volume_id, chunk_idx) {
+        if let Some(data) = self.cache.get(&self.labels.volume, chunk_idx) {
+            self.metrics.observe_cache(&self.labels, true);
             return Ok(data);
         }
+        self.metrics.observe_cache(&self.labels, false);
         let chunk_size = self.inner.chunk_size();
         let offset = chunk_idx * chunk_size;
         let mut buf = vec![0u8; chunk_size as usize];
@@ -140,7 +158,7 @@ impl<S: BlockStore> CachedStore<S> {
         let valid = ((capacity - offset) as usize).min(buf.len());
         self.inner.read_at(offset, &mut buf[..valid])?;
         self.cache
-            .put(&self.volume_id, chunk_idx, buf.clone());
+            .put(&self.labels.volume, chunk_idx, buf.clone());
         Ok(buf)
     }
 }
@@ -172,11 +190,11 @@ impl<S: BlockStore> BlockStore for CachedStore<S> {
             let within = (abs % chunk_size) as usize;
             let take = ((chunk_size as usize) - within).min(data.len() - done);
             // Update or invalidate cache entry
-            if let Some(mut cached) = self.cache.get(&self.volume_id, chunk_idx) {
+            if let Some(mut cached) = self.cache.get(&self.labels.volume, chunk_idx) {
                 cached[within..within + take].copy_from_slice(&data[done..done + take]);
-                self.cache.put(&self.volume_id, chunk_idx, cached);
+                self.cache.put(&self.labels.volume, chunk_idx, cached);
             } else {
-                self.cache.invalidate(&self.volume_id, chunk_idx);
+                self.cache.invalidate(&self.labels.volume, chunk_idx);
             }
             done += take;
         }
@@ -214,7 +232,9 @@ mod tests {
         let mem = MemoryStore::new(8192, 512, 4096).unwrap();
         mem.write_at(0, &[7u8; 100]).unwrap();
         let cache = ChunkCache::new(1024 * 1024);
-        let cached = CachedStore::new(mem, cache, "v0");
+        let metrics = Metrics::new().unwrap();
+        let labels = VolumeLabels::new("v0", "iqn.test:v0");
+        let cached = CachedStore::new(mem, cache, labels, metrics);
         let mut a = [0u8; 100];
         cached.read_at(0, &mut a).unwrap();
         let mut b = [0u8; 100];

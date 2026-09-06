@@ -35,6 +35,8 @@ pub struct Config {
     #[serde(default)]
     pub cache: CacheConfig,
     #[serde(default)]
+    pub metrics: MetricsConfig,
+    #[serde(default)]
     pub volumes: Vec<VolumeConfig>,
 }
 
@@ -75,6 +77,33 @@ impl Default for CacheConfig {
 
 fn default_cache_max() -> u64 {
     DEFAULT_CACHE_MAX
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MetricsConfig {
+    /// Serve Prometheus text on `bind` when true.
+    #[serde(default = "default_metrics_enabled")]
+    pub enabled: bool,
+    /// HTTP listen address for `/metrics` (and `/healthz`).
+    #[serde(default = "default_metrics_bind")]
+    pub bind: String,
+}
+
+impl Default for MetricsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_metrics_enabled(),
+            bind: default_metrics_bind(),
+        }
+    }
+}
+
+fn default_metrics_enabled() -> bool {
+    true
+}
+
+fn default_metrics_bind() -> String {
+    "0.0.0.0:9090".to_string()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -134,6 +163,14 @@ pub struct Cli {
     #[arg(long, default_value = "info")]
     #[serde(skip)]
     pub log: String,
+
+    /// Prometheus metrics listen address (overrides config when set)
+    #[arg(long)]
+    pub metrics_bind: Option<String>,
+
+    /// Disable the Prometheus metrics HTTP endpoint
+    #[arg(long)]
+    pub no_metrics: bool,
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
@@ -144,6 +181,8 @@ struct CliOverrides {
     advertise: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     s3: Option<CliS3Overrides>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    metrics: Option<CliMetricsOverrides>,
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
@@ -156,6 +195,14 @@ struct CliS3Overrides {
     region: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     force_path_style: Option<bool>,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+struct CliMetricsOverrides {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    enabled: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    bind: Option<String>,
 }
 
 impl Config {
@@ -172,6 +219,7 @@ impl Config {
                 secret_access_key: None,
             },
             cache: CacheConfig::default(),
+            metrics: MetricsConfig::default(),
             volumes: Vec::new(),
         };
 
@@ -192,6 +240,10 @@ impl Config {
                 endpoint: cli.endpoint.clone(),
                 region: cli.region.clone(),
                 force_path_style: cli.force_path_style,
+            }),
+            metrics: Some(CliMetricsOverrides {
+                enabled: if cli.no_metrics { Some(false) } else { None },
+                bind: cli.metrics_bind.clone(),
             }),
         };
         figment = figment.merge(Serialized::defaults(overrides));
@@ -323,6 +375,8 @@ capacity = "1GiB"
             region: None,
             force_path_style: None,
             log: "info".into(),
+            metrics_bind: None,
+            no_metrics: false,
         };
         let cfg = Config::load(&cli).unwrap();
         assert_eq!(cfg.s3.bucket.as_deref(), Some("from-env"));

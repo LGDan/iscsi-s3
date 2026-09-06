@@ -3,5 +3,6 @@
 pub mod cache;
 pub mod config;
 pub mod device;
+pub mod metrics;
 pub mod store;
 pub mod volume;

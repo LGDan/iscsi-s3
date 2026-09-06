@@ -1237,6 +1237,12 @@ struct TargetInfo {
     allowed_initiators: Option<Vec<String>>,
 }
 
+/// Callbacks for FullFeature session lifecycle (used for metrics).
+pub trait SessionEventSink: Send + Sync {
+    fn on_session_start(&self, target_iqn: &str);
+    fn on_session_end(&self, target_iqn: &str);
+}
+
 /// Multi-target iSCSI server
 ///
 /// Serves multiple targets on a single port with IQN-based routing
@@ -1251,6 +1257,7 @@ pub struct IscsiServer {
     active_connections: Arc<std::sync::atomic::AtomicUsize>,
     max_sessions: u32,
     active_sessions: Arc<std::sync::atomic::AtomicUsize>,
+    session_events: Option<Arc<dyn SessionEventSink>>,
 }
 
 impl IscsiServer {
@@ -1305,9 +1312,10 @@ impl IscsiServer {
                     let max_sessions = self.max_sessions;
                     let active_sessions = Arc::clone(&self.active_sessions);
                     let advertise_addr = self.advertise_addr.clone();
+                    let session_events = self.session_events.clone();
 
                     thread::spawn(move || {
-                        let session_entered = match handle_multi_target_connection(
+                        let outcome = match handle_multi_target_connection(
                             stream,
                             targets,
                             advertise_addr.as_deref(),
@@ -1315,21 +1323,34 @@ impl IscsiServer {
                             shutting_down,
                             max_sessions,
                             Arc::clone(&active_sessions),
+                            session_events.clone(),
                             addr,
                         ) {
-                            Ok(entered) => entered,
+                            Ok(outcome) => outcome,
                             Err(e) => {
                                 log::error!("Connection from {} failed: {}", addr, e);
-                                false
+                                MultiTargetOutcome {
+                                    session_entered: false,
+                                    target_iqn: None,
+                                }
                             }
                         };
 
-                        log::info!("Connection closed from {} (full_feature={})", addr, session_entered);
+                        log::info!(
+                            "Connection closed from {} (full_feature={})",
+                            addr,
+                            outcome.session_entered
+                        );
 
                         active_connections.fetch_sub(1, Ordering::SeqCst);
 
-                        if session_entered {
+                        if outcome.session_entered {
                             active_sessions.fetch_sub(1, Ordering::SeqCst);
+                            if let (Some(sink), Some(iqn)) =
+                                (session_events.as_ref(), outcome.target_iqn.as_deref())
+                            {
+                                sink.on_session_end(iqn);
+                            }
                         }
                     });
                 }
@@ -1387,6 +1408,11 @@ fn resolve_portal_address(stream: &TcpStream, advertise: Option<&str>) -> ScsiRe
     Ok(stream.local_addr().map_err(IscsiError::Io)?.to_string())
 }
 
+struct MultiTargetOutcome {
+    session_entered: bool,
+    target_iqn: Option<String>,
+}
+
 /// Handle a connection with multi-target routing
 fn handle_multi_target_connection(
     mut stream: TcpStream,
@@ -1396,8 +1422,9 @@ fn handle_multi_target_connection(
     shutting_down: Arc<AtomicBool>,
     max_sessions: u32,
     active_sessions: Arc<std::sync::atomic::AtomicUsize>,
+    session_events: Option<Arc<dyn SessionEventSink>>,
     peer: std::net::SocketAddr,
-) -> ScsiResult<bool> {
+) -> ScsiResult<MultiTargetOutcome> {
     stream.set_nonblocking(false).map_err(IscsiError::Io)?;
     stream.set_read_timeout(Some(Duration::from_secs(5))).map_err(IscsiError::Io)?;
     stream.set_write_timeout(Some(Duration::from_secs(5))).map_err(IscsiError::Io)?;
@@ -1415,13 +1442,19 @@ fn handle_multi_target_connection(
         Ok(pdu) => pdu,
         Err(e) => {
             log::error!("Failed to read first PDU from {}: {}", peer, e);
-            return Ok(false);
+            return Ok(MultiTargetOutcome {
+                session_entered: false,
+                target_iqn: None,
+            });
         }
     };
 
     if first_pdu.opcode != opcode::LOGIN_REQUEST {
         log::warn!("First PDU from {} is not login request: 0x{:02x}", peer, first_pdu.opcode);
-        return Ok(false);
+        return Ok(MultiTargetOutcome {
+            session_entered: false,
+            target_iqn: None,
+        });
     }
 
     let login_req = first_pdu.parse_login_request()?;
@@ -1434,7 +1467,11 @@ fn handle_multi_target_connection(
 
     if target_name.is_none() {
         log::info!("Discovery session from {}", peer);
-        return handle_discovery_session(stream, targets, &portal, first_pdu, peer);
+        let _ = handle_discovery_session(stream, targets, &portal, first_pdu, peer)?;
+        return Ok(MultiTargetOutcome {
+            session_entered: false,
+            target_iqn: None,
+        });
     }
 
     let target_name = target_name.unwrap();
@@ -1452,7 +1489,10 @@ fn handle_multi_target_connection(
                 0x03, // Target not found
             );
             let _ = write_pdu_digest(&mut stream, &reject_pdu, false, false);
-            return Ok(false);
+            return Ok(MultiTargetOutcome {
+                session_entered: false,
+                target_iqn: None,
+            });
         }
     };
 
@@ -1460,14 +1500,15 @@ fn handle_multi_target_connection(
     let alias = target_info.alias.clone();
     let auth_config = target_info.auth_config.clone();
     let allowed_initiators = target_info.allowed_initiators.clone();
+    let target_iqn = target_name.to_string();
     drop(targets_lock);
 
-    log::info!("Routing {} to target: {} ({})", peer, target_name, alias);
+    log::info!("Routing {} to target: {} ({})", peer, target_iqn, alias);
 
-    handle_connection_with_first_pdu_boxed(
+    let session_entered = handle_connection_with_first_pdu_boxed(
         stream,
         device,
-        target_name,
+        &target_iqn,
         &alias,
         auth_config,
         running,
@@ -1477,8 +1518,14 @@ fn handle_multi_target_connection(
         allowed_initiators,
         first_pdu,
         &portal,
+        session_events,
         peer,
-    )
+    )?;
+
+    Ok(MultiTargetOutcome {
+        session_entered,
+        target_iqn: Some(target_iqn),
+    })
 }
 
 /// Handle discovery session (SessionType=Discovery) on the shared portal.
@@ -1643,6 +1690,7 @@ fn handle_connection_with_first_pdu_boxed(
     allowed_initiators: Option<Vec<String>>,
     first_pdu: IscsiPdu,
     portal: &str,
+    session_events: Option<Arc<dyn SessionEventSink>>,
     peer: std::net::SocketAddr,
 ) -> ScsiResult<bool> {
     let mut session =
@@ -1894,6 +1942,9 @@ fn handle_connection_with_first_pdu_boxed(
             }
             session_entered = true;
             active_sessions.fetch_add(1, Ordering::SeqCst);
+            if let Some(ref sink) = session_events {
+                sink.on_session_start(target_name);
+            }
         }
 
         if session.is_ended() {
@@ -2290,6 +2341,7 @@ pub struct IscsiServerBuilder {
     targets: std::collections::HashMap<String, (Box<dyn ScsiBlockDevice + Send>, String, crate::auth::AuthConfig, Option<Vec<String>>)>,
     max_connections: Option<u32>,
     max_sessions: Option<u32>,
+    session_events: Option<Arc<dyn SessionEventSink>>,
 }
 
 impl IscsiServerBuilder {
@@ -2300,6 +2352,7 @@ impl IscsiServerBuilder {
             targets: std::collections::HashMap::new(),
             max_connections: None,
             max_sessions: None,
+            session_events: None,
         }
     }
 
@@ -2311,6 +2364,12 @@ impl IscsiServerBuilder {
     /// Host:port returned in SendTargets for every IQN on this portal.
     pub fn advertise_addr(mut self, addr: &str) -> Self {
         self.advertise_addr = Some(addr.to_string());
+        self
+    }
+
+    /// Optional sink notified when FullFeature sessions start/end (per target IQN).
+    pub fn session_events(mut self, sink: Arc<dyn SessionEventSink>) -> Self {
+        self.session_events = Some(sink);
         self
     }
 
@@ -2382,6 +2441,7 @@ impl IscsiServerBuilder {
             active_connections: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             max_sessions: self.max_sessions.unwrap_or(256),
             active_sessions: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            session_events: self.session_events,
         })
     }
 }

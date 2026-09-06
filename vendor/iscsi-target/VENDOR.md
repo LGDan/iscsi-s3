@@ -17,3 +17,5 @@ Local changes:
   does not reuse the login StatSN.
 - Shared-portal Data-Out path: do not send a new R2T on every non-final Data-Out
   (respect MaxOutstandingR2T=1); align with IscsiTarget write/R2T state machine.
+- Optional `SessionEventSink` on `IscsiServer` for FullFeature session start/end
+  (used by iscsi-s3 Prometheus metrics).

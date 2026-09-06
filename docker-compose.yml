@@ -38,6 +38,7 @@ services:
         condition: service_completed_successfully
     ports:
       - "3260:3260"
+      - "9090:9090"
     volumes:
       #- ./config.docker.toml:/etc/iscsi-s3/config.toml:ro
       - ./config.integration.toml:/etc/iscsi-s3/config.toml:ro

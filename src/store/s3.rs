@@ -1,6 +1,7 @@
 //! S3-backed chunk store with per-volume meta.json.
 
 use super::{check_range, BlockStore, StoreError};
+use crate::metrics::{Metrics, VolumeLabels};
 use aws_sdk_s3::error::SdkError;
 use aws_sdk_s3::operation::get_object::GetObjectError;
 use aws_sdk_s3::primitives::ByteStream;
@@ -10,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::runtime::Handle;
 
 const META_VERSION: u32 = 1;
@@ -30,6 +31,8 @@ pub struct S3StoreConfig {
     pub capacity: u64,
     pub block_size: u32,
     pub chunk_size: u64,
+    pub labels: VolumeLabels,
+    pub metrics: Arc<Metrics>,
 }
 
 pub struct S3ChunkStore {
@@ -41,6 +44,8 @@ pub struct S3ChunkStore {
     capacity: AtomicU64,
     runtime: Handle,
     locks: Arc<[Mutex<()>; LOCK_STRIPES]>,
+    labels: VolumeLabels,
+    metrics: Arc<Metrics>,
 }
 
 impl S3ChunkStore {
@@ -58,6 +63,8 @@ impl S3ChunkStore {
             capacity: AtomicU64::new(cfg.capacity),
             runtime,
             locks,
+            labels: cfg.labels,
+            metrics: cfg.metrics,
         };
 
         let effective = store.resolve_meta(cfg.capacity)?;
@@ -120,10 +127,11 @@ impl S3ChunkStore {
     }
 
     fn get_meta(&self) -> Result<Option<VolumeMeta>, StoreError> {
+        let started = Instant::now();
         let key = self.meta_key();
         let client = self.client.clone();
         let bucket = self.bucket.clone();
-        self.run_async(async move {
+        let result = self.run_async(async move {
             match client
                 .get_object()
                 .bucket(&bucket)
@@ -166,16 +174,20 @@ impl S3ChunkStore {
                     }
                 }
             }
-        })
+        });
+        self.metrics
+            .observe_s3(&self.labels, "get_meta", 0, started, result.is_ok());
+        result
     }
 
     fn put_meta(&self, meta: &VolumeMeta) -> Result<(), StoreError> {
+        let started = Instant::now();
         let key = self.meta_key();
         let body =
             serde_json::to_vec_pretty(meta).map_err(|e| StoreError::Meta(e.to_string()))?;
         let client = self.client.clone();
         let bucket = self.bucket.clone();
-        self.run_async(async move {
+        let result = self.run_async(async move {
             client
                 .put_object()
                 .bucket(&bucket)
@@ -186,15 +198,19 @@ impl S3ChunkStore {
                 .await
                 .map_err(|e| StoreError::S3(e.to_string()))?;
             Ok(())
-        })
+        });
+        self.metrics
+            .observe_s3(&self.labels, "put_meta", 0, started, result.is_ok());
+        result
     }
 
     fn get_chunk(&self, index: u64) -> Result<Vec<u8>, StoreError> {
+        let started = Instant::now();
         let key = self.chunk_key(index);
         let client = self.client.clone();
         let bucket = self.bucket.clone();
         let chunk_size = self.chunk_size as usize;
-        self.run_async(async move {
+        let result = self.run_async(async move {
             match client
                 .get_object()
                 .bucket(&bucket)
@@ -230,11 +246,18 @@ impl S3ChunkStore {
                     }
                 }
             }
-        })
+        });
+        let bytes = result.as_ref().map(|v| v.len() as u64).unwrap_or(0);
+        self.metrics
+            .observe_s3(&self.labels, "get", bytes, started, result.is_ok());
+        result
     }
 
     fn put_chunk(&self, index: u64, data: &[u8]) -> Result<(), StoreError> {
+        let started = Instant::now();
         if data.len() as u64 != self.chunk_size {
+            self.metrics
+                .observe_s3(&self.labels, "put", 0, started, false);
             return Err(StoreError::Other(format!(
                 "put_chunk length {} != chunk_size {}",
                 data.len(),
@@ -245,7 +268,8 @@ impl S3ChunkStore {
         let client = self.client.clone();
         let bucket = self.bucket.clone();
         let body = data.to_vec();
-        self.run_async(async move {
+        let bytes = body.len() as u64;
+        let result = self.run_async(async move {
             client
                 .put_object()
                 .bucket(&bucket)
@@ -255,7 +279,10 @@ impl S3ChunkStore {
                 .await
                 .map_err(|e| StoreError::S3(e.to_string()))?;
             Ok(())
-        })
+        });
+        self.metrics
+            .observe_s3(&self.labels, "put", bytes, started, result.is_ok());
+        result
     }
 }
 

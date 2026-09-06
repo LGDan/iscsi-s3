@@ -7,6 +7,7 @@ use clap::Parser;
 use iscsi_s3::cache::ChunkCache;
 use iscsi_s3::config::{Cli, Config};
 use iscsi_s3::device::S3BlockDevice;
+use iscsi_s3::metrics::{spawn_metrics_server, Metrics, SessionMetricsSink, VolumeLabels};
 use iscsi_s3::store::BlockStore;
 use iscsi_s3::volume::{build_s3_client, open_volume};
 use iscsi_target::IscsiServer;
@@ -91,6 +92,7 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
 
     let client = runtime.block_on(build_s3_client(&cfg))?;
     let cache = ChunkCache::new(cfg.cache.max_bytes);
+    let metrics = Metrics::new().map_err(|e| e.to_string())?;
 
     let advertise = cfg
         .advertise
@@ -103,8 +105,18 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         builder = builder.advertise_addr(addr);
     }
 
+    let mut volume_labels: Vec<VolumeLabels> = Vec::new();
+
     for (index, vol) in cfg.volumes.iter().enumerate() {
-        let opened = open_volume(&client, handle.clone(), Arc::clone(&cache), &cfg, index, vol)?;
+        let opened = open_volume(
+            &client,
+            handle.clone(),
+            Arc::clone(&cache),
+            Arc::clone(&metrics),
+            &cfg,
+            index,
+            vol,
+        )?;
         info!(
             name = %opened.name,
             iqn = %opened.iqn,
@@ -114,21 +126,41 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             "volume ready"
         );
 
-        let device = S3BlockDevice::new(opened.store, &opened.name);
-        builder = builder.add_target(
-            opened.iqn,
-            Box::new(device),
-            Some(opened.name),
-        );
+        volume_labels.push(opened.labels.clone());
+        let device = S3BlockDevice::new(opened.store, opened.labels, Arc::clone(&metrics));
+        builder = builder.add_target(opened.iqn, Box::new(device), Some(opened.name));
     }
 
-    let server = builder.build().map_err(|e| e.to_string())?;
+    builder = builder.session_events(SessionMetricsSink::new(
+        Arc::clone(&metrics),
+        volume_labels,
+    ));
+
+    let server = Arc::new(builder.build().map_err(|e| e.to_string())?);
     info!(
         bind = %cfg.bind,
         advertise = advertise.as_deref().unwrap_or("(socket local_addr)"),
         volumes = cfg.volumes.len(),
         "starting shared-portal IscsiServer (one TCP port, many IQNs)"
     );
+
+    if cfg.metrics.enabled {
+        let server_gauges = Arc::clone(&server);
+        let cache_gauges = Arc::clone(&cache);
+        spawn_metrics_server(
+            cfg.metrics.bind.clone(),
+            Arc::clone(&metrics),
+            move || {
+                (
+                    server_gauges.active_connection_count(),
+                    server_gauges.active_session_count(),
+                )
+            },
+            move || cache_gauges.stats(),
+        )?;
+    } else {
+        info!("prometheus metrics disabled");
+    }
 
     // Keep the tokio runtime alive for S3 I/O while the target runs.
     let _runtime_guard = runtime;

@@ -15,6 +15,11 @@ force_path_style = true
 [cache]
 max_bytes = "256MiB"
 
+[metrics]
+# Prometheus scrape endpoint (GET /metrics). Disable with enabled = false.
+enabled = true
+bind = "0.0.0.0:9090"
+
 [[volumes]]
 name = "disk0"
 iqn = "iqn.2026-09.local.iscsi-s3:disk0"

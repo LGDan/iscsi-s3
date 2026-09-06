@@ -59,7 +59,9 @@ pub use auth::{AuthConfig, ChapCredentials};
 pub use client::IscsiClient;
 pub use error::{IscsiError, ScsiResult};
 pub use scsi::ScsiBlockDevice;
-pub use target::{IscsiTarget, IscsiTargetBuilder, IscsiServer, IscsiServerBuilder};
+pub use target::{
+    IscsiTarget, IscsiTargetBuilder, IscsiServer, IscsiServerBuilder, SessionEventSink,
+};
 
 /// Version of this library
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

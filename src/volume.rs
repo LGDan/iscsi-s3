@@ -2,7 +2,8 @@
 
 use crate::cache::{CachedStore, ChunkCache};
 use crate::config::{Config, VolumeConfig};
-use crate::store::{S3ChunkStore, S3StoreConfig, StoreError};
+use crate::metrics::{Metrics, VolumeLabels};
+use crate::store::{BlockStore, S3ChunkStore, S3StoreConfig, StoreError};
 use aws_config::meta::region::RegionProviderChain;
 use aws_config::BehaviorVersion;
 use aws_sdk_s3::config::{Credentials, Region};
@@ -13,6 +14,7 @@ use tokio::runtime::Handle;
 pub struct OpenedVolume {
     pub name: String,
     pub iqn: String,
+    pub labels: VolumeLabels,
     pub store: Arc<CachedStore<S3ChunkStore>>,
 }
 
@@ -50,6 +52,7 @@ pub fn open_volume(
     client: &Client,
     runtime: Handle,
     cache: Arc<ChunkCache>,
+    metrics: Arc<Metrics>,
     cfg: &Config,
     _index: usize,
     vol: &VolumeConfig,
@@ -60,6 +63,8 @@ pub fn open_volume(
         .clone()
         .ok_or_else(|| StoreError::Other("s3.bucket required".into()))?;
 
+    let labels = VolumeLabels::new(vol.name.clone(), vol.iqn.clone());
+
     let store = S3ChunkStore::open(
         client.clone(),
         runtime,
@@ -69,14 +74,24 @@ pub fn open_volume(
             capacity: vol.capacity,
             block_size: vol.block_size,
             chunk_size: vol.chunk_size,
+            labels: labels.clone(),
+            metrics: Arc::clone(&metrics),
         },
     )?;
 
-    let cached = Arc::new(CachedStore::new(store, cache, vol.name.clone()));
+    let cached = Arc::new(CachedStore::new(
+        store,
+        cache,
+        labels.clone(),
+        Arc::clone(&metrics),
+    ));
+
+    metrics.set_volume_capacity(&labels, cached.capacity());
 
     Ok(OpenedVolume {
         name: vol.name.clone(),
         iqn: vol.iqn.clone(),
+        labels,
         store: cached,
     })
 }
