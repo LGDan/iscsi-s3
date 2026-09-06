@@ -1,7 +1,7 @@
 //! Control client for a running iscsi-s3 daemon (Unix admin socket).
 
 use clap::{Parser, Subcommand, ValueEnum};
-use iscsi_s3::admin::{call_admin, call_admin_write_image};
+use iscsi_s3::admin::{call_admin, call_admin_export, call_admin_write_image};
 use iscsi_s3::config::{parse_byte_size, DEFAULT_ADMIN_SOCKET};
 use serde_json::json;
 use std::fs::File;
@@ -33,6 +33,8 @@ struct CtlCli {
 enum Commands {
     /// Process / cache / session snapshot
     Stats,
+    /// Liveness + S3 reachability
+    Health,
     /// Cache subcommands
     Cache {
         #[command(subcommand)]
@@ -98,6 +100,30 @@ enum VolumeCmd {
         #[arg(long, short = 'f')]
         force: bool,
     },
+    /// Grow volume capacity (grow-only; updates meta.json)
+    Grow {
+        /// Volume name or IQN
+        volume: String,
+        /// New capacity (e.g. 20GiB or byte count)
+        #[arg(long, short)]
+        capacity: String,
+    },
+    /// List active FullFeature iSCSI sessions
+    Sessions {
+        /// Optional volume name or IQN filter
+        volume: Option<String>,
+    },
+    /// Export a raw disk image from a volume
+    Export {
+        /// Volume name or IQN
+        volume: String,
+        /// Output path for the raw image
+        #[arg(long, short)]
+        file: PathBuf,
+        /// Bytes to export (default: full capacity)
+        #[arg(long)]
+        size: Option<String>,
+    },
     /// Discover + login via open-iscsi (`iscsiadm`) on this host
     Connect {
         /// Volume name or IQN
@@ -135,6 +161,18 @@ fn main() -> ExitCode {
     } = &cli.command
     {
         return run_write_image(&cli, &sock, volume, file);
+    }
+
+    if let Commands::Volume {
+        action:
+            VolumeCmd::Export {
+                volume,
+                file,
+                size,
+            },
+    } = &cli.command
+    {
+        return run_export(&cli, &sock, volume, file, size.as_deref());
     }
 
     if let Commands::Volume {
@@ -262,6 +300,43 @@ fn run_write_image(cli: &CtlCli, sock: &PathBuf, volume: &str, file: &PathBuf) -
     }
 }
 
+fn run_export(
+    cli: &CtlCli,
+    sock: &PathBuf,
+    volume: &str,
+    file: &PathBuf,
+    size: Option<&str>,
+) -> ExitCode {
+    let size = match size {
+        Some(s) => match parse_byte_size(s) {
+            Ok(n) => Some(n),
+            Err(e) => {
+                eprintln!("error: {e}");
+                return ExitCode::from(2);
+            }
+        },
+        None => None,
+    };
+    let mut f = match File::create(file) {
+        Ok(f) => f,
+        Err(e) => {
+            eprintln!("error: create {}: {e}", file.display());
+            return ExitCode::from(2);
+        }
+    };
+    eprintln!(
+        "exporting volume {volume} to {}…",
+        file.display()
+    );
+    match call_admin_export(sock, volume, size, &mut f) {
+        Ok(resp) => finish_response(cli, &resp),
+        Err(e) => {
+            eprintln!("error: {e}");
+            ExitCode::from(1)
+        }
+    }
+}
+
 fn finish_response(cli: &CtlCli, resp: &serde_json::Value) -> ExitCode {
     let ok = resp.get("ok").and_then(|v| v.as_bool()).unwrap_or(false);
     match cli.format {
@@ -278,7 +353,12 @@ fn finish_response(cli: &CtlCli, resp: &serde_json::Value) -> ExitCode {
             }
         }
     }
-    if ok {
+    let health_degraded = matches!(cli.command, Commands::Health)
+        && resp
+            .pointer("/data/status")
+            .and_then(|v| v.as_str())
+            != Some("ok");
+    if ok && !health_degraded {
         ExitCode::SUCCESS
     } else {
         ExitCode::from(1)
@@ -288,6 +368,7 @@ fn finish_response(cli: &CtlCli, resp: &serde_json::Value) -> ExitCode {
 fn build_request(cmd: &Commands) -> Result<serde_json::Value, String> {
     Ok(match cmd {
         Commands::Stats => json!({ "op": "stats" }),
+        Commands::Health => json!({ "op": "health" }),
         Commands::Reload => json!({ "op": "reload" }),
         Commands::Cache { action } => match action {
             CacheCmd::Status => json!({ "op": "cache.status" }),
@@ -313,11 +394,25 @@ fn build_request(cmd: &Commands) -> Result<serde_json::Value, String> {
             VolumeCmd::WriteImage { .. } => {
                 unreachable!("write-image uses call_admin_write_image")
             }
+            VolumeCmd::Export { .. } => {
+                unreachable!("export uses call_admin_export")
+            }
             VolumeCmd::Copy { from, to, .. } => {
                 json!({ "op": "volume.copy", "volume": from, "to": to })
             }
             VolumeCmd::Wipe { volume, .. } => {
                 json!({ "op": "volume.wipe", "volume": volume })
+            }
+            VolumeCmd::Grow { volume, capacity } => {
+                let n = parse_byte_size(capacity)?;
+                json!({ "op": "volume.grow", "volume": volume, "capacity": n })
+            }
+            VolumeCmd::Sessions { volume } => {
+                let mut req = json!({ "op": "volume.sessions" });
+                if let Some(v) = volume {
+                    req["volume"] = json!(v);
+                }
+                req
             }
             VolumeCmd::Connect { .. } | VolumeCmd::Disconnect { .. } => {
                 unreachable!("connect/disconnect are local iscsiadm helpers")
@@ -343,6 +438,9 @@ fn print_text(cmd: &Commands, resp: &serde_json::Value) -> Result<(), String> {
                 print_stats(&data);
             }
         }
+        Commands::Health => {
+            print_health(&data);
+        }
         Commands::Cache { .. } => {
             println!("cache updated");
             print_cache(&data);
@@ -363,6 +461,11 @@ fn print_text(cmd: &Commands, resp: &serde_json::Value) -> Result<(), String> {
             print_write_image(&data);
         }
         Commands::Volume {
+            action: VolumeCmd::Export { .. },
+        } => {
+            print_volume_export(&data);
+        }
+        Commands::Volume {
             action: VolumeCmd::Copy { .. },
         } => {
             print_volume_copy(&data);
@@ -371,6 +474,16 @@ fn print_text(cmd: &Commands, resp: &serde_json::Value) -> Result<(), String> {
             action: VolumeCmd::Wipe { .. },
         } => {
             print_volume_wipe(&data);
+        }
+        Commands::Volume {
+            action: VolumeCmd::Grow { .. },
+        } => {
+            print_volume_grow(&data);
+        }
+        Commands::Volume {
+            action: VolumeCmd::Sessions { .. },
+        } => {
+            print_volume_sessions(&data);
         }
         Commands::Volume {
             action: VolumeCmd::Connect { .. } | VolumeCmd::Disconnect { .. },
@@ -617,6 +730,130 @@ fn print_volume_wipe(data: &serde_json::Value) {
     );
     if let Some(n) = data.get("note").and_then(|v| v.as_str()) {
         println!("note: {n}");
+    }
+}
+
+fn print_volume_grow(data: &serde_json::Value) {
+    println!(
+        "grew volume {} ({})",
+        data.get("volume").and_then(|v| v.as_str()).unwrap_or("?"),
+        data.get("iqn").and_then(|v| v.as_str()).unwrap_or("?")
+    );
+    println!(
+        "capacity: {} → {}  changed={}",
+        data.get("old_capacity")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0),
+        data.get("new_capacity")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0),
+        data.get("changed")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false)
+    );
+    if let Some(n) = data.get("note").and_then(|v| v.as_str()) {
+        println!("note: {n}");
+    }
+}
+
+fn print_volume_sessions(data: &serde_json::Value) {
+    let count = data.get("count").and_then(|v| v.as_u64()).unwrap_or(0);
+    if let Some(iscsi) = data.get("iscsi") {
+        println!(
+            "iscsi connections={} sessions={}",
+            iscsi
+                .get("connections")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0),
+            iscsi.get("sessions").and_then(|v| v.as_u64()).unwrap_or(0)
+        );
+    }
+    println!("sessions: {count}");
+    if let Some(arr) = data.get("sessions").and_then(|v| v.as_array()) {
+        for s in arr {
+            println!(
+                "  - volume={} target={} initiator={} peer={} age={}s",
+                s.get("volume").and_then(|v| v.as_str()).unwrap_or("?"),
+                s.get("target_iqn").and_then(|v| v.as_str()).unwrap_or("?"),
+                s.get("initiator_iqn")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("?"),
+                s.get("peer").and_then(|v| v.as_str()).unwrap_or("?"),
+                s.get("started_secs_ago")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0)
+            );
+        }
+    }
+}
+
+fn print_volume_export(data: &serde_json::Value) {
+    if data.get("ready") == Some(&json!(true)) {
+        println!(
+            "ready to send {} bytes for volume {}",
+            data.get("size").and_then(|v| v.as_u64()).unwrap_or(0),
+            data.get("volume").and_then(|v| v.as_str()).unwrap_or("?")
+        );
+        return;
+    }
+    println!(
+        "exported volume {} ({})",
+        data.get("volume").and_then(|v| v.as_str()).unwrap_or("?"),
+        data.get("iqn").and_then(|v| v.as_str()).unwrap_or("?")
+    );
+    println!(
+        "bytes_sent={}  chunks_read={}",
+        data.get("bytes_sent").and_then(|v| v.as_u64()).unwrap_or(0),
+        data.get("chunks_read")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0)
+    );
+}
+
+fn print_health(data: &serde_json::Value) {
+    println!(
+        "status: {}",
+        data.get("status").and_then(|v| v.as_str()).unwrap_or("?")
+    );
+    println!(
+        "uptime: {}",
+        data.get("uptime").and_then(|v| v.as_str()).unwrap_or("-")
+    );
+    println!(
+        "bind: {}",
+        data.get("bind").and_then(|v| v.as_str()).unwrap_or("-")
+    );
+    println!(
+        "volumes: {}",
+        data.get("volumes").and_then(|v| v.as_u64()).unwrap_or(0)
+    );
+    if let Some(iscsi) = data.get("iscsi") {
+        println!(
+            "iscsi connections={} sessions={}",
+            iscsi
+                .get("connections")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0),
+            iscsi.get("sessions").and_then(|v| v.as_u64()).unwrap_or(0)
+        );
+    }
+    if let Some(c) = data.get("cache") {
+        print_cache(c);
+    }
+    if let Some(s3) = data.get("s3") {
+        if s3.get("ok") == Some(&json!(true)) {
+            println!(
+                "s3: ok bucket={} latency_ms={}",
+                s3.get("bucket").and_then(|v| v.as_str()).unwrap_or("?"),
+                s3.get("latency_ms").and_then(|v| v.as_u64()).unwrap_or(0)
+            );
+        } else {
+            println!(
+                "s3: FAIL bucket={} error={}",
+                s3.get("bucket").and_then(|v| v.as_str()).unwrap_or("?"),
+                s3.get("error").and_then(|v| v.as_str()).unwrap_or("?")
+            );
+        }
     }
 }
 

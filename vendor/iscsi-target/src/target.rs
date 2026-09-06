@@ -1248,10 +1248,17 @@ struct TargetInfo {
     allowed_initiators: Option<Vec<String>>,
 }
 
-/// Callbacks for FullFeature session lifecycle (used for metrics).
+/// Callbacks for FullFeature session lifecycle (used for metrics / admin).
+pub struct SessionEvent {
+    pub target_iqn: String,
+    pub initiator_iqn: String,
+    /// TCP peer (`ip:port`) for this connection.
+    pub peer: String,
+}
+
 pub trait SessionEventSink: Send + Sync {
-    fn on_session_start(&self, target_iqn: &str);
-    fn on_session_end(&self, target_iqn: &str);
+    fn on_session_start(&self, event: &SessionEvent);
+    fn on_session_end(&self, event: &SessionEvent);
 }
 
 /// Multi-target iSCSI server
@@ -1344,6 +1351,7 @@ impl IscsiServer {
                                 MultiTargetOutcome {
                                     session_entered: false,
                                     target_iqn: None,
+                                    initiator_iqn: None,
                                 }
                             }
                         };
@@ -1361,7 +1369,13 @@ impl IscsiServer {
                             if let (Some(sink), Some(iqn)) =
                                 (session_events.as_ref(), outcome.target_iqn.as_deref())
                             {
-                                sink.on_session_end(iqn);
+                                sink.on_session_end(&SessionEvent {
+                                    target_iqn: iqn.to_string(),
+                                    initiator_iqn: outcome
+                                        .initiator_iqn
+                                        .unwrap_or_default(),
+                                    peer: addr.to_string(),
+                                });
                             }
                         }
                     });
@@ -1423,6 +1437,7 @@ fn resolve_portal_addresses(stream: &TcpStream, configured: &[String]) -> ScsiRe
 struct MultiTargetOutcome {
     session_entered: bool,
     target_iqn: Option<String>,
+    initiator_iqn: Option<String>,
 }
 
 /// Handle a connection with multi-target routing
@@ -1458,6 +1473,7 @@ fn handle_multi_target_connection(
             return Ok(MultiTargetOutcome {
                 session_entered: false,
                 target_iqn: None,
+                initiator_iqn: None,
             });
         }
     };
@@ -1467,6 +1483,7 @@ fn handle_multi_target_connection(
         return Ok(MultiTargetOutcome {
             session_entered: false,
             target_iqn: None,
+            initiator_iqn: None,
         });
     }
 
@@ -1484,6 +1501,7 @@ fn handle_multi_target_connection(
         return Ok(MultiTargetOutcome {
             session_entered: false,
             target_iqn: None,
+            initiator_iqn: None,
         });
     }
 
@@ -1505,6 +1523,7 @@ fn handle_multi_target_connection(
             return Ok(MultiTargetOutcome {
                 session_entered: false,
                 target_iqn: None,
+                initiator_iqn: None,
             });
         }
     };
@@ -1518,7 +1537,7 @@ fn handle_multi_target_connection(
 
     log::info!("Routing {} to target: {} ({})", peer, target_iqn, alias);
 
-    let session_entered = handle_connection_with_first_pdu_boxed(
+    let (session_entered, initiator_iqn) = handle_connection_with_first_pdu_boxed(
         stream,
         device,
         &target_iqn,
@@ -1539,6 +1558,7 @@ fn handle_multi_target_connection(
     Ok(MultiTargetOutcome {
         session_entered,
         target_iqn: Some(target_iqn),
+        initiator_iqn,
     })
 }
 
@@ -1710,10 +1730,11 @@ fn handle_connection_with_first_pdu_boxed(
     portals: &[String],
     session_events: Option<Arc<dyn SessionEventSink>>,
     peer: std::net::SocketAddr,
-) -> ScsiResult<bool> {
+) -> ScsiResult<(bool, Option<String>)> {
     let mut session =
         AnySession::new_configured(auth_config, target_name, target_alias, allowed_initiators);
     let mut session_entered = false;
+    let mut initiator_iqn: Option<String> = None;
 
     let mut write_stream = stream.try_clone().map_err(IscsiError::Io)?;
     let nop_write_stream = Arc::new(Mutex::new(stream.try_clone().map_err(IscsiError::Io)?));
@@ -1960,8 +1981,17 @@ fn handle_connection_with_first_pdu_boxed(
             }
             session_entered = true;
             active_sessions.fetch_add(1, Ordering::SeqCst);
+            let initiator = session
+                .data()
+                .map(|d| d.params.initiator_name.clone())
+                .unwrap_or_default();
+            initiator_iqn = Some(initiator.clone());
             if let Some(ref sink) = session_events {
-                sink.on_session_start(target_name);
+                sink.on_session_start(&SessionEvent {
+                    target_iqn: target_name.to_string(),
+                    initiator_iqn: initiator,
+                    peer: peer.to_string(),
+                });
             }
         }
 
@@ -1978,7 +2008,7 @@ fn handle_connection_with_first_pdu_boxed(
     conn_running.store(false, Ordering::SeqCst);
     let _ = write_stream.shutdown(Shutdown::Both);
     let _ = reader_handle.join();
-    Ok(session_entered)
+    Ok((session_entered, initiator_iqn))
 }
 
 /// Handle a single PDU in multi-target mode (legacy helper retained for SCSI boxed path tests)

@@ -184,10 +184,10 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         );
     }
 
-    builder = builder.session_events(SessionMetricsSink::new(
-        Arc::clone(&metrics),
-        volume_labels,
-    ));
+    let session_sink = SessionMetricsSink::new(Arc::clone(&metrics), volume_labels);
+    builder = builder.session_events(
+        Arc::clone(&session_sink) as Arc<dyn iscsi_target::SessionEventSink>
+    );
 
     let server = Arc::new(builder.build().map_err(|e| e.to_string())?);
     info!(
@@ -224,6 +224,8 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             server: Arc::clone(&server),
             s3_client: client.clone(),
             runtime: handle.clone(),
+            metrics: Arc::clone(&metrics),
+            sessions: Arc::clone(&session_sink),
             snapshot: Mutex::new(AdminSnapshot {
                 bind: cfg.bind.clone(),
                 portals: portals.clone(),

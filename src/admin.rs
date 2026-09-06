@@ -2,6 +2,7 @@
 
 use crate::cache::ChunkCache;
 use crate::config::{parse_byte_size, Config};
+use crate::metrics::{Metrics, SessionMetricsSink};
 use crate::store::{list_prefix_stats, BlockStore, PrefixObjectStats};
 use iscsi_target::IscsiServer;
 use parking_lot::Mutex;
@@ -40,6 +41,8 @@ pub struct AdminState {
     pub server: Arc<IscsiServer>,
     pub s3_client: aws_sdk_s3::Client,
     pub runtime: tokio::runtime::Handle,
+    pub metrics: Arc<Metrics>,
+    pub sessions: Arc<SessionMetricsSink>,
     /// Labels / config snapshot updated on safe reload.
     pub snapshot: Mutex<AdminSnapshot>,
     /// Per-volume stores for direct image seeding.
@@ -70,9 +73,13 @@ struct AdminRequest {
     /// Destination volume name or IQN (`volume.copy`).
     #[serde(default)]
     to: Option<String>,
-    /// Exact byte length of a following binary body (`volume.write_image`).
+    /// Exact byte length of a following binary body (`volume.write_image`),
+    /// or export length (`volume.export`).
     #[serde(default)]
     size: Option<u64>,
+    /// New capacity for `volume.grow` (number or size string via JSON string/number).
+    #[serde(default)]
+    capacity: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -152,6 +159,9 @@ fn handle_client(stream: UnixStream, state: &AdminState) -> Result<(), String> {
 
     if req.op == "volume.write_image" {
         return handle_write_image(state, &req, &mut reader, &stream);
+    }
+    if req.op == "volume.export" {
+        return handle_export(state, &req, &stream);
     }
 
     let response = dispatch(state, &req);
@@ -376,6 +386,15 @@ fn dispatch(state: &AdminState, req: &AdminRequest) -> serde_json::Value {
             Err(e) => err(e),
         },
         "volume.wipe" => match volume_wipe(state, req.volume.as_deref()) {
+            Ok(v) => ok(v),
+            Err(e) => err(e),
+        },
+        "volume.grow" => match volume_grow(state, req.volume.as_deref(), req.capacity.as_ref()) {
+            Ok(v) => ok(v),
+            Err(e) => err(e),
+        },
+        "volume.sessions" => ok(volume_sessions_json(state, req.volume.as_deref())),
+        "health" => match health_json(state) {
             Ok(v) => ok(v),
             Err(e) => err(e),
         },
@@ -624,6 +643,246 @@ pub fn wipe_volume(store: &dyn BlockStore) -> Result<WipeVolumeResult, String> {
         .flush()
         .map_err(|e| format!("flush after wipe: {e}"))?;
     Ok(WipeVolumeResult { chunks_deleted })
+}
+
+fn volume_sessions_json(state: &AdminState, selector: Option<&str>) -> serde_json::Value {
+    let sessions = state.sessions.list_sessions(selector);
+    json!({
+        "sessions": sessions,
+        "count": sessions.len(),
+        "iscsi": {
+            "connections": state.server.active_connection_count(),
+            "sessions": state.server.active_session_count(),
+        },
+    })
+}
+
+fn volume_grow(
+    state: &AdminState,
+    selector: Option<&str>,
+    capacity: Option<&serde_json::Value>,
+) -> Result<serde_json::Value, String> {
+    let new_capacity = parse_required_max_bytes(capacity)?; // same number/size-string parser
+    if new_capacity == 0 {
+        return Err("capacity must be greater than 0".into());
+    }
+
+    let snap = state.snapshot.lock().clone();
+    let vol = find_volume(&snap.volumes, selector)?.clone();
+    let handle = find_volume_store(&state.volume_stores, &vol)?;
+    let old_capacity = handle.store.capacity();
+    if new_capacity < old_capacity {
+        return Err(format!(
+            "cannot shrink capacity from {old_capacity} to {new_capacity}"
+        ));
+    }
+    if new_capacity == old_capacity {
+        return Ok(json!({
+            "volume": vol.name,
+            "iqn": vol.iqn,
+            "old_capacity": old_capacity,
+            "new_capacity": new_capacity,
+            "changed": false,
+            "note": "capacity unchanged",
+        }));
+    }
+
+    handle
+        .store
+        .set_capacity(new_capacity)
+        .map_err(|e| e.to_string())?;
+
+    {
+        let mut snap = state.snapshot.lock();
+        if let Some(v) = snap.volumes.iter_mut().find(|v| v.name == vol.name) {
+            v.capacity = new_capacity;
+        }
+    }
+
+    let labels = crate::metrics::VolumeLabels::new(vol.name.clone(), vol.iqn.clone());
+    state.metrics.set_volume_capacity(&labels, new_capacity);
+
+    info!(
+        volume = %vol.name,
+        from = old_capacity,
+        to = new_capacity,
+        "volume capacity grown"
+    );
+
+    Ok(json!({
+        "volume": vol.name,
+        "iqn": vol.iqn,
+        "old_capacity": old_capacity,
+        "new_capacity": new_capacity,
+        "changed": true,
+        "note": "SCSI READ CAPACITY updates immediately; initiator may need a device rescan",
+    }))
+}
+
+fn health_json(state: &AdminState) -> Result<serde_json::Value, String> {
+    let snap = state.snapshot.lock().clone();
+    let s3 = probe_s3(state, &snap)?;
+    let status = if s3.get("ok") == Some(&json!(true)) {
+        "ok"
+    } else {
+        "degraded"
+    };
+    Ok(json!({
+        "status": status,
+        "uptime_secs": state.started.elapsed().as_secs(),
+        "uptime": format_duration(state.started.elapsed()),
+        "bind": snap.bind,
+        "portals": snap.portals,
+        "instance": snap.instance,
+        "volumes": snap.volumes.len(),
+        "iscsi": {
+            "connections": state.server.active_connection_count(),
+            "sessions": state.server.active_session_count(),
+        },
+        "cache": cache_json(state),
+        "s3": s3,
+    }))
+}
+
+fn probe_s3(state: &AdminState, snap: &AdminSnapshot) -> Result<serde_json::Value, String> {
+    let Some(bucket) = snap.s3_bucket.clone() else {
+        return Ok(json!({
+            "ok": false,
+            "error": "s3.bucket is not configured",
+        }));
+    };
+    let client = state.s3_client.clone();
+    let started = Instant::now();
+    let result = crate::store::head_bucket(client, state.runtime.clone(), bucket.clone());
+    match result {
+        Ok(()) => Ok(json!({
+            "ok": true,
+            "bucket": bucket,
+            "endpoint": snap.s3_endpoint,
+            "latency_ms": started.elapsed().as_millis() as u64,
+        })),
+        Err(e) => Ok(json!({
+            "ok": false,
+            "bucket": bucket,
+            "endpoint": snap.s3_endpoint,
+            "error": e.to_string(),
+            "latency_ms": started.elapsed().as_millis() as u64,
+        })),
+    }
+}
+
+/// Two-phase export: ready JSON, then exact `size` body bytes, then final JSON.
+fn handle_export(
+    state: &AdminState,
+    req: &AdminRequest,
+    stream: &UnixStream,
+) -> Result<(), String> {
+    match prepare_export(state, req) {
+        Ok(prep) => {
+            write_json_line(
+                stream,
+                &ok(json!({
+                    "ready": true,
+                    "volume": prep.volume_name,
+                    "iqn": prep.iqn,
+                    "size": prep.size,
+                    "capacity": prep.capacity,
+                    "chunk_size": prep.chunk_size,
+                })),
+            )?;
+            let result = match export_image_to_writer(prep.store.as_ref(), &mut &*stream, prep.size) {
+                Ok(r) => ok(json!({
+                    "volume": prep.volume_name,
+                    "iqn": prep.iqn,
+                    "bytes_sent": r.bytes_sent,
+                    "chunks_read": r.chunks_read,
+                })),
+                Err(e) => err(e),
+            };
+            write_json_line(stream, &result)
+        }
+        Err(e) => write_json_line(stream, &err(e)),
+    }
+}
+
+struct ExportPrep {
+    volume_name: String,
+    iqn: String,
+    size: u64,
+    capacity: u64,
+    chunk_size: u64,
+    store: Arc<dyn BlockStore>,
+}
+
+fn prepare_export(state: &AdminState, req: &AdminRequest) -> Result<ExportPrep, String> {
+    let snap = state.snapshot.lock().clone();
+    let vol = find_volume(&snap.volumes, req.volume.as_deref())?.clone();
+    let handle = find_volume_store(&state.volume_stores, &vol)?;
+    let capacity = handle.store.capacity();
+    let size = req.size.unwrap_or(capacity);
+    if size == 0 {
+        return Err("size must be greater than 0".into());
+    }
+    if size > capacity {
+        return Err(format!(
+            "export size {size} exceeds volume capacity {capacity}"
+        ));
+    }
+    Ok(ExportPrep {
+        volume_name: vol.name,
+        iqn: vol.iqn,
+        size,
+        capacity,
+        chunk_size: handle.store.chunk_size(),
+        store: Arc::clone(&handle.store),
+    })
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ExportImageResult {
+    pub bytes_sent: u64,
+    pub chunks_read: u64,
+}
+
+/// Read `size` bytes from `store` and write them to `writer`.
+pub fn export_image_to_writer(
+    store: &dyn BlockStore,
+    writer: &mut impl Write,
+    size: u64,
+) -> Result<ExportImageResult, String> {
+    let chunk_size = store.chunk_size();
+    if chunk_size == 0 {
+        return Err("invalid chunk_size 0".into());
+    }
+    let capacity = store.capacity();
+    if size > capacity {
+        return Err(format!(
+            "export size {size} exceeds volume capacity {capacity}"
+        ));
+    }
+
+    let mut buf = vec![0u8; chunk_size as usize];
+    let mut remaining = size;
+    let mut offset = 0u64;
+    let mut chunks_read = 0u64;
+
+    while remaining > 0 {
+        let n = (remaining as usize).min(buf.len());
+        store
+            .read_at(offset, &mut buf[..n])
+            .map_err(|e| format!("read at offset {offset}: {e}"))?;
+        writer
+            .write_all(&buf[..n])
+            .map_err(|e| format!("write export body at offset {offset}: {e}"))?;
+        chunks_read += 1;
+        offset += n as u64;
+        remaining -= n as u64;
+    }
+
+    Ok(ExportImageResult {
+        bytes_sent: size,
+        chunks_read,
+    })
 }
 
 fn ok(data: serde_json::Value) -> serde_json::Value {
@@ -902,6 +1161,62 @@ pub fn call_admin_write_image(
     serde_json::from_str(final_line.trim()).map_err(|e| format!("bad final json: {e}"))
 }
 
+/// Two-phase `volume.export`: ready handshake, receive `size` bytes, final JSON.
+pub fn call_admin_export(
+    socket: &Path,
+    volume: &str,
+    size: Option<u64>,
+    body: &mut impl Write,
+) -> Result<serde_json::Value, String> {
+    let mut stream = UnixStream::connect(socket)
+        .map_err(|e| format!("connect {}: {e}", socket.display()))?;
+    let mut req = json!({
+        "op": "volume.export",
+        "volume": volume,
+    });
+    if let Some(n) = size {
+        req["size"] = json!(n);
+    }
+    let line = serde_json::to_string(&req).map_err(|e| e.to_string())?;
+    stream
+        .write_all(line.as_bytes())
+        .map_err(|e| format!("write: {e}"))?;
+    stream.write_all(b"\n").map_err(|e| format!("write: {e}"))?;
+
+    let mut reader = BufReader::new(stream.try_clone().map_err(|e| format!("clone: {e}"))?);
+    let mut ready_line = String::new();
+    reader
+        .read_line(&mut ready_line)
+        .map_err(|e| format!("read ready: {e}"))?;
+    let ready: serde_json::Value = serde_json::from_str(ready_line.trim())
+        .map_err(|e| format!("bad ready json: {e}"))?;
+    if ready.get("ok") != Some(&json!(true)) {
+        return Ok(ready);
+    }
+    let export_size = ready
+        .pointer("/data/size")
+        .and_then(|v| v.as_u64())
+        .ok_or_else(|| "export ready response missing size".to_string())?;
+
+    let mut remaining = export_size;
+    let mut buf = vec![0u8; 1024 * 1024];
+    while remaining > 0 {
+        let n = (remaining as usize).min(buf.len());
+        reader
+            .read_exact(&mut buf[..n])
+            .map_err(|e| format!("receive image bytes: {e}"))?;
+        body.write_all(&buf[..n])
+            .map_err(|e| format!("write local file: {e}"))?;
+        remaining -= n as u64;
+    }
+
+    let mut final_line = String::new();
+    reader
+        .read_line(&mut final_line)
+        .map_err(|e| format!("read final: {e}"))?;
+    serde_json::from_str(final_line.trim()).map_err(|e| format!("bad final json: {e}"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1106,5 +1421,31 @@ mod tests {
         assert_eq!(buf[0], 0);
         store.read_at(8192, &mut buf).unwrap();
         assert_eq!(buf[0], 0);
+    }
+
+    #[test]
+    fn export_image_roundtrip_bytes() {
+        use crate::store::MemoryStore;
+        use std::io::Cursor;
+
+        let store = MemoryStore::new(8192, 512, 4096).unwrap();
+        store.write_at(0, &[0x11u8; 4096]).unwrap();
+        store.write_at(4096, &[0x22u8; 4096]).unwrap();
+
+        let mut out = Vec::new();
+        let result = export_image_to_writer(&store, &mut out, 8192).unwrap();
+        assert_eq!(result.bytes_sent, 8192);
+        assert_eq!(out.len(), 8192);
+        assert_eq!(&out[..4096], &[0x11u8; 4096]);
+        assert_eq!(&out[4096..], &[0x22u8; 4096]);
+
+        let restored = MemoryStore::new(8192, 512, 4096).unwrap();
+        let mut cursor = Cursor::new(out);
+        seed_image_from_reader(&restored, &mut cursor, 8192).unwrap();
+        let mut buf = [0u8; 1];
+        restored.read_at(0, &mut buf).unwrap();
+        assert_eq!(buf[0], 0x11);
+        restored.read_at(4096, &mut buf).unwrap();
+        assert_eq!(buf[0], 0x22);
     }
 }

@@ -32,13 +32,17 @@ Docker: install both `iscsi-s3` and `iscsi-s3-ctl` in the image. Mount/share the
 | Command | Effect |
 |---------|--------|
 | `stats` | Uptime, bind, portals, instance, volumes, cache, iSCSI connection/session counts |
+| `health` | Liveness: uptime, sessions, cache, S3 `HeadBucket` (exit 1 if degraded) |
 | `cache status` | Cache enabled flag, max/used bytes, entry count |
 | `cache disable` | Set `max_bytes = 0` and **clear** all cached chunks |
 | `cache enable [--max-bytes 256MiB]` | Enable cache (cold); default size is last non-zero budget |
 | `cache set --max-bytes …` | Set budget (`0` disables + clears) |
 | `volume list` | List configured volumes (name, IQN, capacity, prefix, compression, auth) |
+| `volume sessions [name\|iqn]` | Active FullFeature sessions (initiator, peer, age) |
 | `volume s3-stats <name\|iqn>` | List S3 objects under the volume prefix: chunk/meta counts and bytes |
 | `volume write-image <name\|iqn> --file PATH` | Stream a raw disk image into a volume that has **no chunk objects** yet |
+| `volume export <name\|iqn> --file PATH [--size N]` | Stream a raw image out of a volume (default: full capacity) |
+| `volume grow <name\|iqn> --capacity SIZE` | Grow-only capacity update (meta.json + live READ CAPACITY) |
 | `volume copy <from> <to> [--force]` | 1:1 sparse copy; **overwrites** destination (prompts unless `--force`) |
 | `volume wipe <name\|iqn> [--force]` | Delete all chunk objects; keeps `meta.json` (prompts unless `--force`) |
 | `volume connect <name\|iqn> [--portal HOST:PORT]` | Local helper: `iscsiadm` discovery + login |
@@ -133,6 +137,42 @@ iscsi-s3-ctl volume wipe disk0 --force
 
 Prefer `volume disconnect` (or logout) first so initiators are not reading/writing during the wipe.
 
+## Grow capacity (`volume grow`)
+
+Grow-only live capacity change. Updates `meta.json` and the in-memory store so SCSI `READ CAPACITY` reflects the new size immediately. Initiators usually need a device rescan (or logout/login).
+
+```bash
+iscsi-s3-ctl volume grow disk0 --capacity 20GiB
+```
+
+Also update the TOML `capacity` so the next restart does not refuse a shrink back to the old value.
+
+## Export a raw image (`volume export`)
+
+Stream the volume’s logical bytes to a local file (zeros for sparse regions):
+
+```bash
+iscsi-s3-ctl volume export disk0 --file ./disk.img
+iscsi-s3-ctl volume export disk0 --file ./partial.img --size 1GiB
+```
+
+## Sessions (`volume sessions`)
+
+List active FullFeature sessions (optional volume filter):
+
+```bash
+iscsi-s3-ctl volume sessions
+iscsi-s3-ctl volume sessions disk0
+```
+
+## Health
+
+```bash
+iscsi-s3-ctl health
+```
+
+Reports uptime, connections/sessions, cache, and an S3 `HeadBucket` probe. Exit code `1` when `status` is not `ok` (e.g. S3 unreachable).
+
 ## Connect / disconnect (open-iscsi helpers)
 
 These run **on the machine where you invoke `iscsi-s3-ctl`**, not inside the daemon. They look up the volume IQN (and portals) over the admin socket, then call `iscsiadm`. Requires `open-iscsi` / `iscsiadm` in `PATH`, and usually root.
@@ -188,6 +228,10 @@ One JSON object per connection, newline-terminated request and response:
 {"op":"volume.write_image","volume":"disk0","size":1073741824}
 {"op":"volume.copy","volume":"disk0","to":"disk1"}
 {"op":"volume.wipe","volume":"disk0"}
+{"op":"volume.grow","volume":"disk0","capacity":21474836480}
+{"op":"volume.sessions"}
+{"op":"volume.export","volume":"disk0"}
+{"op":"health"}
 {"op":"reload"}
 ```
 

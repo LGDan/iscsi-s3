@@ -5,8 +5,8 @@ mod s3;
 
 pub use memory::MemoryStore;
 pub use s3::{
-    list_chunk_indices, list_prefix_stats, plan_capacity, PrefixObjectStats, S3ChunkStore,
-    S3StoreConfig, VolumeMeta,
+    head_bucket, list_chunk_indices, list_prefix_stats, plan_capacity, PrefixObjectStats,
+    S3ChunkStore, S3StoreConfig, VolumeMeta,
 };
 
 use thiserror::Error;

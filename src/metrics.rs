@@ -1,9 +1,11 @@
 //! Prometheus metrics registry and HTTP scrape endpoint.
 
+use parking_lot::Mutex;
 use prometheus::{
     Encoder, HistogramOpts, HistogramVec, IntCounterVec, IntGauge, IntGaugeVec, Opts, Registry,
     TextEncoder,
 };
+use serde::Serialize;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::thread;
@@ -279,10 +281,29 @@ fn latency_buckets() -> Vec<f64> {
     ]
 }
 
-/// Maps IQN → volume labels for session hooks.
+/// Maps IQN → volume labels for session hooks; also tracks live sessions for admin.
 pub struct SessionMetricsSink {
     metrics: Arc<Metrics>,
     by_iqn: HashMap<String, VolumeLabels>,
+    live: Mutex<HashMap<(String, String), LiveSessionInner>>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct LiveSession {
+    pub volume: String,
+    pub target_iqn: String,
+    pub initiator_iqn: String,
+    pub peer: String,
+    pub started_secs_ago: u64,
+}
+
+#[derive(Debug, Clone)]
+struct LiveSessionInner {
+    volume: String,
+    target_iqn: String,
+    initiator_iqn: String,
+    peer: String,
+    started: Instant,
 }
 
 impl SessionMetricsSink {
@@ -297,20 +318,63 @@ impl SessionMetricsSink {
                 .with_label_values(&[&labels.volume, &labels.iqn])
                 .set(0);
         }
-        Arc::new(Self { metrics, by_iqn })
+        Arc::new(Self {
+            metrics,
+            by_iqn,
+            live: Mutex::new(HashMap::new()),
+        })
+    }
+
+    pub fn list_sessions(&self, volume_or_iqn: Option<&str>) -> Vec<LiveSession> {
+        let now = Instant::now();
+        let live = self.live.lock();
+        let mut out: Vec<LiveSession> = live
+            .values()
+            .filter(|s| match volume_or_iqn {
+                None => true,
+                Some(sel) => s.volume == sel || s.target_iqn == sel,
+            })
+            .map(|s| LiveSession {
+                volume: s.volume.clone(),
+                target_iqn: s.target_iqn.clone(),
+                initiator_iqn: s.initiator_iqn.clone(),
+                peer: s.peer.clone(),
+                started_secs_ago: now.duration_since(s.started).as_secs(),
+            })
+            .collect();
+        out.sort_by(|a, b| {
+            a.volume
+                .cmp(&b.volume)
+                .then(a.peer.cmp(&b.peer))
+                .then(a.initiator_iqn.cmp(&b.initiator_iqn))
+        });
+        out
     }
 }
 
 impl iscsi_target::SessionEventSink for SessionMetricsSink {
-    fn on_session_start(&self, target_iqn: &str) {
-        if let Some(labels) = self.by_iqn.get(target_iqn) {
+    fn on_session_start(&self, event: &iscsi_target::SessionEvent) {
+        if let Some(labels) = self.by_iqn.get(&event.target_iqn) {
             self.metrics.session_started(labels);
+            self.live.lock().insert(
+                (event.target_iqn.clone(), event.peer.clone()),
+                LiveSessionInner {
+                    volume: labels.volume.clone(),
+                    target_iqn: event.target_iqn.clone(),
+                    initiator_iqn: event.initiator_iqn.clone(),
+                    peer: event.peer.clone(),
+                    started: Instant::now(),
+                },
+            );
         }
     }
 
-    fn on_session_end(&self, target_iqn: &str) {
-        if let Some(labels) = self.by_iqn.get(target_iqn) {
+    fn on_session_end(&self, event: &iscsi_target::SessionEvent) {
+        if let Some(labels) = self.by_iqn.get(&event.target_iqn) {
             self.metrics.session_ended(labels);
+            self.live
+                .lock()
+                .remove(&(event.target_iqn.clone(), event.peer.clone()));
         }
     }
 }

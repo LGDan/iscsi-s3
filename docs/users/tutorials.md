@@ -49,9 +49,15 @@ sudo iscsiadm -m node -T "$IQN" -p ${HOST}:${PORT} --logout
 
 Capacity is **grow-only**. Geometry (`chunk_size`, `block_size`) cannot change after the first `meta.json` write.
 
-1. Edit TOML — set `capacity` to a **larger** value.
-2. Restart `iscsi-s3` (Compose: `docker compose up -d --force-recreate iscsi-s3`).
-3. On the initiator, rescan and grow the filesystem:
+1. Grow live (preferred while the daemon is up):
+
+```bash
+iscsi-s3-ctl volume grow disk0 --capacity 20GiB
+```
+
+Also raise `capacity` in the TOML so the next restart keeps the new size.
+
+2. On the initiator, rescan and grow the filesystem:
 
 ```bash
 DEV=/dev/sdX

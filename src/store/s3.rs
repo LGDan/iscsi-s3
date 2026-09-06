@@ -158,6 +158,23 @@ fn parse_chunk_index_from_key(chunks_prefix: &str, key: &str) -> Option<u64> {
     u64::from_str_radix(name, 16).ok()
 }
 
+/// Lightweight connectivity check used by admin `health`.
+pub fn head_bucket(client: Client, runtime: Handle, bucket: String) -> Result<(), StoreError> {
+    run_on_runtime(
+        &runtime,
+        async move {
+            client
+                .head_bucket()
+                .bucket(&bucket)
+                .send()
+                .await
+                .map_err(|e| StoreError::S3(e.to_string()))?;
+            Ok(())
+        },
+        Duration::from_secs(15),
+    )
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct VolumeMeta {
     pub version: u32,

@@ -60,7 +60,8 @@ pub use client::IscsiClient;
 pub use error::{IscsiError, ScsiResult};
 pub use scsi::ScsiBlockDevice;
 pub use target::{
-    IscsiTarget, IscsiTargetBuilder, IscsiServer, IscsiServerBuilder, SessionEventSink,
+    IscsiTarget, IscsiTargetBuilder, IscsiServer, IscsiServerBuilder, SessionEvent,
+    SessionEventSink,
 };
 
 /// Version of this library
