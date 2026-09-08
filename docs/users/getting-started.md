@@ -20,8 +20,7 @@ This starts:
 
 | Service | Role |
 |---------|------|
-| `minio` | S3 API `:9000`, console `:9001` (`minioadmin` / `minioadmin`) |
-| `createbuckets` | Creates bucket `iscsi` |
+| `rclone` | S3 API `:9000` (`rclone serve s3` on `/ext-hd`, bucket `iscsi`) |
 | `iscsi-s3` | Target (config mounted from the host) |
 
 Default Compose mounts a lab config from the repo root (`config.integration.toml` or `config.docker.toml` — check `docker-compose.yml`).
@@ -36,16 +35,16 @@ Watch logs:
 docker compose logs -f iscsi-s3
 ```
 
-Stop and remove MinIO data:
+Stop and remove Compose volumes (S3 objects live on the host `/ext-hd` mount):
 
 ```bash
 docker compose down -v
 ```
 
-## Option B — Local binary + MinIO
+## Option B — Local binary + rclone S3
 
 ```bash
-docker compose up -d minio createbuckets
+docker compose up -d rclone
 cp config.example.toml config.toml
 # edit config.toml; set advertise if needed
 export AWS_ACCESS_KEY_ID=minioadmin

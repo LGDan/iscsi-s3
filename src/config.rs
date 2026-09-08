@@ -363,8 +363,8 @@ pub struct Cli {
     #[arg(long)]
     pub force_path_style: Option<bool>,
 
-    /// Log filter (e.g. info, iscsi_s3=debug)
-    #[arg(long, default_value = "info")]
+    /// Log filter (overridden by RUST_LOG when set). Default: warn.
+    #[arg(long, default_value = "warn")]
     #[serde(skip)]
     pub log: String,
 

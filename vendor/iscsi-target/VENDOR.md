@@ -12,6 +12,11 @@ Local changes:
 - Login Response serializes ISID+TSIH (was zeroed on the wire).
 - AuthMethod=None honours initiator Transit (CSG0→NSG1) instead of staying T=0.
 - Negotiate MaxConnections; answer unknown operational keys with NotUnderstood.
+- Login operational keys: echo only keys the initiator offered (plus declarative
+  `MaxRecvDataSegmentLength`); accept a late Login Request in Full Feature
+  (Windows initiator). Target `MaxRecvDataSegmentLength` default is 65536.
+- SCSI Data-In/Response residual underflow/overflow (Windows INQUIRY VPD);
+  VPD pages 0xB1 (block device characteristics) and 0xB2 (thin provisioning stub).
 - `IscsiServer` (shared portal, multi-IQN): digest-aware read/write after FullFeature,
   full discovery login before SendTargets, TargetAddress includes host:port.
 - `IscsiServer` normal sessions use the same reader-thread + inline NOP path as

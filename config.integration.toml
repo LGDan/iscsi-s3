@@ -1,4 +1,4 @@
-# Docker Compose / container defaults (MinIO service hostname)
+# Docker Compose / container defaults (rclone serve s3)
 bind = "0.0.0.0:3260"
 # Address iscsiadm stores from SendTargets (not the container eth0 IP).
 advertise = "192.168.88.15"
@@ -6,7 +6,7 @@ advertise = "192.168.88.15"
 [s3]
 bucket = "iscsi"
 region = "us-east-1"
-endpoint = "http://minio:9000"
+endpoint = "http://rclone:9000"
 force_path_style = true
 access_key_id = "minioadmin"
 secret_access_key = "minioadmin"
@@ -22,8 +22,8 @@ bind = "0.0.0.0:9090"
 name = "disk0"
 iqn = "iqn.2026-09.local.iscsi-s3:disk0"
 prefix = "disks/disk0"
-capacity = "16GiB"
-chunk_size = "256KiB"
+capacity = "64GiB"
+chunk_size = "8MiB"
 storage = "cow"
 
 [[volumes]]

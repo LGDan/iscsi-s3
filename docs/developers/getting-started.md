@@ -3,7 +3,7 @@
 ## Prerequisites
 
 - Rust stable (edition 2021; recent stable recommended)
-- Docker (for MinIO / Compose smoke)
+- Docker (for rclone S3 / Compose smoke)
 - Optional: `open-iscsi` on a Linux host for end-to-end initiator tests
 
 ## Clone and build
@@ -15,10 +15,10 @@ cargo build --release --bin iscsi-s3
 cargo build --release --example smoke_client
 ```
 
-Run locally against Compose MinIO:
+Run locally against Compose `rclone serve s3`:
 
 ```bash
-docker compose up -d minio createbuckets
+docker compose up -d rclone
 cp config.example.toml config.toml
 export AWS_ACCESS_KEY_ID=minioadmin AWS_SECRET_ACCESS_KEY=minioadmin
 cargo run --release -- --config config.toml --log info,iscsi_s3=debug,iscsi_target=debug

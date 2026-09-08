@@ -6,7 +6,11 @@
 use crate::auth::{AuthConfig, ChapAuthState};
 use crate::error::{IscsiError, ScsiResult};
 use crate::pdu::{self, IscsiPdu, LoginRequest, serialize_text_parameters};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+
+/// Target-declared MaxRecvDataSegmentLength (RFC 3720: declarative, not min-negotiated).
+/// Windows initiators typically advertise 65536; matching that avoids a follow-up login.
+pub const DEFAULT_MAX_RECV_DATA_SEGMENT_LENGTH: u32 = 65536;
 
 /// Session state machine states (RFC 3720 Section 5)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -44,7 +48,7 @@ pub enum SessionType {
 #[derive(Debug, Clone)]
 pub struct SessionParams {
     // Connection parameters
-    /// Maximum data segment length target can receive (default: 8192)
+    /// Maximum data segment length target can receive (default: 65536)
     pub max_recv_data_segment_length: u32,
     /// Maximum data segment length initiator can receive
     pub max_xmit_data_segment_length: u32,
@@ -92,6 +96,8 @@ pub struct SessionParams {
     // Validation tracking
     /// Invalid session type received (for error reporting)
     pub(crate) invalid_session_type: Option<String>,
+    /// Operational keys offered by the initiator (echo only these, plus MaxRecv).
+    pub(crate) offered_keys: HashSet<String>,
 }
 
 /// Digest type for header/data
@@ -123,8 +129,8 @@ pub(crate) fn negotiate_digest(offer: &str) -> DigestType {
 impl Default for SessionParams {
     fn default() -> Self {
         SessionParams {
-            max_recv_data_segment_length: 8192,
-            max_xmit_data_segment_length: 8192,
+            max_recv_data_segment_length: DEFAULT_MAX_RECV_DATA_SEGMENT_LENGTH,
+            max_xmit_data_segment_length: DEFAULT_MAX_RECV_DATA_SEGMENT_LENGTH,
             max_burst_length: 262144,
             first_burst_length: 65536,
             default_time2wait: 2,
@@ -143,7 +149,110 @@ impl Default for SessionParams {
             target_alias: String::new(),
             initiator_alias: String::new(),
             invalid_session_type: None,
+            offered_keys: HashSet::new(),
         }
+    }
+}
+
+fn is_operational_response_key(key: &str) -> bool {
+    matches!(
+        key,
+        "MaxRecvDataSegmentLength"
+            | "MaxConnections"
+            | "MaxBurstLength"
+            | "FirstBurstLength"
+            | "DefaultTime2Wait"
+            | "DefaultTime2Retain"
+            | "MaxOutstandingR2T"
+            | "DataPDUInOrder"
+            | "DataSequenceInOrder"
+            | "ErrorRecoveryLevel"
+            | "ImmediateData"
+            | "InitialR2T"
+            | "HeaderDigest"
+            | "DataDigest"
+            | "IFMarker"
+            | "OFMarker"
+    )
+}
+
+impl SessionParams {
+    pub(crate) fn note_offered(&mut self, key: &str) {
+        if is_operational_response_key(key) {
+            self.offered_keys.insert(key.to_string());
+        }
+    }
+
+    fn operational_value(&self, key: &str) -> Option<String> {
+        Some(match key {
+            "MaxRecvDataSegmentLength" => self.max_recv_data_segment_length.to_string(),
+            "MaxConnections" => self.max_connections.to_string(),
+            "MaxBurstLength" => self.max_burst_length.to_string(),
+            "FirstBurstLength" => self.first_burst_length.to_string(),
+            "DefaultTime2Wait" => self.default_time2wait.to_string(),
+            "DefaultTime2Retain" => self.default_time2retain.to_string(),
+            "MaxOutstandingR2T" => self.max_outstanding_r2t.to_string(),
+            "DataPDUInOrder" => if self.data_pdu_in_order { "Yes" } else { "No" }.to_string(),
+            "DataSequenceInOrder" => {
+                if self.data_sequence_in_order {
+                    "Yes"
+                } else {
+                    "No"
+                }
+                .to_string()
+            }
+            "ErrorRecoveryLevel" => self.error_recovery_level.to_string(),
+            "ImmediateData" => if self.immediate_data { "Yes" } else { "No" }.to_string(),
+            "InitialR2T" => if self.initial_r2t { "Yes" } else { "No" }.to_string(),
+            "HeaderDigest" => match self.header_digest {
+                DigestType::None => "None",
+                DigestType::CRC32C => "CRC32C",
+            }
+            .to_string(),
+            "DataDigest" => match self.data_digest {
+                DigestType::None => "None",
+                DigestType::CRC32C => "CRC32C",
+            }
+            .to_string(),
+            "IFMarker" | "OFMarker" => "No".to_string(),
+            _ => return None,
+        })
+    }
+
+    /// Operational keys to put on a Login Response.
+    ///
+    /// Always includes declarative `MaxRecvDataSegmentLength`. Other keys are
+    /// included only if the initiator offered them (Windows sends a short first
+    /// operational PDU; volunteering the rest triggers a late Login in FFP).
+    pub fn operational_response_params(&self) -> Vec<(String, String)> {
+        const ORDER: &[&str] = &[
+            "MaxRecvDataSegmentLength",
+            "MaxConnections",
+            "MaxBurstLength",
+            "FirstBurstLength",
+            "DefaultTime2Wait",
+            "DefaultTime2Retain",
+            "MaxOutstandingR2T",
+            "DataPDUInOrder",
+            "DataSequenceInOrder",
+            "ErrorRecoveryLevel",
+            "ImmediateData",
+            "InitialR2T",
+            "HeaderDigest",
+            "DataDigest",
+            "IFMarker",
+            "OFMarker",
+        ];
+        let mut out = Vec::new();
+        for key in ORDER {
+            let send = *key == "MaxRecvDataSegmentLength" || self.offered_keys.contains(*key);
+            if send {
+                if let Some(value) = self.operational_value(key) {
+                    out.push(((*key).to_string(), value));
+                }
+            }
+        }
+        out
     }
 }
 
@@ -507,6 +616,7 @@ impl IscsiSession {
 
     /// Apply an initiator parameter during negotiation
     fn apply_initiator_param(&mut self, key: &str, value: &str) {
+        self.params.note_offered(key);
         match key {
             "InitiatorName" => {
                 self.params.initiator_name = value.to_string();
@@ -605,6 +715,9 @@ impl IscsiSession {
             "DataDigest" => {
                 self.params.data_digest = negotiate_digest(value);
             }
+            "IFMarker" | "OFMarker" => {
+                // RFC 3720: markers are obsolete; answer No.
+            }
             // Authentication parameters - handled separately in handle_chap_auth()
             "AuthMethod" | "CHAP_A" | "CHAP_I" | "CHAP_C" | "CHAP_N" | "CHAP_R" => {
                 // These are processed by handle_chap_auth, not here
@@ -628,69 +741,7 @@ impl IscsiSession {
             }
         }
 
-        // Negotiated parameters
-        params.push((
-            "MaxConnections".to_string(),
-            self.params.max_connections.to_string(),
-        ));
-        params.push((
-            "MaxRecvDataSegmentLength".to_string(),
-            self.params.max_recv_data_segment_length.to_string(),
-        ));
-        params.push((
-            "MaxBurstLength".to_string(),
-            self.params.max_burst_length.to_string(),
-        ));
-        params.push((
-            "FirstBurstLength".to_string(),
-            self.params.first_burst_length.to_string(),
-        ));
-        params.push((
-            "DefaultTime2Wait".to_string(),
-            self.params.default_time2wait.to_string(),
-        ));
-        params.push((
-            "DefaultTime2Retain".to_string(),
-            self.params.default_time2retain.to_string(),
-        ));
-        params.push((
-            "MaxOutstandingR2T".to_string(),
-            self.params.max_outstanding_r2t.to_string(),
-        ));
-        params.push((
-            "DataPDUInOrder".to_string(),
-            if self.params.data_pdu_in_order { "Yes" } else { "No" }.to_string(),
-        ));
-        params.push((
-            "DataSequenceInOrder".to_string(),
-            if self.params.data_sequence_in_order { "Yes" } else { "No" }.to_string(),
-        ));
-        params.push((
-            "ErrorRecoveryLevel".to_string(),
-            self.params.error_recovery_level.to_string(),
-        ));
-        params.push((
-            "ImmediateData".to_string(),
-            if self.params.immediate_data { "Yes" } else { "No" }.to_string(),
-        ));
-        params.push((
-            "InitialR2T".to_string(),
-            if self.params.initial_r2t { "Yes" } else { "No" }.to_string(),
-        ));
-        params.push((
-            "HeaderDigest".to_string(),
-            match self.params.header_digest {
-                DigestType::None => "None",
-                DigestType::CRC32C => "CRC32C",
-            }.to_string(),
-        ));
-        params.push((
-            "DataDigest".to_string(),
-            match self.params.data_digest {
-                DigestType::None => "None",
-                DigestType::CRC32C => "CRC32C",
-            }.to_string(),
-        ));
+        params.extend(self.params.operational_response_params());
 
         params
     }
@@ -890,16 +941,16 @@ impl IscsiSession {
                     // Security → Full Feature Phase
                     self.state = SessionState::FullFeaturePhase;
                     // Only assign TSIH for Normal sessions, not Discovery
-                    if self.session_type == SessionType::Normal {
+                    if self.tsih == 0 && self.session_type == SessionType::Normal {
                         self.tsih = self.generate_tsih();
                     }
                     (login.csg, login.nsg, true) // Echo back the transition
                 }
                 (1, 3) => {
-                    // Login Op Neg → Full Feature Phase
+                    // Login Op Neg → Full Feature Phase (or late Login already in FFP)
                     self.state = SessionState::FullFeaturePhase;
                     // Only assign TSIH for Normal sessions, not Discovery
-                    if self.session_type == SessionType::Normal {
+                    if self.tsih == 0 && self.session_type == SessionType::Normal {
                         self.tsih = self.generate_tsih();
                     }
                     (login.csg, login.nsg, true) // Echo back the transition
@@ -1234,7 +1285,7 @@ mod tests {
     #[test]
     fn test_session_params_default() {
         let params = SessionParams::default();
-        assert_eq!(params.max_recv_data_segment_length, 8192);
+        assert_eq!(params.max_recv_data_segment_length, 65536);
         assert_eq!(params.max_burst_length, 262144);
         assert_eq!(params.first_burst_length, 65536);
         assert_eq!(params.error_recovery_level, 0);
@@ -1337,14 +1388,45 @@ mod tests {
     fn test_generate_response_params() {
         let mut session = IscsiSession::new();
         session.params.target_name = "iqn.2025-12.local:storage".to_string();
-        session.params.max_recv_data_segment_length = 8192;
 
         let params = session.generate_response_params();
 
-        // Check that required params are present
-        // Note: SessionType should NOT be in response (it's initiator-only per RFC 3720)
+        // Declarative MaxRecv is always sent. Other operational keys are
+        // echoed only if the initiator offered them (Windows interop).
         assert!(params.iter().any(|(k, _)| k == "MaxRecvDataSegmentLength"));
-        assert!(params.iter().any(|(k, _)| k == "MaxBurstLength"));
+        assert!(!params.iter().any(|(k, _)| k == "MaxBurstLength"));
+        assert!(!params.iter().any(|(k, _)| k == "SessionType"));
+
+        session.apply_initiator_param("MaxBurstLength", "131072");
+        let params = session.generate_response_params();
+        assert!(params.iter().any(|(k, v)| k == "MaxBurstLength" && v == "131072"));
+    }
+
+    #[test]
+    fn test_operational_response_echoes_only_offered_keys() {
+        let mut params = SessionParams::default();
+        params.note_offered("HeaderDigest");
+        params.note_offered("DefaultTime2Wait");
+        params.note_offered("IFMarker");
+
+        let keys: Vec<String> = params
+            .operational_response_params()
+            .into_iter()
+            .map(|(k, _)| k)
+            .collect();
+        assert_eq!(
+            keys,
+            vec![
+                "MaxRecvDataSegmentLength",
+                "DefaultTime2Wait",
+                "HeaderDigest",
+                "IFMarker",
+            ]
+        );
+        assert_eq!(
+            params.operational_value("IFMarker").as_deref(),
+            Some("No")
+        );
     }
 
     #[test]

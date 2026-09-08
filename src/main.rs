@@ -24,16 +24,26 @@ use tracing_subscriber::EnvFilter;
 fn main() {
     let cli = Cli::parse();
 
-    // Prefer RUST_LOG when set (docker-compose), otherwise --log / default.
-    let filter = EnvFilter::try_from_default_env()
-        .or_else(|_| EnvFilter::try_new(&cli.log))
-        .unwrap_or_else(|_| EnvFilter::new("info"));
-    tracing_subscriber::fmt().with_env_filter(filter).init();
+    // RUST_LOG wins when set (docker-compose). Otherwise --log, default warn.
+    tracing_subscriber::fmt()
+        .with_env_filter(resolve_env_filter(
+            std::env::var("RUST_LOG").ok().as_deref(),
+            &cli.log,
+        ))
+        .init();
     let _ = tracing_log::LogTracer::init();
 
     if let Err(e) = run(cli) {
         error!(error = %e, "fatal");
         std::process::exit(1);
+    }
+}
+
+/// Prefer `RUST_LOG` (including Compose) over `--log`. Empty/invalid env falls back.
+fn resolve_env_filter(rust_log: Option<&str>, cli_log: &str) -> EnvFilter {
+    match rust_log.map(str::trim).filter(|s| !s.is_empty()) {
+        Some(val) => EnvFilter::try_new(val).unwrap_or_else(|_| EnvFilter::new("warn")),
+        None => EnvFilter::try_new(cli_log).unwrap_or_else(|_| EnvFilter::new("warn")),
     }
 }
 
@@ -254,8 +264,27 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
 
 #[cfg(test)]
 mod tests {
-    use super::{resolve_advertise, resolve_portals};
+    use super::{resolve_advertise, resolve_env_filter, resolve_portals};
     use iscsi_s3::config::Config;
+
+    #[test]
+    fn rust_log_overrides_cli_log() {
+        let filter = resolve_env_filter(Some("info,iscsi_target=debug"), "warn");
+        let s = filter.to_string();
+        assert!(s.contains("iscsi_target=debug"), "{s}");
+    }
+
+    #[test]
+    fn empty_rust_log_uses_cli_default() {
+        let filter = resolve_env_filter(Some("  "), "warn");
+        assert_eq!(filter.to_string(), "warn");
+    }
+
+    #[test]
+    fn missing_rust_log_uses_cli() {
+        let filter = resolve_env_filter(None, "error");
+        assert_eq!(filter.to_string(), "error");
+    }
 
     #[test]
     fn advertise_host_only_uses_bind_port() {

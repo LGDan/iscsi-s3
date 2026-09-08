@@ -1,41 +1,32 @@
 services:
-  minio:
-    image: minio/minio:latest
-    command: server /data --console-address ":9001"
+  rclone:
+    image: rclone/rclone:latest
+    # Default serve bind is 127.0.0.1:8080; listen on all interfaces for Compose.
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        mkdir -p /ext-hd/iscsi
+        exec rclone serve s3 /ext-hd \
+          --addr :9000 \
+          --auth-key minioadmin,minioadmin \
+          --dir-cache-time 1s
     ports:
       - "9000:9000"
-      - "9001:9001"
-    environment:
-      MINIO_ROOT_USER: minioadmin
-      MINIO_ROOT_PASSWORD: minioadmin
     volumes:
-      - minio-data:/data
+      - /Volumes/Music/Misc/S3:/ext-hd
+    restart: unless-stopped
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      test: ["CMD-SHELL", "wget -q -S -O /dev/null http://127.0.0.1:9000/ 2>&1 | grep -q HTTP"]
       interval: 3s
       timeout: 5s
       retries: 20
       start_period: 5s
 
-  createbuckets:
-    image: minio/mc:latest
-    depends_on:
-      minio:
-        condition: service_healthy
-    entrypoint: >
-      /bin/sh -c "
-      set -e;
-      mc alias set local http://minio:9000 minioadmin minioadmin;
-      mc mb -p local/iscsi || true;
-      mc anonymous set none local/iscsi;
-      echo bucket-ready;
-      "
-
   iscsi-s3:
     build: .
     depends_on:
-      createbuckets:
-        condition: service_completed_successfully
+      rclone:
+        condition: service_healthy
     ports:
       - "3260:3260"
       # Host 9091 avoids clashing with Prometheus on 9090
@@ -43,12 +34,12 @@ services:
     volumes:
       #- ./config.docker.toml:/etc/iscsi-s3/config.toml:ro
       - ./config.integration.toml:/etc/iscsi-s3/config.toml:ro
-      - /Volumes/Music/Misc/S3:/ext-hd
     environment:
       AWS_ACCESS_KEY_ID: minioadmin
       AWS_SECRET_ACCESS_KEY: minioadmin
-      # Uncomment this to enable debug logging
+      # Default: warnings and errors only. For login/SCSI traces:
       # RUST_LOG: info,iscsi_s3=debug,iscsi_target=debug
+      RUST_LOG: warn
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:9090/health"]
@@ -101,6 +92,5 @@ services:
   #   restart: "no"
 
 volumes:
-  minio-data:
   prometheus-data:
   grafana-data:

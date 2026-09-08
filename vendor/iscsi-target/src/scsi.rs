@@ -416,9 +416,10 @@ impl ScsiHandler {
     fn handle_inquiry_vpd(page_code: u8, alloc_len: usize, device: &dyn ScsiBlockDevice, target_name: Option<&str>) -> ScsiResult<ScsiResponse> {
         match page_code {
             0x00 => {
-                // Supported VPD pages
-                let mut data = vec![0x00, 0x00, 0x00, 4]; // Device type, page code, reserved, page length
-                data.extend_from_slice(&[0x00, 0x80, 0x83, 0xB0]); // Supported pages
+                // Supported VPD pages (SPC-3: page length at byte 3)
+                const PAGES: &[u8] = &[0x00, 0x80, 0x83, 0xB0, 0xB1, 0xB2];
+                let mut data = vec![0x00, 0x00, 0x00, PAGES.len() as u8];
+                data.extend_from_slice(PAGES);
                 data.truncate(alloc_len.min(data.len()));
                 Ok(ScsiResponse::good(data))
             }
@@ -484,6 +485,30 @@ impl ScsiHandler {
                 // Optimal transfer length
                 BigEndian::write_u32(&mut data[12..16], 128); // 128 blocks optimal
 
+                data.truncate(alloc_len.min(data.len()));
+                Ok(ScsiResponse::good(data))
+            }
+            0xB1 => {
+                // Block Device Characteristics (SBC-3). Windows queries this
+                // after VPD 0x00; CHECK CONDITION here drops the session.
+                let mut data = vec![0u8; 64];
+                data[0] = 0x00;
+                data[1] = 0xB1;
+                BigEndian::write_u16(&mut data[2..4], 60);
+                // Medium rotation rate 0001h = non-rotating (SSD/virtual)
+                BigEndian::write_u16(&mut data[4..6], 0x0001);
+                data.truncate(alloc_len.min(data.len()));
+                Ok(ScsiResponse::good(data))
+            }
+            0xB2 => {
+                // Logical Block Provisioning. LBPU=0 so we do not advertise UNMAP.
+                let mut data = vec![0u8; 8];
+                data[0] = 0x00;
+                data[1] = 0xB2;
+                BigEndian::write_u16(&mut data[2..4], 4);
+                data[4] = 0; // threshold exponent
+                data[5] = 0; // LBPU/LBPWS/LBPRZ off
+                data[6] = 0; // provisioning type = not reported
                 data.truncate(alloc_len.min(data.len()));
                 Ok(ScsiResponse::good(data))
             }
@@ -884,6 +909,28 @@ mod tests {
         let response = ScsiHandler::handle_command(&cdb, &device, None).unwrap();
         assert_eq!(response.status, scsi_status::GOOD);
         assert_eq!(response.data[1], 0x00); // Page code 0
+        assert!(response.data[4..].contains(&0xB1));
+        assert!(response.data[4..].contains(&0xB2));
+    }
+
+    #[test]
+    fn test_inquiry_vpd_block_device_characteristics() {
+        let device = MockDevice::new(1000, 512);
+        let cdb = [0x12, 0x01, 0xB1, 0, 64, 0];
+        let response = ScsiHandler::handle_command(&cdb, &device, None).unwrap();
+        assert_eq!(response.status, scsi_status::GOOD);
+        assert_eq!(response.data[1], 0xB1);
+        assert_eq!(&response.data[4..6], &[0x00, 0x01]);
+    }
+
+    #[test]
+    fn test_inquiry_vpd_logical_block_provisioning() {
+        let device = MockDevice::new(1000, 512);
+        let cdb = [0x12, 0x01, 0xB2, 0, 8, 0];
+        let response = ScsiHandler::handle_command(&cdb, &device, None).unwrap();
+        assert_eq!(response.status, scsi_status::GOOD);
+        assert_eq!(response.data[1], 0xB2);
+        assert_eq!(response.data[5] & 0x80, 0); // LBPU off
     }
 
     #[test]

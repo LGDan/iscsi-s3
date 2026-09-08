@@ -11,7 +11,7 @@ Lowest → highest:
 
 Volumes (`[[volumes]]`) are defined only in TOML. Env/CLI override shared settings (bind, advertise, bucket, endpoint, region, path style, logging). Multi-portal lists (`portals`), `instance`, and most auth fields are TOML-oriented; auth secrets may also come from env (`ISCSI_S3_AUTH__SECRET`, etc.). There are no CLI flags for CHAP secrets.
 
-`RUST_LOG` is preferred when set; otherwise `--log` applies (Compose commonly sets `RUST_LOG`).
+`RUST_LOG` is preferred when set; otherwise `--log` applies (default `warn`). Compose sets `RUST_LOG=warn`.
 
 ## Minimal TOML
 
@@ -166,10 +166,11 @@ iscsi-s3 -c config.toml --log info,iscsi_s3=debug,iscsi_target=debug
 
 ## Logging
 
-Useful filters:
+Default is `warn` (warnings and errors only). Useful filters:
 
 | Filter | Use |
 |--------|-----|
+| `warn` | Default — problems only |
 | `info` | Connection lifecycle, login, SCSI probes |
 | `iscsi_s3=debug` | Application detail |
 | `iscsi_target=debug` | PDU / bulk I/O detail |

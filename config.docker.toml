@@ -1,4 +1,4 @@
-# Docker Compose / container defaults (MinIO service hostname)
+# Docker Compose / container defaults (rclone serve s3)
 bind = "0.0.0.0:3260"
 # Reachable address for SendTargets (host publishes 3260).
 advertise = "127.0.0.1"
@@ -7,7 +7,7 @@ advertise = "127.0.0.1"
 [s3]
 bucket = "iscsi"
 region = "us-east-1"
-endpoint = "http://minio:9000"
+endpoint = "http://rclone:9000"
 force_path_style = true
 access_key_id = "minioadmin"
 secret_access_key = "minioadmin"
