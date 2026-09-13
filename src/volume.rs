@@ -90,7 +90,12 @@ pub fn open_volume(
         labels.clone(),
         Arc::clone(&metrics),
     );
-    let wrapped = WriteCachedStore::wrap(cached, &vol.write_cache, &vol.name)?;
+    let wrapped = WriteCachedStore::wrap(
+        cached,
+        &vol.write_cache,
+        &vol.write_buffer,
+        &vol.name,
+    )?;
     let store = Arc::new(wrapped);
 
     metrics.set_volume_capacity(&labels, store.capacity());

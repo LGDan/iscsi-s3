@@ -25,9 +25,10 @@ name = "disk0"
 iqn = "iqn.2026-09.local.iscsi-s3:disk0"
 prefix = "disks/disk0"
 capacity = "64GiB"
-chunk_size = "8MiB"
+chunk_size = "1MiB"
 storage = "cow"
 write_cache = { mode = "memory", max_bytes = "512MiB" }
+write_buffer = { max_bytes = "256MiB" }
 
 [[volumes]]
 name = "disk1"

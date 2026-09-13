@@ -36,6 +36,7 @@ pub const BOTTLENECK_COMPONENTS: &[&str] = &[
     "s3_write",
     "read_cache",
     "write_cache",
+    "write_buffer",
     "iscsi",
 ];
 
@@ -168,6 +169,9 @@ pub struct Metrics {
     cache_ops: IntCounterVec,
     cache_bytes: IntGauge,
     cache_entries: IntGauge,
+    write_cache_bytes: IntGauge,
+    write_buffer_bytes: IntGauge,
+    write_buffer_chunks: IntGauge,
     volume_capacity_bytes: IntGaugeVec,
     iscsi_connections: IntGauge,
     iscsi_sessions: IntGauge,
@@ -242,6 +246,18 @@ impl Metrics {
             "iscsi_s3_cache_entries",
             "Current number of cached chunks",
         )?;
+        let write_cache_bytes = IntGauge::new(
+            "iscsi_s3_write_cache_bytes",
+            "Current dirty write-cache bytes, summed across volumes",
+        )?;
+        let write_buffer_bytes = IntGauge::new(
+            "iscsi_s3_write_buffer_bytes",
+            "Queued plus in-flight write-buffer snapshot bytes, summed across volumes",
+        )?;
+        let write_buffer_chunks = IntGauge::new(
+            "iscsi_s3_write_buffer_chunks",
+            "Queued plus in-flight write-buffer snapshots, summed across volumes",
+        )?;
 
         let volume_capacity_bytes = IntGaugeVec::new(
             Opts::new(
@@ -290,6 +306,9 @@ impl Metrics {
         registry.register(Box::new(cache_ops.clone()))?;
         registry.register(Box::new(cache_bytes.clone()))?;
         registry.register(Box::new(cache_entries.clone()))?;
+        registry.register(Box::new(write_cache_bytes.clone()))?;
+        registry.register(Box::new(write_buffer_bytes.clone()))?;
+        registry.register(Box::new(write_buffer_chunks.clone()))?;
         registry.register(Box::new(volume_capacity_bytes.clone()))?;
         registry.register(Box::new(iscsi_connections.clone()))?;
         registry.register(Box::new(iscsi_sessions.clone()))?;
@@ -311,6 +330,9 @@ impl Metrics {
             cache_ops,
             cache_bytes,
             cache_entries,
+            write_cache_bytes,
+            write_buffer_bytes,
+            write_buffer_chunks,
             volume_capacity_bytes,
             iscsi_connections,
             iscsi_sessions,
@@ -410,6 +432,15 @@ impl Metrics {
     pub fn set_cache_stats(&self, bytes: u64, entries: usize) {
         self.cache_bytes.set(bytes as i64);
         self.cache_entries.set(entries as i64);
+    }
+
+    pub fn set_write_cache_bytes(&self, bytes: u64) {
+        self.write_cache_bytes.set(bytes as i64);
+    }
+
+    pub fn set_write_buffer_stats(&self, bytes: u64, chunks: usize) {
+        self.write_buffer_bytes.set(bytes as i64);
+        self.write_buffer_chunks.set(chunks as i64);
     }
 
     pub fn set_iscsi_gauges(&self, connections: usize, sessions: usize) {
@@ -555,6 +586,8 @@ pub fn spawn_metrics_server(
     metrics: Arc<Metrics>,
     gauge_source: impl Fn() -> (usize, usize) + Send + Sync + 'static,
     cache_stats: impl Fn() -> (u64, usize) + Send + Sync + 'static,
+    write_cache_bytes: impl Fn() -> u64 + Send + Sync + 'static,
+    write_buffer_stats: impl Fn() -> (u64, usize) + Send + Sync + 'static,
 ) -> Result<(), String> {
     let server = Server::http(&bind).map_err(|e| format!("metrics bind {bind}: {e}"))?;
     info!(%bind, "prometheus metrics listening");
@@ -570,6 +603,9 @@ pub fn spawn_metrics_server(
                         metrics.set_iscsi_gauges(conns, sessions);
                         let (bytes, entries) = cache_stats();
                         metrics.set_cache_stats(bytes, entries);
+                        metrics.set_write_cache_bytes(write_cache_bytes());
+                        let (buf_bytes, buf_chunks) = write_buffer_stats();
+                        metrics.set_write_buffer_stats(buf_bytes, buf_chunks);
                         let body = metrics.gather_text();
                         let response = Response::from_string(body).with_header(
                             Header::from_bytes(
@@ -594,4 +630,24 @@ pub fn spawn_metrics_server(
         .map_err(|e| format!("spawn metrics thread: {e}"))?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn write_cache_bytes_gauge() {
+        let metrics = Metrics::new().unwrap();
+        metrics.set_write_cache_bytes(4096);
+        let text = metrics.gather_text();
+        assert!(
+            text.contains("iscsi_s3_write_cache_bytes 4096"),
+            "{text}"
+        );
+        metrics.set_write_buffer_stats(8192, 2);
+        let text = metrics.gather_text();
+        assert!(text.contains("iscsi_s3_write_buffer_bytes 8192"), "{text}");
+        assert!(text.contains("iscsi_s3_write_buffer_chunks 2"), "{text}");
+    }
 }

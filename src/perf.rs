@@ -34,6 +34,7 @@ pub enum Component {
     S3Write,
     ReadCache,
     WriteCache,
+    WriteBuffer,
     Iscsi,
 }
 
@@ -44,6 +45,7 @@ impl Component {
             Self::S3Write => "s3_write",
             Self::ReadCache => "read_cache",
             Self::WriteCache => "write_cache",
+            Self::WriteBuffer => "write_buffer",
             Self::Iscsi => "iscsi",
         }
     }
@@ -65,6 +67,9 @@ pub struct WindowSample {
     pub write_cache_max: u64,
     /// Dirty bytes at the start of the window (budgeted volumes only).
     pub write_cache_dirty_prev: u64,
+    pub write_buffer_bytes: u64,
+    pub write_buffer_max: u64,
+    pub write_buffer_bytes_prev: u64,
 }
 
 impl WindowSample {
@@ -75,6 +80,9 @@ impl WindowSample {
         write_cache_dirty: u64,
         write_cache_max: u64,
         write_cache_dirty_prev: u64,
+        write_buffer_bytes: u64,
+        write_buffer_max: u64,
+        write_buffer_bytes_prev: u64,
     ) -> Self {
         Self {
             scsi_read: counters.scsi_read,
@@ -89,6 +97,9 @@ impl WindowSample {
             write_cache_dirty,
             write_cache_max,
             write_cache_dirty_prev,
+            write_buffer_bytes,
+            write_buffer_max,
+            write_buffer_bytes_prev,
         }
     }
 }
@@ -139,6 +150,9 @@ pub fn decide(sample: &WindowSample) -> Option<Component> {
     if scsi_ops < MIN_OPS && s3_ops < MIN_OPS {
         return None;
     }
+    if write_buffer_pinned(sample) {
+        return Some(Component::WriteBuffer);
+    }
     if write_cache_pinned(sample) {
         return Some(Component::WriteCache);
     }
@@ -164,6 +178,22 @@ fn consider(best: &mut Option<(Component, f64)>, component: Component, score: f6
         Some((_, prev)) if score <= *prev => {}
         _ => *best = Some((component, score)),
     }
+}
+
+fn write_buffer_pinned(sample: &WindowSample) -> bool {
+    if sample.write_buffer_max == 0 || sample.scsi_write.count == 0 {
+        return false;
+    }
+    let fill = sample.write_buffer_bytes as f64 / sample.write_buffer_max as f64;
+    if fill < WRITE_CACHE_FILL {
+        return false;
+    }
+    let prev = sample.write_buffer_bytes_prev;
+    if prev == 0 || sample.write_buffer_bytes >= prev {
+        return true;
+    }
+    let dropped = (prev - sample.write_buffer_bytes) as f64 / prev as f64;
+    dropped < WRITE_CACHE_MIN_DRAIN
 }
 
 fn write_cache_pinned(sample: &WindowSample) -> bool {
@@ -244,6 +274,21 @@ fn iscsi_score(sample: &WindowSample) -> Option<f64> {
     Some(scsi - s3)
 }
 
+/// Queued plus in-flight buffer bytes, and budget, summed over volumes with a buffer.
+fn write_buffer_fill(stores: &[Arc<VolumeStore>]) -> (u64, u64) {
+    let mut bytes = 0u64;
+    let mut max = 0u64;
+    for store in stores {
+        let budget = store.buffer_max_bytes();
+        if budget == 0 {
+            continue;
+        }
+        bytes = bytes.saturating_add(store.buffer_bytes());
+        max = max.saturating_add(budget);
+    }
+    (bytes, max)
+}
+
 /// Dirty bytes and budget summed over volumes that have a finite write-cache limit.
 fn write_cache_fill(stores: &[Arc<VolumeStore>]) -> (u64, u64) {
     let mut dirty = 0u64;
@@ -280,6 +325,7 @@ pub fn spawn_perf_analyser(
         .spawn(move || {
             let mut prev = metrics.perf_counters();
             let (mut prev_dirty, _) = write_cache_fill(&stores);
+            let (mut prev_buffer, _) = write_buffer_fill(&stores);
             let mut tracker = BottleneckTracker::new();
             let mut shown = tracker.lit();
             loop {
@@ -288,6 +334,7 @@ pub fn spawn_perf_analyser(
                 let counters = now.delta(prev);
                 prev = now;
                 let (dirty, write_max) = write_cache_fill(&stores);
+                let (buffer_bytes, buffer_max) = write_buffer_fill(&stores);
                 let (used, _) = cache.stats();
                 let sample = WindowSample::from_counters(
                     counters,
@@ -296,8 +343,12 @@ pub fn spawn_perf_analyser(
                     dirty,
                     write_max,
                     prev_dirty,
+                    buffer_bytes,
+                    buffer_max,
+                    prev_buffer,
                 );
                 prev_dirty = dirty;
+                prev_buffer = buffer_bytes;
 
                 let winner = decide(&sample);
                 let next = tracker.observe(winner);
@@ -322,6 +373,8 @@ pub fn spawn_perf_analyser(
                     read_cache_max = sample.read_cache_max,
                     write_cache_dirty = sample.write_cache_dirty,
                     write_cache_max = sample.write_cache_max,
+                    write_buffer_bytes = sample.write_buffer_bytes,
+                    write_buffer_max = sample.write_buffer_max,
                     "performance window"
                 );
             }
@@ -357,6 +410,9 @@ mod tests {
             write_cache_dirty: 0,
             write_cache_max: 0,
             write_cache_dirty_prev: 0,
+            write_buffer_bytes: 0,
+            write_buffer_max: 0,
+            write_buffer_bytes_prev: 0,
         }
     }
 
@@ -387,6 +443,20 @@ mod tests {
         sample.scsi_read = lat(10, 80.0);
         sample.s3_get = lat(3, 200.0);
         assert_eq!(decide(&sample), None);
+    }
+
+    #[test]
+    fn pinned_write_buffer_wins_over_write_cache() {
+        let mut sample = idle();
+        sample.scsi_write = lat(10, 90.0);
+        sample.s3_put = lat(10, 80.0);
+        sample.write_cache_max = 1000;
+        sample.write_cache_dirty = 900;
+        sample.write_cache_dirty_prev = 900;
+        sample.write_buffer_max = 1000;
+        sample.write_buffer_bytes = 900;
+        sample.write_buffer_bytes_prev = 900;
+        assert_eq!(decide(&sample), Some(Component::WriteBuffer));
     }
 
     #[test]

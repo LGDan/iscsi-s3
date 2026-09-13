@@ -327,6 +327,9 @@ pub struct VolumeConfig {
     /// Optional write-back cache (default `none` = write-through to S3).
     #[serde(default)]
     pub write_cache: WriteCacheConfig,
+    /// Optional queue of chunk snapshots waiting on PutObject (default off).
+    #[serde(default)]
+    pub write_buffer: WriteBufferConfig,
 }
 
 /// Where SCSI writes are acknowledged before S3.
@@ -362,6 +365,14 @@ pub struct WriteCacheConfig {
     pub path: Option<PathBuf>,
     /// Dirty-data budget. `0` = unlimited. When set, oldest dirty chunks
     /// flush to S3 until the set fits.
+    #[serde(default = "default_write_cache_max", with = "bytesize_serde")]
+    pub max_bytes: u64,
+}
+
+/// Background queue of chunk snapshots between the write cache and PutObject.
+/// `max_bytes = 0` disables it (writes leave the cache only on flush or cache eviction).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WriteBufferConfig {
     #[serde(default = "default_write_cache_max", with = "bytesize_serde")]
     pub max_bytes: u64,
 }
@@ -614,6 +625,18 @@ impl Config {
                 return Err(ConfigError::Invalid(format!(
                     "volume {}: write_cache.max_bytes ({}) must be 0 (unlimited) or at least chunk_size ({})",
                     vol.name, vol.write_cache.max_bytes, vol.chunk_size
+                )));
+            }
+            if vol.write_buffer.max_bytes > 0 && vol.write_buffer.max_bytes < vol.chunk_size {
+                return Err(ConfigError::Invalid(format!(
+                    "volume {}: write_buffer.max_bytes ({}) must be 0 (disabled) or at least chunk_size ({})",
+                    vol.name, vol.write_buffer.max_bytes, vol.chunk_size
+                )));
+            }
+            if vol.write_buffer.max_bytes > 0 && vol.write_cache.mode == WriteCacheMode::None {
+                return Err(ConfigError::Invalid(format!(
+                    "volume {}: write_buffer requires write_cache.mode of memory or disk",
+                    vol.name
                 )));
             }
             match vol.write_cache.mode {
@@ -1004,5 +1027,54 @@ write_cache = {{ mode = "memory", max_bytes = "1KiB" }}
             err.to_string().contains("write_cache.max_bytes"),
             "{err}"
         );
+    }
+
+    #[test]
+    fn config_rejects_write_buffer_below_chunk() {
+        let err = load_write_buffer_case(
+            r#"write_cache = { mode = "memory" }
+write_buffer = { max_bytes = "1KiB" }"#,
+        );
+        assert!(err.contains("write_buffer.max_bytes"), "{err}");
+    }
+
+    #[test]
+    fn config_rejects_write_buffer_without_write_cache() {
+        let err = load_write_buffer_case(r#"write_buffer = { max_bytes = "4MiB" }"#);
+        assert!(err.contains("write_buffer requires write_cache"), "{err}");
+    }
+
+    fn load_write_buffer_case(volume_extra: &str) -> String {
+        let mut file = NamedTempFile::new().unwrap();
+        writeln!(
+            file,
+            r#"
+bind = "0.0.0.0:3260"
+[s3]
+bucket = "iscsi"
+[[volumes]]
+name = "disk0"
+iqn = "iqn.2026-09.local:disk0"
+prefix = "disks/disk0"
+capacity = "1GiB"
+chunk_size = "4MiB"
+{volume_extra}
+"#
+        )
+        .unwrap();
+        let cli = Cli {
+            config: Some(file.path().to_path_buf()),
+            bind: None,
+            advertise: None,
+            bucket: None,
+            endpoint: None,
+            region: None,
+            force_path_style: None,
+            log: "info".into(),
+            metrics_bind: None,
+            no_metrics: false,
+            performance_optimiser: None,
+        };
+        Config::load(&cli).unwrap_err().to_string()
     }
 }

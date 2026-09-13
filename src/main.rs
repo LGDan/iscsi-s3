@@ -178,6 +178,7 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             storage,
             write_cache: vol.write_cache.mode.as_str().to_string(),
             write_cache_max_bytes: vol.write_cache.max_bytes,
+            write_buffer_max_bytes: vol.write_buffer.max_bytes,
         });
         info!(
             name = %opened.name,
@@ -217,6 +218,10 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     if cfg.metrics.enabled {
         let server_gauges = Arc::clone(&server);
         let cache_gauges = Arc::clone(&cache);
+        let write_cache_stores: Vec<_> = volume_stores
+            .iter()
+            .map(|handle| Arc::clone(&handle.store))
+            .collect();
         spawn_metrics_server(
             cfg.metrics.bind.clone(),
             Arc::clone(&metrics),
@@ -227,6 +232,21 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 )
             },
             move || cache_gauges.stats(),
+            {
+                let stores = write_cache_stores.clone();
+                move || stores.iter().map(|store| store.dirty_bytes()).sum()
+            },
+            move || {
+                let bytes = write_cache_stores
+                    .iter()
+                    .map(|store| store.buffer_bytes())
+                    .sum();
+                let chunks = write_cache_stores
+                    .iter()
+                    .map(|store| store.buffer_chunks())
+                    .sum();
+                (bytes, chunks)
+            },
         )?;
     } else {
         info!("prometheus metrics disabled");

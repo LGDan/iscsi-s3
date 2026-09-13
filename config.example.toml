@@ -65,6 +65,9 @@ capacity = "10GiB"
 # write_cache = { mode = "none" }
 # write_cache = { mode = "memory", max_bytes = "64MiB" }
 # write_cache = { mode = "disk", path = "/var/cache/iscsi-s3/disk0", max_bytes = "1GiB" }
+# Optional S3 write buffer (default 0 = disabled). Requires memory or disk write cache.
+# Quiet chunks and cache overflow are Put in the background, up to this many snapshot bytes.
+# write_buffer = { max_bytes = "64MiB" }
 
 [[volumes]]
 name = "disk1"

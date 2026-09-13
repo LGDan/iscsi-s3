@@ -36,7 +36,9 @@ Optional **per-volume write-back** (`WriteCachedStore` in [`src/write_cache.rs`]
 | `memory` | Dirty whole chunks in RAM; SCSI write returns after the patch | Dirty data lost |
 | `disk` | Same plus atomic files under `write_cache.path` | Recovered on reopen, then flushed |
 
-Optional `write_cache.max_bytes` (default `0` = unlimited) caps dirty data. When the set would exceed the budget, the **oldest** dirty chunks flush to S3 (and disk files are removed) until it fits. A non-zero budget must be at least `chunk_size` — the cache stores whole chunks.
+Optional `write_cache.max_bytes` (default `0` = unlimited) caps dirty data. When the set would exceed the budget, the **oldest** dirty chunks leave the set until it fits: they are put to S3 immediately if the write buffer is disabled, or handed to the buffer if it is enabled. A non-zero budget must be at least `chunk_size` — the cache stores whole chunks.
+
+`iscsi_s3_write_cache_bytes` is the current dirty size in bytes, summed across volumes (updated on each `/metrics` scrape). It is a gauge, not a counter. Bytes already handed to the write buffer are not included.
 
 Partial SCSI writes still RMW a full chunk, but the Get/Put to S3 is deferred until:
 
@@ -49,6 +51,22 @@ Partial SCSI writes still RMW a full chunk, but the Get/Put to S3 is deferred un
 Reads serve dirty chunks first. Snapshot **restore/clone dest** discards dirty data so it cannot overlay restored pointers.
 
 `mode = "disk"` requires a unique `path` per volume. Do not share a write-cache directory across volumes or hosts. Multi-instance MPIO plus write-back is **unsafe** (same as a hot read cache).
+
+## Write buffer
+
+Optional next stage after the dirty set and before `PutObject` (`write_buffer.max_bytes`, default `0`). `0` keeps the behaviour above: Puts only on flush or inline budget eviction. A non-zero budget requires a memory or disk write cache and must be at least `chunk_size`.
+
+The write cache stays the coalesce window. The buffer is the queue of chunk snapshots waiting on S3. Bytes leave the dirty set on handoff, so `iscsi_s3_write_cache_bytes` and `iscsi_s3_write_buffer_bytes` do not overlap. A pinned cache means the coalesce window is full. A pinned buffer means Puts are not keeping up.
+
+One drain thread per volume (`iscsi-s3-wbuf`) puts one chunk at a time. A chunk is handed off when it has been quiet for 100ms, or immediately if the write cache is over budget and needs the oldest slot. Streaming writes do not wait out the quiet period.
+
+A later write to a handed-off index goes back into the dirty map as a newer generation. It does not mutate the snapshot already queued. Put completion drops that buffer snapshot only. A stale Put does not clear a newer dirty copy. In disk mode the local file stays until the Put succeeds and the dirty map does not hold a newer generation.
+
+Reads check the dirty map, then the buffer, then the inner store. SCSI SYNCHRONIZE CACHE, shutdown, and I/O lock pause the worker, push every dirty chunk into the buffer, and wait until the buffer is empty. Snapshot restore and clone dest drop dirty and queued snapshots without putting, and wait until any in-flight Put has finished.
+
+If the buffer is at `max_bytes` and the cache needs to hand off, the SCSI write blocks until a slot frees. Unlimited write cache still hands off quiet chunks; it only blocks if a handoff is required to free cache space.
+
+`iscsi_s3_write_buffer_bytes` is queued plus in-flight snapshot bytes, summed across volumes. `iscsi_s3_write_buffer_chunks` is the count of those snapshots. Both are scrape-time gauges.
 
 ## What “data loss” means here
 

@@ -235,7 +235,7 @@ Enabling starts empty (cold) at the requested (or last) budget.
 | Rejected (reported, need restart) | Notes |
 |-----------------------------------|--------|
 | `bind` | Listener cannot move |
-| `volumes` | Add/remove/iqn/capacity/geometry/write_cache |
+| `volumes` | Add/remove/iqn/capacity/geometry/write_cache/write_buffer |
 | `s3` bucket/endpoint/region/path-style | Client already built |
 | `auth` / CHAP | Bound into target table at start |
 | `performance_optimiser` | Analyser thread starts only at process start |

@@ -13,7 +13,7 @@ services:
     ports:
       - "9000:9000"
     volumes:
-      - /Volumes/Music/Misc/S3:/ext-hd
+      - /Volumes/T5/iscsi:/ext-hd
     restart: unless-stopped
     healthcheck:
       test: ["CMD-SHELL", "wget -q -S -O /dev/null http://127.0.0.1:9000/ 2>&1 | grep -q HTTP"]

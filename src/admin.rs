@@ -30,6 +30,7 @@ pub struct VolumeSummary {
     pub storage: String,
     pub write_cache: String,
     pub write_cache_max_bytes: u64,
+    pub write_buffer_max_bytes: u64,
 }
 
 /// Live store handle used by admin write paths (same Arc as the iSCSI device).
@@ -1389,6 +1390,7 @@ fn volumes_structurally_changed(current: &AdminSnapshot, new_cfg: &Config) -> bo
             || cur.storage != vol.storage.as_str()
             || cur.write_cache != vol.write_cache.mode.as_str()
             || cur.write_cache_max_bytes != vol.write_cache.max_bytes
+            || cur.write_buffer_max_bytes != vol.write_buffer.max_bytes
         {
             return true;
         }
@@ -1542,6 +1544,7 @@ mod tests {
                 storage: "legacy".into(),
                 write_cache: "none".into(),
                 write_cache_max_bytes: 0,
+                write_buffer_max_bytes: 0,
             }],
             cache_max_bytes: 1024,
             s3_bucket: None,
@@ -1572,6 +1575,7 @@ mod tests {
                 compression: Default::default(),
                 storage: Default::default(),
                 write_cache: Default::default(),
+                write_buffer: Default::default(),
             }],
         };
         let r = apply_safe_reload(&snap, &cfg, &cache).unwrap();
