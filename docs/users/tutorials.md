@@ -138,7 +138,7 @@ sudo iscsiadm -m node -T iqn.2026-09.local.iscsi-s3:disk1 -p 127.0.0.1:3260 --lo
 
 ## Tutorial 5 — Firmware iSCSI boot (Intel NIC / NUC)
 
-For a full **live ISO → install to LUN → chroot GRUB/initrd fixup** walkthrough (Ubuntu, Debian, Alpine) plus helper scripts, see **[Install OS on iSCSI](iscsi-os-install.md)**.
+For a full **live ISO → install to LUN → chroot GRUB/initrd fixup** walkthrough (Ubuntu, Debian, Alpine, Arch) plus helper scripts, see **[Install OS on iSCSI](iscsi-os-install.md)**.
 
 High-level firmware checklist that has been exercised with this project:
 

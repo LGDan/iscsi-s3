@@ -1,6 +1,6 @@
 # Install a Linux OS onto an iSCSI disk (live ISO + chroot)
 
-This guide installs **Ubuntu**, **Debian**, or **Alpine** onto an iscsi-s3 (or any open-iscsi) LUN using a **live ISO**, then fixes GRUB and the initramfs in a **chroot** so the machine can reboot from the network disk.
+This guide installs **Ubuntu**, **Debian**, **Alpine**, or an **Arch-based** distro onto an iscsi-s3 (or any open-iscsi) LUN using a **live ISO**, then fixes GRUB and the initramfs in a **chroot** so the machine can reboot from the network disk.
 
 It complements [firmware iSCSI boot notes](tutorials.md#tutorial-5--firmware-iscsi-boot-intel-nic--nuc) in the tutorials. Here the focus is software initiator install from a live environment (also works when firmware/iBFT will own the session later).
 
@@ -21,6 +21,7 @@ Helper scripts (run **inside** the chroot, or via `chroot /mnt …`):
 |--------|--------|
 | Ubuntu / Debian | [`scripts/iscsi-boot-fixup-debian.sh`](../../scripts/iscsi-boot-fixup-debian.sh) |
 | Alpine | [`scripts/iscsi-boot-fixup-alpine.sh`](../../scripts/iscsi-boot-fixup-alpine.sh) |
+| Arch, EndeavourOS, Manjaro, … | [`scripts/iscsi-boot-fixup-arch.sh`](../../scripts/iscsi-boot-fixup-arch.sh) |
 
 ## Prerequisites
 
@@ -127,7 +128,7 @@ mount --bind /dev /mnt/dev
 mount --bind /proc /mnt/proc
 mount --bind /sys /mnt/sys
 mount --bind /run /mnt/run
-# DNS for apt/apk inside chroot:
+# DNS for apt/apk/pacman inside chroot:
 cp -L /etc/resolv.conf /mnt/etc/resolv.conf
 ```
 
@@ -283,6 +284,68 @@ reboot
 
 ---
 
+## Arch-based (live ISO)
+
+Tested pattern: Arch, and other pacman + mkinitcpio systems (EndeavourOS, Manjaro). The official Arch ISO is already a root shell.
+
+### 1. Packages in the live session
+
+```bash
+# Wired DHCP is usually up already. Wireless: iwctl, then:
+pacman -Sy --noconfirm open-iscsi
+systemctl start iscsid
+```
+
+Then run the [shared discover/login](#discover-and-login) steps. Confirm the device with `lsblk`.
+
+### 2. Install onto the iSCSI disk
+
+Use `archinstall` and pick the iSCSI disk, or install by hand (`pacstrap` / `genfstab` / bootloader). Include a bootloader (GRUB or systemd-boot).
+
+Do **not** reboot when the installer finishes. If it already rebooted, boot the ISO again, log in, and remount the installed system.
+
+UEFI mount points differ from Debian:
+
+- **systemd-boot** (common on Arch): the ESP is usually mounted at `/boot`.
+- **GRUB**: kernels often stay on the root filesystem, and the ESP is `/boot/efi`.
+
+The ESP that holds the initramfs and bootloader config must be mounted at that same path **inside the chroot** before the fixup script runs. Otherwise `mkinitcpio` writes an image the firmware will not load.
+
+### 3. Remount and chroot
+
+Prefer `arch-chroot` (it bind-mounts `/dev`, `/proc`, `/sys` and copies resolv.conf):
+
+```bash
+# systemd-boot example: ESP at /boot
+mount /dev/sdb2 /mnt          # root
+mount /dev/sdb1 /mnt/boot     # ESP — adjust partition numbers
+
+# GRUB example instead: ESP at /boot/efi
+# mount /dev/sdb2 /mnt
+# mkdir -p /mnt/boot/efi && mount /dev/sdb1 /mnt/boot/efi
+
+cp /tmp/iscsi-boot-fixup-arch.sh /mnt/tmp/
+chmod +x /mnt/tmp/iscsi-boot-fixup-arch.sh
+arch-chroot /mnt /tmp/iscsi-boot-fixup-arch.sh \
+  --portal "$PORTAL" --iqn "$IQN"
+# add --username / --password if using CHAP
+# add --iface eth0 if DHCP must use a specific NIC (predictable names)
+```
+
+If `arch-chroot` is not available, use the [shared remount steps](#after-the-installer-exits) and `chroot /mnt …` instead.
+
+The script installs `open-iscsi` and `mkinitcpio-nfs-utils`, writes a node record, and adds an `iscsi` mkinitcpio hook that runs `iscsistart` before the root mount (iBFT if the firmware attached the LUN, otherwise the portal/IQN you passed). On a busybox initramfs it also inserts the `net` hook. On a systemd initramfs (runtime hooks are skipped) it installs `initrd-iscsi.service` instead. It adds `ip=dhcp` and `rd.neednet=1` to the bootloader cmdline, then runs `mkinitcpio -P`.
+
+### 4. Reboot
+
+```bash
+umount -R /mnt
+iscsiadm -m node -T "$IQN" -p "$PORTAL" --logout
+reboot
+```
+
+---
+
 ## What the fixup scripts do
 
 ### Debian / Ubuntu (`iscsi-boot-fixup-debian.sh`)
@@ -302,6 +365,18 @@ reboot
 4. Ensure `iscsi` feature is listed for mkinitfs; rebuild initramfs (`mkinitfs`).
 5. `grub-mkconfig -o /boot/grub/grub.cfg` (and note EFI path when applicable).
 
+### Arch-based (`iscsi-boot-fixup-arch.sh`)
+
+1. `pacman -Sy --needed --noconfirm open-iscsi mkinitcpio mkinitcpio-nfs-utils` (and `grub` / `efibootmgr` when missing).
+2. Write `/etc/iscsi/initiatorname.iscsi` and an open-iscsi node for `PORTAL`/`IQN` (optional CHAP). `node.startup = automatic`. Session timeouts are relaxed so a brief network blip does not fail the root disk.
+3. Enable `iscsid.service` and `iscsi.service`.
+4. Install an mkinitcpio `iscsi` hook that runs `iscsistart` (iBFT first, then the given portal/IQN). Busybox configs also get the `net` hook before `block`. Systemd configs get `initrd-iscsi.service` instead, because runtime hooks do not run when the `systemd` hook is in `HOOKS`.
+5. Add `ip=dhcp` (or `ip=:::::IFACE:dhcp` if `--iface` is set) and `rd.neednet=1` to GRUB, `/etc/kernel/cmdline`, and systemd-boot entries when those files exist.
+6. Append `_netdev,x-systemd.requires=iscsid.service` to the `/` line in `/etc/fstab`.
+7. `mkinitcpio -P`, and `grub-mkconfig` when `/boot/grub` exists.
+
+On Arch, systemd-boot usually mounts the ESP at `/boot`, not `/boot/efi`. Mount the ESP at the same path the install used before running the script.
+
 Run `script --help` inside each file for flags.
 
 ---
@@ -318,6 +393,8 @@ findmnt /
 lsblk -o NAME,SIZE,TYPE,TRAN
 # initrd hooks present (Debian/Ubuntu)?
 lsinitramfs /boot/initrd.img-$(uname -r) | grep -i iscsi | head
+# Arch?
+lsinitcpio /boot/initramfs-linux.img | grep -i iscsi | head
 ```
 
 If you drop to an initramfs shell:
