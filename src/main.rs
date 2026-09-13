@@ -11,6 +11,7 @@ use iscsi_s3::cache::ChunkCache;
 use iscsi_s3::config::{resolve_auth, Cli, Config};
 use iscsi_s3::device::S3BlockDevice;
 use iscsi_s3::metrics::{spawn_metrics_server, Metrics, SessionMetricsSink, VolumeLabels};
+use iscsi_s3::perf::spawn_perf_analyser;
 use iscsi_s3::store::BlockStore;
 use iscsi_s3::volume::{build_s3_client, open_volume};
 use iscsi_target::IscsiServer;
@@ -229,6 +230,19 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         )?;
     } else {
         info!("prometheus metrics disabled");
+    }
+
+    if cli.performance_optimiser {
+        let stores = volume_stores
+            .iter()
+            .map(|handle| Arc::clone(&handle.store))
+            .collect();
+        spawn_perf_analyser(
+            Arc::clone(&metrics),
+            Arc::clone(&cache),
+            stores,
+            cfg.metrics.enabled,
+        )?;
     }
 
     if cfg.admin.enabled {

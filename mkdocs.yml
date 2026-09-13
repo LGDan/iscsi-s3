@@ -71,5 +71,6 @@ nav:
       - Getting started: developers/getting-started.md
       - Architecture: developers/architecture.md
       - Chunk cache: developers/cache.md
+      - Performance: developers/performance.md
       - Testing: developers/testing.md
   - Examples: examples.md

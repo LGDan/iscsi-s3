@@ -18,6 +18,7 @@
 | [Getting started](developers/getting-started.md) | Clone, build, project layout, vendored `iscsi-target` |
 | [Architecture](developers/architecture.md) | Ports, portals/MPIO, chunks, login/advertise |
 | [Chunk cache](developers/cache.md) | Write-through LRU, coherence, multi-instance risks |
+| [Performance](developers/performance.md) | Bottleneck analyser and `iscsi_s3_bottleneck` |
 | [Testing](developers/testing.md) | Unit tests, MinIO integration, smoke script |
 
 ## Examples

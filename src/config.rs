@@ -415,6 +415,10 @@ pub struct Cli {
     /// Disable the Prometheus metrics HTTP endpoint
     #[arg(long)]
     pub no_metrics: bool,
+
+    /// Sample latency and cache fill, and export `iscsi_s3_bottleneck` (process lifetime; not reloadable).
+    #[arg(long)]
+    pub performance_optimiser: bool,
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
@@ -702,6 +706,7 @@ capacity = "1GiB"
             log: "info".into(),
             metrics_bind: None,
             no_metrics: false,
+            performance_optimiser: false,
         };
         let cfg = Config::load(&cli).unwrap();
         assert_eq!(cfg.s3.bucket.as_deref(), Some("from-env"));
@@ -826,6 +831,7 @@ capacity = "1GiB"
             log: "info".into(),
             metrics_bind: None,
             no_metrics: false,
+            performance_optimiser: false,
         };
         let cfg = Config::load(&cli).unwrap();
         let r = resolve_auth(&cfg.auth, &cfg.volumes[0].auth).unwrap();
@@ -863,6 +869,7 @@ capacity = "1GiB"
             log: "info".into(),
             metrics_bind: None,
             no_metrics: false,
+            performance_optimiser: false,
         };
         assert!(Config::load(&cli).is_err());
     }
@@ -896,6 +903,7 @@ write_cache = {{ mode = "disk" }}
             log: "info".into(),
             metrics_bind: None,
             no_metrics: false,
+            performance_optimiser: false,
         };
         let err = Config::load(&cli).unwrap_err();
         assert!(
@@ -934,6 +942,7 @@ write_cache = {{ mode = "memory", max_bytes = "1KiB" }}
             log: "info".into(),
             metrics_bind: None,
             no_metrics: false,
+            performance_optimiser: false,
         };
         let err = Config::load(&cli).unwrap_err();
         assert!(

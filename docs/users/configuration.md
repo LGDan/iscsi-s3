@@ -145,7 +145,10 @@ iscsi-s3 --config config.toml
 iscsi-s3 -c config.toml --bind 0.0.0.0:3260 --advertise 127.0.0.1 --bucket iscsi
 iscsi-s3 -c config.toml --endpoint http://127.0.0.1:9000 --force-path-style true
 iscsi-s3 -c config.toml --log info,iscsi_s3=debug,iscsi_target=debug
+iscsi-s3 -c config.toml --performance-optimiser
 ```
+
+`--performance-optimiser` starts a diagnostic thread that exports `iscsi_s3_bottleneck{component="..."}` (`0` or `1`, at most one component lit). It does not change settings. Query `iscsi_s3_bottleneck` in Grafana. Details: [performance bottleneck analyser](../developers/performance.md).
 
 ## Object layout (per volume)
 

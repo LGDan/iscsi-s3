@@ -50,6 +50,7 @@ Set `advertise` in the mounted config to an address clients can reach (for Docke
 | [Developer getting started](docs/developers/getting-started.md) | Build, layout, vendored crate |
 | [Architecture](docs/developers/architecture.md) | How chunks, ports, and sessions work |
 | [Chunk cache](docs/developers/cache.md) | Write-through LRU and multi-instance safety |
+| [Performance](docs/developers/performance.md) | Optional bottleneck analyser (`iscsi_s3_bottleneck`) |
 | [Testing](docs/developers/testing.md) | Unit, integration, and smoke tests |
 | [Examples](docs/examples.md) | Use cases with config + Compose YAML |
 

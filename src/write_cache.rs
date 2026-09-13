@@ -171,6 +171,10 @@ impl<S: BlockStore> WriteCachedStore<S> {
         }
     }
 
+    pub fn max_bytes(&self) -> u64 {
+        self.max_bytes
+    }
+
     pub fn dirty_bytes(&self) -> u64 {
         match &self.backend {
             WriteCacheBackend::Off => 0,
