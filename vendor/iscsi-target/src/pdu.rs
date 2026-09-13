@@ -48,6 +48,15 @@ pub mod flags {
     pub const READ: u8 = 0x40;
     pub const WRITE: u8 = 0x20;
 
+    // SCSI Data-In flags (RFC 3720 §10.7.2): F A 0 0 0 O U S
+    pub const DATA_IN_OVERFLOW: u8 = 0x04;
+    pub const DATA_IN_UNDERFLOW: u8 = 0x02;
+    pub const DATA_IN_STATUS: u8 = 0x01;
+
+    // SCSI Response flags (RFC 3720 §10.4.1): F o u O U 0 0 0
+    pub const SCSI_RESPONSE_OVERFLOW: u8 = 0x10;
+    pub const SCSI_RESPONSE_UNDERFLOW: u8 = 0x08;
+
     // Login flags
     pub const TRANSIT: u8 = 0x80;
     pub const CONTINUE_LOGIN: u8 = 0x40;
@@ -272,9 +281,11 @@ impl IscsiPdu {
         if self.opcode == opcode::SCSI_RESPONSE {
             buf.push(self.specific[0]); // Response (byte 2)
             buf.push(self.specific[1]); // Status (byte 3)
-        } else if self.opcode == opcode::SCSI_DATA_IN && (self.flags & 0x01) != 0 {
+        } else if self.opcode == opcode::SCSI_DATA_IN && (self.flags & flags::DATA_IN_STATUS) != 0 {
             buf.push(0); // Reserved (byte 2)
-            buf.push(self.specific[27]); // Status (byte 3) if S bit is set
+            // Status lives in version_or_reserved so Residual Count (specific[24..28])
+            // is not overwritten (Windows rejects Data-In with S=1 and residual 0).
+            buf.push((self.version_or_reserved & 0xFF) as u8);
         } else if self.opcode == opcode::LOGIN_REQUEST || self.opcode == opcode::LOGIN_RESPONSE {
             // Write version_or_reserved for Login PDUs
             buf.push((self.version_or_reserved >> 8) as u8); // High byte (version-max or active version)
@@ -596,10 +607,26 @@ impl IscsiPdu {
             pdu.data = data_segment;
         }
 
-        // Residual count at bytes 40-43 (specific[20..24])
-        pdu.specific[20..24].copy_from_slice(&residual_count.to_be_bytes());
+        // Residual Count is BHS bytes 44-47 (specific[24..28]). Bytes 40-43 are
+        // the bidirectional-read residual and must stay zero for unidirectional.
+        if residual_count > 0 {
+            pdu.flags |= flags::SCSI_RESPONSE_UNDERFLOW;
+        }
+        pdu.specific[24..28].copy_from_slice(&residual_count.to_be_bytes());
 
         pdu
+    }
+
+    /// Residual Count plus overflow/underflow for a SCSI read/data-in command.
+    pub fn scsi_residual(expected: u32, actual: usize) -> (u32, bool, bool) {
+        let actual = actual as u32;
+        if actual < expected {
+            (expected - actual, false, true)
+        } else if actual > expected {
+            (actual - expected, true, false)
+        } else {
+            (0, false, false)
+        }
     }
 
     /// Create a SCSI Data-In PDU (data from target to initiator)
@@ -614,17 +641,26 @@ impl IscsiPdu {
         data: Vec<u8>,
         final_flag: bool,
         status: Option<u8>,
+        residual_count: u32,
+        overflow: bool,
+        underflow: bool,
     ) -> Self {
         let mut pdu = IscsiPdu::new();
         pdu.opcode = opcode::SCSI_DATA_IN;
 
-        // Flags
+        // Flags: F A 0 0 0 O U S
         let mut flags_byte = 0u8;
         if final_flag {
             flags_byte |= flags::FINAL;
         }
+        if overflow {
+            flags_byte |= flags::DATA_IN_OVERFLOW;
+        }
+        if underflow {
+            flags_byte |= flags::DATA_IN_UNDERFLOW;
+        }
         if status.is_some() {
-            flags_byte |= 0x01; // S bit - status included
+            flags_byte |= flags::DATA_IN_STATUS;
         }
         pdu.flags = flags_byte;
 
@@ -642,13 +678,12 @@ impl IscsiPdu {
         pdu.specific[16..20].copy_from_slice(&data_sn.to_be_bytes());
         // Buffer Offset
         pdu.specific[20..24].copy_from_slice(&buffer_offset.to_be_bytes());
-        // Residual count (for underflow/overflow)
-        // pdu.specific[24..28] - residual count if needed
+        // Residual Count (BHS 44-47). Status is stored in version_or_reserved
+        // so it does not overwrite residual LSB at specific[27].
+        pdu.specific[24..28].copy_from_slice(&residual_count.to_be_bytes());
 
         if let Some(s) = status {
-            // Status byte goes in BHS byte 3 (not part of specific array)
-            // We store it in specific[27] temporarily and to_bytes() will move it
-            pdu.specific[27] = s;
+            pdu.version_or_reserved = s as u16;
         }
 
         pdu.data = data;
@@ -1180,11 +1215,47 @@ mod tests {
             data.clone(),
             true,    // final
             Some(scsi_status::GOOD),
+            0,
+            false,
+            false,
         );
 
         assert_eq!(pdu.opcode, opcode::SCSI_DATA_IN);
         assert_eq!(pdu.flags & flags::FINAL, flags::FINAL);
         assert_eq!(pdu.data, data);
+    }
+
+    #[test]
+    fn test_scsi_data_in_underflow_residual_on_wire() {
+        let data = vec![0u8; 8];
+        let pdu = IscsiPdu::scsi_data_in(
+            3,
+            0xFFFF_FFFF,
+            5,
+            4,
+            5,
+            0,
+            0,
+            data,
+            true,
+            Some(scsi_status::GOOD),
+            247,
+            false,
+            true,
+        );
+        let bytes = pdu.to_bytes();
+        assert_eq!(bytes[1] & flags::DATA_IN_UNDERFLOW, flags::DATA_IN_UNDERFLOW);
+        assert_eq!(bytes[1] & flags::DATA_IN_OVERFLOW, 0);
+        assert_eq!(bytes[1] & flags::DATA_IN_STATUS, flags::DATA_IN_STATUS);
+        assert_eq!(bytes[3], scsi_status::GOOD);
+        assert_eq!(&bytes[44..48], &[0, 0, 0, 247]);
+    }
+
+    #[test]
+    fn test_scsi_residual() {
+        assert_eq!(IscsiPdu::scsi_residual(255, 8), (247, false, true));
+        assert_eq!(IscsiPdu::scsi_residual(36, 36), (0, false, false));
+        assert_eq!(IscsiPdu::scsi_residual(8, 16), (8, true, false));
     }
 
     #[test]

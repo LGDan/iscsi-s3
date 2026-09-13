@@ -4,6 +4,7 @@ use crate::cache::{CachedStore, ChunkCache};
 use crate::config::{Config, VolumeConfig};
 use crate::metrics::{Metrics, VolumeLabels};
 use crate::store::{BlockStore, S3ChunkStore, S3StoreConfig, StoreError};
+use crate::write_cache::WriteCachedStore;
 use aws_config::meta::region::RegionProviderChain;
 use aws_config::BehaviorVersion;
 use aws_sdk_s3::config::{Credentials, Region};
@@ -11,11 +12,13 @@ use aws_sdk_s3::Client;
 use std::sync::Arc;
 use tokio::runtime::Handle;
 
+pub type VolumeStore = WriteCachedStore<CachedStore<S3ChunkStore>>;
+
 pub struct OpenedVolume {
     pub name: String,
     pub iqn: String,
     pub labels: VolumeLabels,
-    pub store: Arc<CachedStore<S3ChunkStore>>,
+    pub store: Arc<VolumeStore>,
 }
 
 pub async fn build_s3_client(cfg: &Config) -> Result<Client, StoreError> {
@@ -81,19 +84,26 @@ pub fn open_volume(
         },
     )?;
 
-    let cached = Arc::new(CachedStore::new(
+    let cached = CachedStore::new(
         store,
         cache,
         labels.clone(),
         Arc::clone(&metrics),
-    ));
+    );
+    let wrapped = WriteCachedStore::wrap(
+        cached,
+        &vol.write_cache,
+        &vol.write_buffer,
+        &vol.name,
+    )?;
+    let store = Arc::new(wrapped);
 
-    metrics.set_volume_capacity(&labels, cached.capacity());
+    metrics.set_volume_capacity(&labels, store.capacity());
 
     Ok(OpenedVolume {
         name: vol.name.clone(),
         iqn: vol.iqn.clone(),
         labels,
-        store: cached,
+        store,
     })
 }

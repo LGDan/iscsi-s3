@@ -41,7 +41,7 @@
 use crate::auth::{parse_chap_response, AuthConfig, ChapAuthState};
 use crate::error::{IscsiError, ScsiResult};
 use crate::pdu::{self, IscsiPdu, serialize_text_parameters};
-use crate::session::{DigestType, PendingWrite, SessionParams, SessionType};
+use crate::session::{PendingWrite, SessionParams, SessionType};
 use std::collections::HashMap;
 use std::marker::PhantomData;
 
@@ -228,6 +228,7 @@ impl SessionData {
     /// Apply initiator parameter during negotiation.
     /// Returns `false` if the key is not understood (caller should answer NotUnderstood).
     pub fn apply_initiator_param(&mut self, key: &str, value: &str) -> bool {
+        self.params.note_offered(key);
         match key {
             "InitiatorName" => self.params.initiator_name = value.to_string(),
             "InitiatorAlias" => self.params.initiator_alias = value.to_string(),
@@ -314,6 +315,9 @@ impl SessionData {
             "DataDigest" => {
                 self.params.data_digest = crate::session::negotiate_digest(value);
             }
+            "IFMarker" | "OFMarker" => {
+                // RFC 3720: markers are obsolete; answer No if offered.
+            }
             // Auth / discovery parameters handled elsewhere or not operational keys
             "AuthMethod" | "CHAP_A" | "CHAP_I" | "CHAP_C" | "CHAP_N" | "CHAP_R"
             | "TargetPortalGroupTag" | "SendTargets" => {}
@@ -333,20 +337,7 @@ impl SessionData {
             params.push(("TargetAlias".to_string(), self.params.target_alias.clone()));
         }
 
-        params.push(("MaxConnections".to_string(), self.params.max_connections.to_string()));
-        params.push(("MaxRecvDataSegmentLength".to_string(), self.params.max_recv_data_segment_length.to_string()));
-        params.push(("MaxBurstLength".to_string(), self.params.max_burst_length.to_string()));
-        params.push(("FirstBurstLength".to_string(), self.params.first_burst_length.to_string()));
-        params.push(("DefaultTime2Wait".to_string(), self.params.default_time2wait.to_string()));
-        params.push(("DefaultTime2Retain".to_string(), self.params.default_time2retain.to_string()));
-        params.push(("MaxOutstandingR2T".to_string(), self.params.max_outstanding_r2t.to_string()));
-        params.push(("DataPDUInOrder".to_string(), if self.params.data_pdu_in_order { "Yes" } else { "No" }.to_string()));
-        params.push(("DataSequenceInOrder".to_string(), if self.params.data_sequence_in_order { "Yes" } else { "No" }.to_string()));
-        params.push(("ErrorRecoveryLevel".to_string(), self.params.error_recovery_level.to_string()));
-        params.push(("ImmediateData".to_string(), if self.params.immediate_data { "Yes" } else { "No" }.to_string()));
-        params.push(("InitialR2T".to_string(), if self.params.initial_r2t { "Yes" } else { "No" }.to_string()));
-        params.push(("HeaderDigest".to_string(), match self.params.header_digest { DigestType::None => "None", DigestType::CRC32C => "CRC32C" }.to_string()));
-        params.push(("DataDigest".to_string(), match self.params.data_digest { DigestType::None => "None", DigestType::CRC32C => "CRC32C" }.to_string()));
+        params.extend(self.params.operational_response_params());
 
         params
     }
@@ -968,6 +959,72 @@ impl TypestateSession<FullFeaturePhase> {
         self.data.session_type == SessionType::Discovery
     }
 
+    /// Accept a late Login Request after Full Feature (Windows initiator).
+    ///
+    /// Microsoft often sends a second operational Login on the same TCP
+    /// connection after the target has already transited. Apply any new keys
+    /// and stay in Full Feature; do not drop the connection.
+    pub fn process_login(
+        mut self,
+        pdu: &IscsiPdu,
+        _target_name: &str,
+    ) -> ScsiResult<(AnySession, Vec<IscsiPdu>)> {
+        let login = pdu.parse_login_request()?;
+        let itt = pdu.itt;
+
+        let mut not_understood = Vec::new();
+        for (key, value) in &login.parameters {
+            if !self.data.apply_initiator_param(key, value) {
+                not_understood.push(key.clone());
+            }
+        }
+
+        let param_summary: Vec<String> = login
+            .parameters
+            .iter()
+            .map(|(k, v)| format!("{k}={v}"))
+            .collect();
+        log::info!(
+            "Login PDU (FullFeaturePhase): CSG={} NSG={} transit={} initiator={} params=[{}]",
+            login.csg,
+            login.nsg,
+            login.transit,
+            self.data.params.initiator_name,
+            param_summary.join(", ")
+        );
+
+        let mut response_params = self.data.generate_response_params();
+        for key in &not_understood {
+            response_params.push((key.clone(), "NotUnderstood".to_string()));
+        }
+        let response_summary: Vec<String> = response_params
+            .iter()
+            .map(|(k, v)| format!("{k}={v}"))
+            .collect();
+        log::info!(
+            "Login in FullFeature: stay in FullFeature initiator={} response=[{}]",
+            self.data.params.initiator_name,
+            response_summary.join(", ")
+        );
+
+        let stat_sn = self.data.next_stat_sn();
+        let response = IscsiPdu::login_response(
+            self.data.isid,
+            self.data.tsih,
+            stat_sn,
+            self.data.exp_cmd_sn,
+            self.data.max_cmd_sn,
+            0,
+            0,
+            1,
+            3,
+            true,
+            itt,
+            serialize_text_parameters(&response_params),
+        );
+        Ok((AnySession::FullFeaturePhase(self), vec![response]))
+    }
+
     /// Process NOP-Out (ping) request
     pub fn process_nop_out(&mut self, pdu: &IscsiPdu) -> ScsiResult<IscsiPdu> {
         let nop = pdu.parse_nop_out()?;
@@ -1097,6 +1154,7 @@ impl AnySession {
             AnySession::Free(s) => s.process_login(pdu, target_name),
             AnySession::SecurityNegotiation(s) => s.process_login(pdu, target_name),
             AnySession::LoginOperationalNegotiation(s) => s.process_login(pdu, target_name),
+            AnySession::FullFeaturePhase(s) => s.process_login(pdu, target_name),
             _ => Err(IscsiError::Protocol("Cannot process login in current state".to_string())),
         }
     }
@@ -1197,5 +1255,123 @@ mod tests {
 
         data.apply_initiator_param("SessionType", "Discovery");
         assert_eq!(data.session_type, SessionType::Discovery);
+    }
+
+    fn login_pdu(csg: u8, nsg: u8, transit: bool, params: &[(&str, &str)]) -> IscsiPdu {
+        let pairs: Vec<(String, String)> = params
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+            .collect();
+        IscsiPdu::login_request(
+            [0x00, 0x02, 0x3d, 0x00, 0x00, 0x01],
+            0,
+            1,
+            0,
+            0,
+            csg,
+            nsg,
+            transit,
+            serialize_text_parameters(&pairs),
+        )
+    }
+
+    fn response_keys(pdu: &IscsiPdu) -> Vec<String> {
+        pdu::parse_text_parameters(&pdu.data)
+            .unwrap()
+            .into_iter()
+            .map(|(k, _)| k)
+            .collect()
+    }
+
+    #[test]
+    fn test_operational_login_does_not_volunteer_unsolicited_keys() {
+        let session = AnySession::new();
+        let security = login_pdu(
+            0,
+            1,
+            true,
+            &[
+                ("InitiatorName", "iqn.1991-05.com.microsoft:test"),
+                ("SessionType", "Discovery"),
+                ("AuthMethod", "None"),
+            ],
+        );
+        let (session, _) = session.process_login(&security, "").unwrap();
+        assert_eq!(session.state_name(), "LoginOperationalNegotiation");
+
+        let operational = login_pdu(
+            1,
+            3,
+            true,
+            &[
+                ("HeaderDigest", "None,CRC32C"),
+                ("DataDigest", "None,CRC32C"),
+                ("MaxRecvDataSegmentLength", "65536"),
+                ("DefaultTime2Wait", "0"),
+                ("DefaultTime2Retain", "60"),
+            ],
+        );
+        let (session, responses) = session.process_login(&operational, "").unwrap();
+        assert!(session.is_full_feature());
+        let keys = response_keys(&responses[0]);
+        assert!(keys.contains(&"MaxRecvDataSegmentLength".to_string()));
+        assert!(keys.contains(&"HeaderDigest".to_string()));
+        assert!(keys.contains(&"DefaultTime2Wait".to_string()));
+        assert!(!keys.contains(&"MaxBurstLength".to_string()));
+        assert!(!keys.contains(&"ImmediateData".to_string()));
+        assert!(!keys.contains(&"MaxConnections".to_string()));
+
+        let data = session.data().unwrap();
+        assert_eq!(data.params.max_recv_data_segment_length, 65536);
+        assert_eq!(data.params.max_xmit_data_segment_length, 65536);
+    }
+
+    #[test]
+    fn test_late_login_in_full_feature_stays_in_ffp() {
+        let session = AnySession::new();
+        let security = login_pdu(
+            0,
+            1,
+            true,
+            &[
+                ("InitiatorName", "iqn.1991-05.com.microsoft:test"),
+                ("SessionType", "Discovery"),
+                ("AuthMethod", "None"),
+            ],
+        );
+        let (session, _) = session.process_login(&security, "").unwrap();
+
+        let operational = login_pdu(
+            1,
+            3,
+            true,
+            &[
+                ("HeaderDigest", "None"),
+                ("DataDigest", "None"),
+                ("MaxRecvDataSegmentLength", "65536"),
+            ],
+        );
+        let (session, _) = session.process_login(&operational, "").unwrap();
+        assert!(session.is_full_feature());
+
+        let late = login_pdu(
+            1,
+            3,
+            true,
+            &[
+                ("MaxBurstLength", "262144"),
+                ("ImmediateData", "Yes"),
+                ("InitialR2T", "No"),
+            ],
+        );
+        let (session, responses) = session.process_login(&late, "").unwrap();
+        assert!(session.is_full_feature());
+        assert_eq!(responses.len(), 1);
+        assert_eq!(responses[0].opcode, pdu::opcode::LOGIN_RESPONSE);
+        let keys = response_keys(&responses[0]);
+        assert!(keys.contains(&"MaxBurstLength".to_string()));
+        assert!(keys.contains(&"ImmediateData".to_string()));
+        assert!(keys.contains(&"InitialR2T".to_string()));
+        assert!(keys.contains(&"MaxRecvDataSegmentLength".to_string()));
     }
 }

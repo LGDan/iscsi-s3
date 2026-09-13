@@ -12,7 +12,7 @@ Userspace iSCSI target that presents virtual disks backed by S3 (or MinIO / othe
 | [Admin control](users/admin-ctl.md) | `iscsi-s3-ctl`: stats, cache toggle, safe reload |
 | [Volume snapshots](users/snapshots.md) | CoW snapshots, `legacy` vs `cow`, migrate |
 | [Tutorials](users/tutorials.md) | Format/mount, grow, remote LAN, firmware iSCSI boot notes |
-| [Install OS on iSCSI](users/iscsi-os-install.md) | Live ISO → install to LUN → chroot fixup (Ubuntu, Debian, Alpine) |
+| [Install OS on iSCSI](users/iscsi-os-install.md) | Live ISO → install to LUN → chroot fixup (Ubuntu, Debian, Alpine, Arch) |
 
 ## For developers
 
@@ -21,6 +21,7 @@ Userspace iSCSI target that presents virtual disks backed by S3 (or MinIO / othe
 | [Getting started](developers/getting-started.md) | Clone, build, project layout, vendored `iscsi-target` |
 | [Architecture](developers/architecture.md) | Ports, portals/MPIO, chunks, login/advertise |
 | [Chunk cache](developers/cache.md) | Write-through LRU, coherence, multi-instance risks |
+| [Performance](developers/performance.md) | Bottleneck analyser and `iscsi_s3_bottleneck` |
 | [Testing](developers/testing.md) | Unit tests, MinIO integration, smoke script |
 
 ## Examples

@@ -18,4 +18,4 @@ RUN useradd --system --create-home --uid 10001 iscsi
 USER iscsi
 EXPOSE 3260 9090
 ENTRYPOINT ["iscsi-s3"]
-CMD ["--config", "/etc/iscsi-s3/config.toml", "--log", "info,iscsi_s3=debug,iscsi_target=debug"]
+CMD ["--config", "/etc/iscsi-s3/config.toml"]

@@ -907,16 +907,23 @@ fn build_scsi_response(
     let mut responses = Vec::new();
 
     if !response.data.is_empty() {
+        let mut payload = response.data;
+        let (residual, overflow, underflow) =
+            IscsiPdu::scsi_residual(cmd.expected_data_length, payload.len());
+        if overflow {
+            payload.truncate(cmd.expected_data_length as usize);
+        }
+
         let max_data_seg = data.params.max_xmit_data_segment_length as usize;
         let mut offset = 0u32;
         let mut data_sn = 0u32;
 
-        while offset < response.data.len() as u32 {
-            let remaining = response.data.len() - offset as usize;
+        while offset < payload.len() as u32 {
+            let remaining = payload.len() - offset as usize;
             let chunk_size = remaining.min(max_data_seg);
-            let is_final = offset as usize + chunk_size >= response.data.len();
+            let is_final = offset as usize + chunk_size >= payload.len();
 
-            let chunk = response.data[offset as usize..offset as usize + chunk_size].to_vec();
+            let chunk = payload[offset as usize..offset as usize + chunk_size].to_vec();
             let pdu_stat_sn = if is_final { data.next_stat_sn() } else { 0 };
 
             let data_in = IscsiPdu::scsi_data_in(
@@ -924,6 +931,9 @@ fn build_scsi_response(
                 data.exp_cmd_sn, data.max_cmd_sn,
                 data_sn, offset, chunk, is_final,
                 if is_final { Some(response.status) } else { None },
+                if is_final { residual } else { 0 },
+                is_final && overflow,
+                is_final && underflow,
             );
 
             responses.push(data_in);
@@ -943,9 +953,10 @@ fn build_scsi_response(
             data.last_sense_data = None;
         }
 
+        let (residual, _, _) = IscsiPdu::scsi_residual(cmd.expected_data_length, 0);
         let scsi_resp = IscsiPdu::scsi_response(
             cmd.itt, data.next_stat_sn(), data.exp_cmd_sn, data.max_cmd_sn,
-            response.status, 0, 0, sense_data.as_deref(),
+            response.status, 0, residual, sense_data.as_deref(),
         );
         responses.push(scsi_resp);
     }

@@ -52,6 +52,9 @@ pub struct Config {
     pub metrics: MetricsConfig,
     #[serde(default)]
     pub admin: AdminConfig,
+    /// Name the current performance bottleneck (`iscsi_s3_bottleneck`). Off by default.
+    #[serde(default)]
+    pub performance_optimiser: bool,
     #[serde(default)]
     pub volumes: Vec<VolumeConfig>,
 }
@@ -321,6 +324,57 @@ pub struct VolumeConfig {
     /// Optional per-volume CHAP override (inherits unset fields from `[auth]`).
     #[serde(default)]
     pub auth: Option<AuthSettings>,
+    /// Optional write-back cache (default `none` = write-through to S3).
+    #[serde(default)]
+    pub write_cache: WriteCacheConfig,
+    /// Optional queue of chunk snapshots waiting on PutObject (default off).
+    #[serde(default)]
+    pub write_buffer: WriteBufferConfig,
+}
+
+/// Where SCSI writes are acknowledged before S3.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum WriteCacheMode {
+    #[default]
+    None,
+    Memory,
+    Disk,
+}
+
+impl WriteCacheMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Memory => "memory",
+            Self::Disk => "disk",
+        }
+    }
+}
+
+fn default_write_cache_max() -> u64 {
+    0
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WriteCacheConfig {
+    #[serde(default)]
+    pub mode: WriteCacheMode,
+    /// Directory for dirty chunk files (`mode = "disk"`).
+    #[serde(default)]
+    pub path: Option<PathBuf>,
+    /// Dirty-data budget. `0` = unlimited. When set, oldest dirty chunks
+    /// flush to S3 until the set fits.
+    #[serde(default = "default_write_cache_max", with = "bytesize_serde")]
+    pub max_bytes: u64,
+}
+
+/// Background queue of chunk snapshots between the write cache and PutObject.
+/// `max_bytes = 0` disables it (writes leave the cache only on flush or cache eviction).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WriteBufferConfig {
+    #[serde(default = "default_write_cache_max", with = "bytesize_serde")]
+    pub max_bytes: u64,
 }
 
 fn default_block_size() -> u32 {
@@ -363,8 +417,8 @@ pub struct Cli {
     #[arg(long)]
     pub force_path_style: Option<bool>,
 
-    /// Log filter (e.g. info, iscsi_s3=debug)
-    #[arg(long, default_value = "info")]
+    /// Log filter (overridden by RUST_LOG when set). Default: warn.
+    #[arg(long, default_value = "warn")]
     #[serde(skip)]
     pub log: String,
 
@@ -375,6 +429,10 @@ pub struct Cli {
     /// Disable the Prometheus metrics HTTP endpoint
     #[arg(long)]
     pub no_metrics: bool,
+
+    /// Enable the performance bottleneck analyser (overrides config/env when set).
+    #[arg(long)]
+    pub performance_optimiser: Option<bool>,
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
@@ -387,6 +445,8 @@ struct CliOverrides {
     s3: Option<CliS3Overrides>,
     #[serde(skip_serializing_if = "Option::is_none")]
     metrics: Option<CliMetricsOverrides>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    performance_optimiser: Option<bool>,
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
@@ -428,6 +488,7 @@ impl Config {
             cache: CacheConfig::default(),
             metrics: MetricsConfig::default(),
             admin: AdminConfig::default(),
+            performance_optimiser: false,
             volumes: Vec::new(),
         };
 
@@ -453,6 +514,7 @@ impl Config {
                 enabled: if cli.no_metrics { Some(false) } else { None },
                 bind: cli.metrics_bind.clone(),
             }),
+            performance_optimiser: cli.performance_optimiser,
         };
         figment = figment.merge(Serialized::defaults(overrides));
 
@@ -480,6 +542,7 @@ impl Config {
             cache: CacheConfig::default(),
             metrics: MetricsConfig::default(),
             admin: AdminConfig::default(),
+            performance_optimiser: false,
             volumes: Vec::new(),
         };
         let figment = Figment::new()
@@ -506,6 +569,7 @@ impl Config {
         let mut names = std::collections::HashSet::new();
         let mut iqns = std::collections::HashSet::new();
         let mut prefixes = std::collections::HashSet::new();
+        let mut disk_paths = std::collections::HashSet::new();
         for vol in &self.volumes {
             if vol.name.is_empty() {
                 return Err(ConfigError::Invalid("volume name must not be empty".into()));
@@ -552,6 +616,47 @@ impl Config {
                 }
                 other => other,
             })?;
+            if matches!(
+                vol.write_cache.mode,
+                WriteCacheMode::Memory | WriteCacheMode::Disk
+            ) && vol.write_cache.max_bytes > 0
+                && vol.write_cache.max_bytes < vol.chunk_size
+            {
+                return Err(ConfigError::Invalid(format!(
+                    "volume {}: write_cache.max_bytes ({}) must be 0 (unlimited) or at least chunk_size ({})",
+                    vol.name, vol.write_cache.max_bytes, vol.chunk_size
+                )));
+            }
+            if vol.write_buffer.max_bytes > 0 && vol.write_buffer.max_bytes < vol.chunk_size {
+                return Err(ConfigError::Invalid(format!(
+                    "volume {}: write_buffer.max_bytes ({}) must be 0 (disabled) or at least chunk_size ({})",
+                    vol.name, vol.write_buffer.max_bytes, vol.chunk_size
+                )));
+            }
+            if vol.write_buffer.max_bytes > 0 && vol.write_cache.mode == WriteCacheMode::None {
+                return Err(ConfigError::Invalid(format!(
+                    "volume {}: write_buffer requires write_cache.mode of memory or disk",
+                    vol.name
+                )));
+            }
+            match vol.write_cache.mode {
+                WriteCacheMode::Disk => {
+                    let path = vol.write_cache.path.as_ref().filter(|p| !p.as_os_str().is_empty());
+                    let Some(path) = path else {
+                        return Err(ConfigError::Invalid(format!(
+                            "volume {}: write_cache.mode=disk requires write_cache.path",
+                            vol.name
+                        )));
+                    };
+                    if !disk_paths.insert(path.clone()) {
+                        return Err(ConfigError::Invalid(format!(
+                            "volume {}: write_cache.path {:?} is used by another volume",
+                            vol.name, path
+                        )));
+                    }
+                }
+                WriteCacheMode::None | WriteCacheMode::Memory => {}
+            }
         }
         Ok(())
     }
@@ -632,6 +737,7 @@ capacity = "1GiB"
             log: "info".into(),
             metrics_bind: None,
             no_metrics: false,
+            performance_optimiser: None,
         };
         let cfg = Config::load(&cli).unwrap();
         assert_eq!(cfg.s3.bucket.as_deref(), Some("from-env"));
@@ -645,6 +751,53 @@ capacity = "1GiB"
         assert_eq!(cfg.s3.bucket.as_deref(), Some("from-cli"));
 
         std::env::remove_var("ISCSI_S3_S3__BUCKET");
+    }
+
+    #[test]
+    fn performance_optimiser_file_env_cli() {
+        let mut file = NamedTempFile::new().unwrap();
+        writeln!(
+            file,
+            r#"
+bind = "0.0.0.0:3260"
+performance_optimiser = true
+[s3]
+bucket = "iscsi"
+[[volumes]]
+name = "disk0"
+iqn = "iqn.2026-09.local:disk0"
+prefix = "disks/disk0"
+capacity = "1GiB"
+"#
+        )
+        .unwrap();
+        let cli = Cli {
+            config: Some(file.path().to_path_buf()),
+            bind: None,
+            advertise: None,
+            bucket: None,
+            endpoint: None,
+            region: None,
+            force_path_style: None,
+            log: "info".into(),
+            metrics_bind: None,
+            no_metrics: false,
+            performance_optimiser: None,
+        };
+        let cfg = Config::load(&cli).unwrap();
+        assert!(cfg.performance_optimiser);
+
+        std::env::set_var("ISCSI_S3_PERFORMANCE_OPTIMISER", "false");
+        let cfg = Config::load(&cli).unwrap();
+        assert!(!cfg.performance_optimiser);
+
+        let cli = Cli {
+            performance_optimiser: Some(true),
+            ..cli
+        };
+        let cfg = Config::load(&cli).unwrap();
+        assert!(cfg.performance_optimiser);
+        std::env::remove_var("ISCSI_S3_PERFORMANCE_OPTIMISER");
     }
 
     #[test]
@@ -756,6 +909,7 @@ capacity = "1GiB"
             log: "info".into(),
             metrics_bind: None,
             no_metrics: false,
+            performance_optimiser: None,
         };
         let cfg = Config::load(&cli).unwrap();
         let r = resolve_auth(&cfg.auth, &cfg.volumes[0].auth).unwrap();
@@ -793,7 +947,134 @@ capacity = "1GiB"
             log: "info".into(),
             metrics_bind: None,
             no_metrics: false,
+            performance_optimiser: None,
         };
         assert!(Config::load(&cli).is_err());
+    }
+
+    #[test]
+    fn config_rejects_disk_write_cache_without_path() {
+        let mut file = NamedTempFile::new().unwrap();
+        writeln!(
+            file,
+            r#"
+bind = "0.0.0.0:3260"
+[s3]
+bucket = "iscsi"
+[[volumes]]
+name = "disk0"
+iqn = "iqn.2026-09.local:disk0"
+prefix = "disks/disk0"
+capacity = "1GiB"
+write_cache = {{ mode = "disk" }}
+"#
+        )
+        .unwrap();
+        let cli = Cli {
+            config: Some(file.path().to_path_buf()),
+            bind: None,
+            advertise: None,
+            bucket: None,
+            endpoint: None,
+            region: None,
+            force_path_style: None,
+            log: "info".into(),
+            metrics_bind: None,
+            no_metrics: false,
+            performance_optimiser: None,
+        };
+        let err = Config::load(&cli).unwrap_err();
+        assert!(
+            err.to_string().contains("write_cache.path"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn config_rejects_write_cache_max_below_chunk() {
+        let mut file = NamedTempFile::new().unwrap();
+        writeln!(
+            file,
+            r#"
+bind = "0.0.0.0:3260"
+[s3]
+bucket = "iscsi"
+[[volumes]]
+name = "disk0"
+iqn = "iqn.2026-09.local:disk0"
+prefix = "disks/disk0"
+capacity = "1GiB"
+chunk_size = "4MiB"
+write_cache = {{ mode = "memory", max_bytes = "1KiB" }}
+"#
+        )
+        .unwrap();
+        let cli = Cli {
+            config: Some(file.path().to_path_buf()),
+            bind: None,
+            advertise: None,
+            bucket: None,
+            endpoint: None,
+            region: None,
+            force_path_style: None,
+            log: "info".into(),
+            metrics_bind: None,
+            no_metrics: false,
+            performance_optimiser: None,
+        };
+        let err = Config::load(&cli).unwrap_err();
+        assert!(
+            err.to_string().contains("write_cache.max_bytes"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn config_rejects_write_buffer_below_chunk() {
+        let err = load_write_buffer_case(
+            r#"write_cache = { mode = "memory" }
+write_buffer = { max_bytes = "1KiB" }"#,
+        );
+        assert!(err.contains("write_buffer.max_bytes"), "{err}");
+    }
+
+    #[test]
+    fn config_rejects_write_buffer_without_write_cache() {
+        let err = load_write_buffer_case(r#"write_buffer = { max_bytes = "4MiB" }"#);
+        assert!(err.contains("write_buffer requires write_cache"), "{err}");
+    }
+
+    fn load_write_buffer_case(volume_extra: &str) -> String {
+        let mut file = NamedTempFile::new().unwrap();
+        writeln!(
+            file,
+            r#"
+bind = "0.0.0.0:3260"
+[s3]
+bucket = "iscsi"
+[[volumes]]
+name = "disk0"
+iqn = "iqn.2026-09.local:disk0"
+prefix = "disks/disk0"
+capacity = "1GiB"
+chunk_size = "4MiB"
+{volume_extra}
+"#
+        )
+        .unwrap();
+        let cli = Cli {
+            config: Some(file.path().to_path_buf()),
+            bind: None,
+            advertise: None,
+            bucket: None,
+            endpoint: None,
+            region: None,
+            force_path_style: None,
+            log: "info".into(),
+            metrics_bind: None,
+            no_metrics: false,
+            performance_optimiser: None,
+        };
+        Config::load(&cli).unwrap_err().to_string()
     }
 }

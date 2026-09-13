@@ -7,6 +7,7 @@ use prometheus::{
 };
 use serde::Serialize;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::thread;
 use std::time::Instant;
@@ -29,6 +30,133 @@ impl VolumeLabels {
     }
 }
 
+/// Prometheus label values for `iscsi_s3_bottleneck`.
+pub const BOTTLENECK_COMPONENTS: &[&str] = &[
+    "s3_read",
+    "s3_write",
+    "read_cache",
+    "write_cache",
+    "write_buffer",
+    "iscsi",
+];
+
+/// Cumulative latency sample (count and sum of microseconds).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct LatencyAccum {
+    pub count: u64,
+    pub sum_us: u64,
+}
+
+impl LatencyAccum {
+    pub fn avg_secs(self) -> f64 {
+        if self.count == 0 {
+            0.0
+        } else {
+            (self.sum_us as f64 / self.count as f64) / 1_000_000.0
+        }
+    }
+
+    pub fn total_secs(self) -> f64 {
+        self.sum_us as f64 / 1_000_000.0
+    }
+
+    fn saturating_delta(self, earlier: Self) -> Self {
+        Self {
+            count: self.count.saturating_sub(earlier.count),
+            sum_us: self.sum_us.saturating_sub(earlier.sum_us),
+        }
+    }
+}
+
+/// Process-wide counters the bottleneck analyser diffs between windows.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PerfCounters {
+    pub scsi_read: LatencyAccum,
+    pub scsi_write: LatencyAccum,
+    pub scsi_flush: LatencyAccum,
+    pub s3_get: LatencyAccum,
+    pub s3_put: LatencyAccum,
+    pub cache_hits: u64,
+    pub cache_misses: u64,
+}
+
+impl PerfCounters {
+    pub fn delta(self, earlier: Self) -> Self {
+        Self {
+            scsi_read: self.scsi_read.saturating_delta(earlier.scsi_read),
+            scsi_write: self.scsi_write.saturating_delta(earlier.scsi_write),
+            scsi_flush: self.scsi_flush.saturating_delta(earlier.scsi_flush),
+            s3_get: self.s3_get.saturating_delta(earlier.s3_get),
+            s3_put: self.s3_put.saturating_delta(earlier.s3_put),
+            cache_hits: self.cache_hits.saturating_sub(earlier.cache_hits),
+            cache_misses: self.cache_misses.saturating_sub(earlier.cache_misses),
+        }
+    }
+}
+
+struct AtomicLatency {
+    count: AtomicU64,
+    sum_us: AtomicU64,
+}
+
+impl AtomicLatency {
+    fn new() -> Self {
+        Self {
+            count: AtomicU64::new(0),
+            sum_us: AtomicU64::new(0),
+        }
+    }
+
+    fn record(&self, elapsed_secs: f64) {
+        let us = (elapsed_secs * 1_000_000.0).round().max(0.0) as u64;
+        self.count.fetch_add(1, Ordering::Relaxed);
+        self.sum_us.fetch_add(us, Ordering::Relaxed);
+    }
+
+    fn snapshot(&self) -> LatencyAccum {
+        LatencyAccum {
+            count: self.count.load(Ordering::Relaxed),
+            sum_us: self.sum_us.load(Ordering::Relaxed),
+        }
+    }
+}
+
+struct PerfAccumulators {
+    scsi_read: AtomicLatency,
+    scsi_write: AtomicLatency,
+    scsi_flush: AtomicLatency,
+    s3_get: AtomicLatency,
+    s3_put: AtomicLatency,
+    cache_hits: AtomicU64,
+    cache_misses: AtomicU64,
+}
+
+impl PerfAccumulators {
+    fn new() -> Self {
+        Self {
+            scsi_read: AtomicLatency::new(),
+            scsi_write: AtomicLatency::new(),
+            scsi_flush: AtomicLatency::new(),
+            s3_get: AtomicLatency::new(),
+            s3_put: AtomicLatency::new(),
+            cache_hits: AtomicU64::new(0),
+            cache_misses: AtomicU64::new(0),
+        }
+    }
+
+    fn snapshot(&self) -> PerfCounters {
+        PerfCounters {
+            scsi_read: self.scsi_read.snapshot(),
+            scsi_write: self.scsi_write.snapshot(),
+            scsi_flush: self.scsi_flush.snapshot(),
+            s3_get: self.s3_get.snapshot(),
+            s3_put: self.s3_put.snapshot(),
+            cache_hits: self.cache_hits.load(Ordering::Relaxed),
+            cache_misses: self.cache_misses.load(Ordering::Relaxed),
+        }
+    }
+}
+
 /// Process-wide metrics for iscsi-s3.
 pub struct Metrics {
     registry: Registry,
@@ -41,11 +169,16 @@ pub struct Metrics {
     cache_ops: IntCounterVec,
     cache_bytes: IntGauge,
     cache_entries: IntGauge,
+    write_cache_bytes: IntGauge,
+    write_buffer_bytes: IntGauge,
+    write_buffer_chunks: IntGauge,
     volume_capacity_bytes: IntGaugeVec,
     iscsi_connections: IntGauge,
     iscsi_sessions: IntGauge,
     iscsi_sessions_active: IntGaugeVec,
     iscsi_sessions_total: IntCounterVec,
+    bottleneck: IntGaugeVec,
+    perf: PerfAccumulators,
 }
 
 impl Metrics {
@@ -113,6 +246,18 @@ impl Metrics {
             "iscsi_s3_cache_entries",
             "Current number of cached chunks",
         )?;
+        let write_cache_bytes = IntGauge::new(
+            "iscsi_s3_write_cache_bytes",
+            "Current dirty write-cache bytes, summed across volumes",
+        )?;
+        let write_buffer_bytes = IntGauge::new(
+            "iscsi_s3_write_buffer_bytes",
+            "Queued plus in-flight write-buffer snapshot bytes, summed across volumes",
+        )?;
+        let write_buffer_chunks = IntGauge::new(
+            "iscsi_s3_write_buffer_chunks",
+            "Queued plus in-flight write-buffer snapshots, summed across volumes",
+        )?;
 
         let volume_capacity_bytes = IntGaugeVec::new(
             Opts::new(
@@ -144,6 +289,13 @@ impl Metrics {
             ),
             &["volume", "iqn"],
         )?;
+        let bottleneck = IntGaugeVec::new(
+            Opts::new(
+                "iscsi_s3_bottleneck",
+                "1 if this component is the current primary performance bottleneck, else 0",
+            ),
+            &["component"],
+        )?;
 
         registry.register(Box::new(scsi_ops.clone()))?;
         registry.register(Box::new(scsi_bytes.clone()))?;
@@ -154,11 +306,18 @@ impl Metrics {
         registry.register(Box::new(cache_ops.clone()))?;
         registry.register(Box::new(cache_bytes.clone()))?;
         registry.register(Box::new(cache_entries.clone()))?;
+        registry.register(Box::new(write_cache_bytes.clone()))?;
+        registry.register(Box::new(write_buffer_bytes.clone()))?;
+        registry.register(Box::new(write_buffer_chunks.clone()))?;
         registry.register(Box::new(volume_capacity_bytes.clone()))?;
         registry.register(Box::new(iscsi_connections.clone()))?;
         registry.register(Box::new(iscsi_sessions.clone()))?;
         registry.register(Box::new(iscsi_sessions_active.clone()))?;
         registry.register(Box::new(iscsi_sessions_total.clone()))?;
+        registry.register(Box::new(bottleneck.clone()))?;
+        for component in BOTTLENECK_COMPONENTS {
+            bottleneck.with_label_values(&[component]).set(0);
+        }
 
         Ok(Arc::new(Self {
             registry,
@@ -171,12 +330,29 @@ impl Metrics {
             cache_ops,
             cache_bytes,
             cache_entries,
+            write_cache_bytes,
+            write_buffer_bytes,
+            write_buffer_chunks,
             volume_capacity_bytes,
             iscsi_connections,
             iscsi_sessions,
             iscsi_sessions_active,
             iscsi_sessions_total,
+            bottleneck,
+            perf: PerfAccumulators::new(),
         }))
+    }
+
+    pub fn perf_counters(&self) -> PerfCounters {
+        self.perf.snapshot()
+    }
+
+    /// Set exactly one component to 1, or all to 0 when `active` is `None`.
+    pub fn set_bottleneck(&self, active: Option<&str>) {
+        for component in BOTTLENECK_COMPONENTS {
+            let value = if Some(*component) == active { 1 } else { 0 };
+            self.bottleneck.with_label_values(&[component]).set(value);
+        }
     }
 
     pub fn set_volume_capacity(&self, labels: &VolumeLabels, capacity: u64) {
@@ -205,6 +381,12 @@ impl Metrics {
                 .with_label_values(&[&labels.volume, &labels.iqn, op])
                 .inc_by(bytes);
         }
+        match op {
+            "read" => self.perf.scsi_read.record(elapsed),
+            "write" => self.perf.scsi_write.record(elapsed),
+            "flush" => self.perf.scsi_flush.record(elapsed),
+            _ => {}
+        }
     }
 
     pub fn observe_s3(
@@ -228,6 +410,11 @@ impl Metrics {
                 .with_label_values(&[&labels.volume, &labels.iqn, op])
                 .inc_by(bytes);
         }
+        match op {
+            "get" => self.perf.s3_get.record(elapsed),
+            "put" => self.perf.s3_put.record(elapsed),
+            _ => {}
+        }
     }
 
     pub fn observe_cache(&self, labels: &VolumeLabels, hit: bool) {
@@ -235,11 +422,25 @@ impl Metrics {
         self.cache_ops
             .with_label_values(&[&labels.volume, &labels.iqn, result])
             .inc();
+        if hit {
+            self.perf.cache_hits.fetch_add(1, Ordering::Relaxed);
+        } else {
+            self.perf.cache_misses.fetch_add(1, Ordering::Relaxed);
+        }
     }
 
     pub fn set_cache_stats(&self, bytes: u64, entries: usize) {
         self.cache_bytes.set(bytes as i64);
         self.cache_entries.set(entries as i64);
+    }
+
+    pub fn set_write_cache_bytes(&self, bytes: u64) {
+        self.write_cache_bytes.set(bytes as i64);
+    }
+
+    pub fn set_write_buffer_stats(&self, bytes: u64, chunks: usize) {
+        self.write_buffer_bytes.set(bytes as i64);
+        self.write_buffer_chunks.set(chunks as i64);
     }
 
     pub fn set_iscsi_gauges(&self, connections: usize, sessions: usize) {
@@ -385,6 +586,8 @@ pub fn spawn_metrics_server(
     metrics: Arc<Metrics>,
     gauge_source: impl Fn() -> (usize, usize) + Send + Sync + 'static,
     cache_stats: impl Fn() -> (u64, usize) + Send + Sync + 'static,
+    write_cache_bytes: impl Fn() -> u64 + Send + Sync + 'static,
+    write_buffer_stats: impl Fn() -> (u64, usize) + Send + Sync + 'static,
 ) -> Result<(), String> {
     let server = Server::http(&bind).map_err(|e| format!("metrics bind {bind}: {e}"))?;
     info!(%bind, "prometheus metrics listening");
@@ -400,6 +603,9 @@ pub fn spawn_metrics_server(
                         metrics.set_iscsi_gauges(conns, sessions);
                         let (bytes, entries) = cache_stats();
                         metrics.set_cache_stats(bytes, entries);
+                        metrics.set_write_cache_bytes(write_cache_bytes());
+                        let (buf_bytes, buf_chunks) = write_buffer_stats();
+                        metrics.set_write_buffer_stats(buf_bytes, buf_chunks);
                         let body = metrics.gather_text();
                         let response = Response::from_string(body).with_header(
                             Header::from_bytes(
@@ -424,4 +630,24 @@ pub fn spawn_metrics_server(
         .map_err(|e| format!("spawn metrics thread: {e}"))?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn write_cache_bytes_gauge() {
+        let metrics = Metrics::new().unwrap();
+        metrics.set_write_cache_bytes(4096);
+        let text = metrics.gather_text();
+        assert!(
+            text.contains("iscsi_s3_write_cache_bytes 4096"),
+            "{text}"
+        );
+        metrics.set_write_buffer_stats(8192, 2);
+        let text = metrics.gather_text();
+        assert!(text.contains("iscsi_s3_write_buffer_bytes 8192"), "{text}");
+        assert!(text.contains("iscsi_s3_write_buffer_chunks 2"), "{text}");
+    }
 }

@@ -11,7 +11,7 @@ Lowest → highest:
 
 Volumes (`[[volumes]]`) are defined only in TOML. Env/CLI override shared settings (bind, advertise, bucket, endpoint, region, path style, logging). Multi-portal lists (`portals`), `instance`, and most auth fields are TOML-oriented; auth secrets may also come from env (`ISCSI_S3_AUTH__SECRET`, etc.). There are no CLI flags for CHAP secrets.
 
-`RUST_LOG` is preferred when set; otherwise `--log` applies (Compose commonly sets `RUST_LOG`).
+`RUST_LOG` is preferred when set; otherwise `--log` applies (default `warn`). Compose sets `RUST_LOG=warn`.
 
 ## Minimal TOML
 
@@ -54,6 +54,7 @@ capacity = "10GiB"
 | `s3.force_path_style` | Path-style URLs (`http://endpoint/bucket/key`). Usually `true` for MinIO. |
 | `s3.access_key_id` / `secret_access_key` | Optional static keys; otherwise AWS default credential chain / `AWS_*`. |
 | `cache.max_bytes` | Shared in-process LRU for whole chunks. Safe with one process (including dual-portal). Use `0` when multiple daemons share a volume. Live toggle via [`iscsi-s3-ctl`](admin-ctl.md). Details: [cache safety](../developers/cache.md), [MPIO Setup A](mpio.md#setup-a--single-process-dual-nic-keep-the-cache). |
+| `performance_optimiser` | Off by default. When true, a background thread names the current bottleneck and exports `iscsi_s3_bottleneck` (see [performance](../developers/performance.md)). Changing it requires a restart. |
 | `admin.enabled` | Listen for `iscsi-s3-ctl` on a Unix socket (default `true`). |
 | `admin.socket` | Admin UDS path (default `/tmp/iscsi-s3/admin.sock`). |
 | `volumes[].name` | Short label (logs, INQUIRY product id). |
@@ -64,6 +65,8 @@ capacity = "10GiB"
 | `volumes[].chunk_size` | S3 object size (default 4 MiB; locked after first meta write). |
 | `volumes[].compression` | Chunk compression: `none` (default), `lz4`, `zstd`, or `deflate`. Locked in `meta.json` like geometry; change requires a new prefix. |
 | `volumes[].storage` | On-disk layout: `legacy` (default — flat chunks, no snapshots) or `cow` (content-addressed; snapshots). Locked in `meta.json`. See [snapshots](snapshots.md). |
+| `volumes[].write_cache` | Optional write-back: `mode = "none"` (default, write-through), `"memory"`, or `"disk"` with `path` (directory for dirty chunk files). Optional `max_bytes` (human size or integer; `0` = unlimited) flushes the oldest dirty chunks to S3 when the budget is exceeded (or hands them to the write buffer, if enabled). Must be `0` or at least `chunk_size`. Changing mode/path/`max_bytes` requires a restart. Flushed on SCSI SYNCHRONIZE CACHE, admin copy/wipe, snapshot create, process shutdown, and budget eviction. Memory mode is lost on crash. See [chunk cache](../developers/cache.md#write-cache). |
+| `volumes[].write_buffer` | Optional queue of chunk snapshots waiting on `PutObject`, after the write cache. `max_bytes` (human size or integer; default `0` = disabled) must be `0` or at least `chunk_size`. Non-zero requires `write_cache.mode` of `memory` or `disk`. Quiet chunks (100ms) and write-cache overflow are handed off and put in the background. A full buffer blocks a write that needs a slot. Changing `max_bytes` requires a restart. See [write buffer](../developers/cache.md#write-buffer). |
 | `volumes[].auth` | Optional per-volume CHAP override (unset fields inherit from `[auth]`). |
 
 Sizes accept human strings (`64KiB`, `4MiB`, `10GiB`) or raw byte integers.
@@ -132,6 +135,7 @@ export ISCSI_S3_S3__BUCKET=iscsi
 export ISCSI_S3_S3__ENDPOINT=http://minio:9000
 export ISCSI_S3_S3__FORCE_PATH_STYLE=true
 export ISCSI_S3_CACHE__MAX_BYTES=256MiB
+export ISCSI_S3_PERFORMANCE_OPTIMISER=true
 export ISCSI_S3_AUTH__USERNAME=iscsiuser
 export ISCSI_S3_AUTH__SECRET='change-me'
 export RUST_LOG=info,iscsi_s3=debug,iscsi_target=debug
@@ -144,7 +148,10 @@ iscsi-s3 --config config.toml
 iscsi-s3 -c config.toml --bind 0.0.0.0:3260 --advertise 127.0.0.1 --bucket iscsi
 iscsi-s3 -c config.toml --endpoint http://127.0.0.1:9000 --force-path-style true
 iscsi-s3 -c config.toml --log info,iscsi_s3=debug,iscsi_target=debug
+iscsi-s3 -c config.toml --performance-optimiser true
 ```
+
+`performance_optimiser` (config, `ISCSI_S3_PERFORMANCE_OPTIMISER`, or `--performance-optimiser true|false`) starts a diagnostic thread that exports `iscsi_s3_bottleneck{component="..."}` (`0` or `1`, at most one component lit). It does not change settings. Query `iscsi_s3_bottleneck` in Grafana. Details: [performance bottleneck analyser](../developers/performance.md).
 
 ## Object layout (per volume)
 
@@ -166,10 +173,11 @@ iscsi-s3 -c config.toml --log info,iscsi_s3=debug,iscsi_target=debug
 
 ## Logging
 
-Useful filters:
+Default is `warn` (warnings and errors only). Useful filters:
 
 | Filter | Use |
 |--------|-----|
+| `warn` | Default — problems only |
 | `info` | Connection lifecycle, login, SCSI probes |
 | `iscsi_s3=debug` | Application detail |
 | `iscsi_target=debug` | PDU / bulk I/O detail |

@@ -56,6 +56,7 @@ Implementation: `portal_addrs` / `advertise_addr` on `IscsiServer` / `IscsiTarge
 - Optional per-volume chunk compression (`none` / `lz4` / `zstd` / `deflate`); compressed objects use an `ISC3` header. Locked in `meta.json`.
 - Optional `storage` (`legacy` | `cow`); locked in `meta.json`. COW volumes store pointers under `live/chunks/` and payloads under `objects/`.
 - Writes RMW partial chunks as needed.
+- Optional per-volume write-back (`write_cache.mode = none\|memory\|disk`, optional `max_bytes`) and optional S3 write buffer (`write_buffer.max_bytes`).
 - `meta.json` locks capacity/geometry grow-only rules (see user configuration docs).
 
 ## Sessions and digests
@@ -71,6 +72,8 @@ Header/data digests use CRC32C in little-endian wire order for open-iscsi/tgt in
 ## Cache
 
 See **[Chunk cache: behavior and safety](cache.md)** for the full model (write-through, LRU, multi-instance risks).
+
+Optional `performance_optimiser` (config, env, or `--performance-optimiser`) names the current bottleneck (`s3_read`, `s3_write`, `read_cache`, `write_cache`, `write_buffer`, or `iscsi`) as `iscsi_s3_bottleneck`. See **[Performance bottleneck analyser](performance.md)**.
 
 Short version: process-wide whole-chunk LRU (`cache.max_bytes`), shared across volumes. Writes hit S3 first, then patch or invalidate the local entry. **Safe for a single daemon** (including dual-portal / dual-NIC on one process). **Unsafe across multi-instance peers** — use `cache.max_bytes = 0` when multiple processes share a volume prefix.
 

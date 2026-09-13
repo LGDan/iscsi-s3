@@ -829,7 +829,7 @@ fn print_stats(data: &serde_json::Value) {
         println!("volumes:");
         for v in vols {
             println!(
-                "  - {} ({}) capacity={} auth={} prefix={} compression={}",
+                "  - {} ({}) capacity={} auth={} prefix={} compression={} write_cache={} write_cache_max_bytes={} write_buffer_max_bytes={}",
                 v.get("name").and_then(|x| x.as_str()).unwrap_or("?"),
                 v.get("iqn").and_then(|x| x.as_str()).unwrap_or("?"),
                 v.get("capacity").and_then(|x| x.as_u64()).unwrap_or(0),
@@ -837,7 +837,16 @@ fn print_stats(data: &serde_json::Value) {
                 v.get("prefix").and_then(|x| x.as_str()).unwrap_or("?"),
                 v.get("compression")
                     .and_then(|x| x.as_str())
-                    .unwrap_or("none")
+                    .unwrap_or("none"),
+                v.get("write_cache")
+                    .and_then(|x| x.as_str())
+                    .unwrap_or("none"),
+                v.get("write_cache_max_bytes")
+                    .and_then(|x| x.as_u64())
+                    .unwrap_or(0),
+                v.get("write_buffer_max_bytes")
+                    .and_then(|x| x.as_u64())
+                    .unwrap_or(0)
             );
         }
     }
@@ -862,7 +871,7 @@ fn print_volume_list(data: &serde_json::Value) {
     if let Some(vols) = data.get("volumes").and_then(|v| v.as_array()) {
         for v in vols {
             println!(
-                "  - {}  iqn={}  capacity={}  prefix={}  storage={}  compression={}  auth={}",
+                "  - {}  iqn={}  capacity={}  prefix={}  storage={}  compression={}  write_cache={} write_cache_max_bytes={} write_buffer_max_bytes={}  auth={}",
                 v.get("name").and_then(|x| x.as_str()).unwrap_or("?"),
                 v.get("iqn").and_then(|x| x.as_str()).unwrap_or("?"),
                 v.get("capacity").and_then(|x| x.as_u64()).unwrap_or(0),
@@ -871,6 +880,15 @@ fn print_volume_list(data: &serde_json::Value) {
                 v.get("compression")
                     .and_then(|x| x.as_str())
                     .unwrap_or("none"),
+                v.get("write_cache")
+                    .and_then(|x| x.as_str())
+                    .unwrap_or("none"),
+                v.get("write_cache_max_bytes")
+                    .and_then(|x| x.as_u64())
+                    .unwrap_or(0),
+                v.get("write_buffer_max_bytes")
+                    .and_then(|x| x.as_u64())
+                    .unwrap_or(0),
                 v.get("auth").and_then(|x| x.as_str()).unwrap_or("?")
             );
         }
