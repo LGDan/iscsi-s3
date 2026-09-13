@@ -98,8 +98,16 @@ enum VolumeCmd {
         #[arg(long = "resume-from")]
         resume_from: Option<u64>,
     },
-    /// Delete all chunk objects on a volume (keeps meta.json)
+    /// Delete live data, COW objects, and snapshots (keeps meta.json)
     Wipe {
+        /// Volume name or IQN
+        volume: String,
+        /// Skip interactive confirmation
+        #[arg(long, short = 'f')]
+        force: bool,
+    },
+    /// Delete unreferenced COW objects (live pointers and snapshots are kept)
+    Gc {
         /// Volume name or IQN
         volume: String,
         /// Skip interactive confirmation
@@ -349,10 +357,26 @@ fn main() -> ExitCode {
     {
         if let Err(e) = confirm_yes(
             &format!(
-                "This will WIPE all chunk data on volume '{volume}' (meta.json is kept)."
+                "This will WIPE volume '{volume}': live data, objects, and snapshots (meta.json is kept)."
             ),
             *force,
             "volume wipe",
+        ) {
+            eprintln!("error: {e}");
+            return ExitCode::from(2);
+        }
+    }
+
+    if let Commands::Volume {
+        action: VolumeCmd::Gc { volume, force },
+    } = &cli.command
+    {
+        if let Err(e) = confirm_yes(
+            &format!(
+                "This will GC unreferenced objects on volume '{volume}' (live data and snapshots are kept)."
+            ),
+            *force,
+            "volume gc",
         ) {
             eprintln!("error: {e}");
             return ExitCode::from(2);
@@ -600,6 +624,9 @@ fn build_request(cmd: &Commands) -> Result<serde_json::Value, String> {
             VolumeCmd::Wipe { volume, .. } => {
                 json!({ "op": "volume.wipe", "volume": volume })
             }
+            VolumeCmd::Gc { volume, .. } => {
+                json!({ "op": "volume.gc", "volume": volume })
+            }
             VolumeCmd::Grow { volume, capacity } => {
                 let n = parse_byte_size(capacity)?;
                 json!({ "op": "volume.grow", "volume": volume, "capacity": n })
@@ -723,6 +750,11 @@ fn print_text(cmd: &Commands, resp: &serde_json::Value) -> Result<(), String> {
             action: VolumeCmd::Wipe { .. },
         } => {
             print_volume_wipe(&data);
+        }
+        Commands::Volume {
+            action: VolumeCmd::Gc { .. },
+        } => {
+            print_volume_gc(&data);
         }
         Commands::Volume {
             action: VolumeCmd::Grow { .. },
@@ -1017,14 +1049,37 @@ fn print_volume_wipe(data: &serde_json::Value) {
         data.get("iqn").and_then(|v| v.as_str()).unwrap_or("?")
     );
     println!(
-        "chunks_deleted={}",
+        "chunks_deleted={}  objects_deleted={}  snapshots_deleted={}",
         data.get("chunks_deleted")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0),
+        data.get("objects_deleted")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0),
+        data.get("snapshots_deleted")
             .and_then(|v| v.as_u64())
             .unwrap_or(0)
     );
     if let Some(n) = data.get("note").and_then(|v| v.as_str()) {
         println!("note: {n}");
     }
+}
+
+fn print_volume_gc(data: &serde_json::Value) {
+    println!(
+        "gc volume {} ({})",
+        data.get("volume").and_then(|v| v.as_str()).unwrap_or("?"),
+        data.get("iqn").and_then(|v| v.as_str()).unwrap_or("?")
+    );
+    println!(
+        "objects_deleted={}  objects_referenced={}",
+        data.get("objects_deleted")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0),
+        data.get("objects_referenced")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0)
+    );
 }
 
 fn print_volume_grow(data: &serde_json::Value) {

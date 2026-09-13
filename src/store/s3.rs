@@ -1114,10 +1114,51 @@ impl S3ChunkStore {
         }
 
         let obj_prefix = format!("{}/objects/", self.prefix);
-        let list_prefix = obj_prefix.clone();
+        let keys = self.list_keys(&obj_prefix)?;
+
+        let mut deleted = 0u64;
+        for key in keys {
+            let Some(rel) = key.strip_prefix(&obj_prefix) else {
+                continue;
+            };
+            let Some(hash) = hash_from_object_relpath(rel) else {
+                continue;
+            };
+            if !referenced.contains(&hash) {
+                self.delete_object_key(key)?;
+                deleted += 1;
+            }
+        }
+        Ok(GcStats {
+            objects_deleted: deleted,
+            objects_referenced: referenced.len() as u64,
+        })
+    }
+
+    /// Delete every object under `prefix` (must include a trailing `/`).
+    /// Missing prefixes delete nothing. Does not touch `meta.json`.
+    pub fn delete_prefix(&self, prefix: &str) -> Result<u64, StoreError> {
+        let keys = self.list_keys(prefix)?;
+        let mut deleted = 0u64;
+        for key in keys {
+            self.delete_object_key(key)?;
+            deleted += 1;
+        }
+        Ok(deleted)
+    }
+
+    /// Delete the COW payload pool and every snapshot object. Meta is left alone.
+    pub fn wipe_objects_and_snapshots(&self) -> Result<(u64, u64), StoreError> {
+        let objects = self.delete_prefix(&format!("{}/objects/", self.prefix))?;
+        let snapshots = self.delete_prefix(&format!("{}/snapshots/", self.prefix))?;
+        Ok((objects, snapshots))
+    }
+
+    fn list_keys(&self, prefix: &str) -> Result<Vec<String>, StoreError> {
+        let list_prefix = prefix.to_string();
         let client = self.client.clone();
         let bucket = self.bucket.clone();
-        let keys: Vec<String> = self.run_async_long(
+        self.run_async_long(
             async move {
                 let mut keys = Vec::new();
                 let mut token: Option<String> = None;
@@ -1150,25 +1191,7 @@ impl S3ChunkStore {
                 Ok(keys)
             },
             Duration::from_secs(300),
-        )?;
-
-        let mut deleted = 0u64;
-        for key in keys {
-            let Some(rel) = key.strip_prefix(&obj_prefix) else {
-                continue;
-            };
-            let Some(hash) = hash_from_object_relpath(rel) else {
-                continue;
-            };
-            if !referenced.contains(&hash) {
-                self.delete_object_key(key)?;
-                deleted += 1;
-            }
-        }
-        Ok(GcStats {
-            objects_deleted: deleted,
-            objects_referenced: referenced.len() as u64,
-        })
+        )
     }
 }
 

@@ -45,6 +45,9 @@ iscsi-s3-ctl volume snapshot list disk0
 iscsi-s3-ctl volume snapshot restore disk0 before-upgrade [--force]
 iscsi-s3-ctl volume snapshot clone disk0 before-upgrade --to disk1
 iscsi-s3-ctl volume snapshot delete disk0 before-upgrade [--force]
+
+# Unreferenced objects only (snapshots and live pointers stay)
+iscsi-s3-ctl volume gc disk0 [--force]
 ```
 
 | Command | Behavior |
@@ -52,6 +55,7 @@ iscsi-s3-ctl volume snapshot delete disk0 before-upgrade [--force]
 | `create` | Quiesce check → invalidate volume cache → write `chunks.bin` + `manifest.json` |
 | `list` | Headers only (`manifest.json`) |
 | `delete` | Remove snapshot objects + synchronous GC of unreferenced `objects/` |
+| `volume gc` | Same unreferenced sweep, without deleting a snapshot |
 | `restore` | Quiesce → replace live pointers from `chunks.bin` (grow-only if snap larger) |
 | `clone` | Dest must be empty COW with matching geometry; shares/copies objects as needed |
 
@@ -85,7 +89,8 @@ Then set `storage = "cow"` in config and restart.
 
 ## Interactions
 
-- **`volume wipe`**: deletes live pointers/chunks only; snapshots kept.
+- **`volume wipe`**: deletes live pointers, every snapshot, and the entire `objects/` pool. `meta.json` is kept.
+- **`volume gc`**: deletes unreferenced objects only. Live pointers and snapshots stay.
 - **`volume.grow`**: live meta only; existing snapshots keep recorded capacity.
 - **`volume.copy`**: still a full logical copy (unchanged in v1).
 - Clone of a second IQN still requires the destination volume in config (restart to add IQN).

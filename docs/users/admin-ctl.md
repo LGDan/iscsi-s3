@@ -44,7 +44,8 @@ Docker: install both `iscsi-s3` and `iscsi-s3-ctl` in the image. Mount/share the
 | `volume export <name\|iqn> --file PATH [--size N]` | Stream a raw image out of a volume (default: full capacity) |
 | `volume grow <name\|iqn> --capacity SIZE` | Grow-only capacity update (meta.json + live READ CAPACITY) |
 | `volume copy <from> <to> [--force] [--resume-from N]` | 1:1 sparse copy; **overwrites** destination (prompts unless `--force`) |
-| `volume wipe <name\|iqn> [--force]` | Delete all chunk objects; keeps `meta.json` (prompts unless `--force`) |
+| `volume wipe <name\|iqn> [--force]` | Delete live data, COW objects, and snapshots; keeps `meta.json` (prompts unless `--force`) |
+| `volume gc <name\|iqn> [--force]` | Delete unreferenced COW objects; live pointers and snapshots stay (prompts unless `--force`) |
 | `volume snapshot create <vol> [--name ID] [--force]` | Create CoW snapshot (`storage=cow` only); quiesce unless `--force` |
 | `volume snapshot list <vol>` | List snapshot headers |
 | `volume snapshot delete <vol> <id> [--force]` | Delete snapshot + GC unreferenced objects |
@@ -137,7 +138,7 @@ Rules:
 
 ## Wipe a volume (`volume wipe`)
 
-Delete every chunk object under the volume prefix. `meta.json` (capacity / geometry / compression) is kept so the volume stays configured but fully sparse.
+Delete live chunk/pointer objects, every COW payload under `objects/`, and every snapshot. `meta.json` (capacity / geometry / compression) is kept so the volume stays configured but fully sparse. Writers are paused for the sweep (I/O lock) and unlocked even if it fails, so a partial wipe can be re-run.
 
 ```bash
 iscsi-s3-ctl volume wipe disk0
@@ -146,6 +147,15 @@ iscsi-s3-ctl volume wipe disk0 --force
 ```
 
 Prefer `volume disconnect` (or logout) first so initiators are not reading/writing during the wipe.
+
+## Garbage-collect a volume (`volume gc`)
+
+Delete COW objects that no live pointer and no remaining snapshot still names. Live data and snapshots are kept. `storage=legacy` is refused (there is no object pool). Writers are paused for the list-and-delete so a pointer update cannot race the sweep.
+
+```bash
+iscsi-s3-ctl volume gc disk0
+iscsi-s3-ctl volume gc disk0 --force
+```
 
 ## Grow capacity (`volume grow`)
 

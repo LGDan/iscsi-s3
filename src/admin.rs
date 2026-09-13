@@ -292,7 +292,7 @@ fn prepare_write_image(state: &AdminState, req: &AdminRequest) -> Result<WriteIm
 }
 
 /// Volume is seedable when it has no live chunk/pointer objects yet.
-/// `meta.json` and COW `objects/` / `snapshots/` are allowed (e.g. after wipe).
+/// `meta.json` is allowed (wipe leaves geometry, not payloads or snapshots).
 pub fn ensure_prefix_empty_for_seed(stats: &PrefixObjectStats) -> Result<(), String> {
     if stats.chunk_count > 0 {
         return Err(format!(
@@ -407,6 +407,10 @@ fn dispatch(state: &AdminState, req: &AdminRequest) -> serde_json::Value {
             Err(e) => err(e),
         },
         "volume.wipe" => match volume_wipe(state, req.volume.as_deref()) {
+            Ok(v) => ok(v),
+            Err(e) => err(e),
+        },
+        "volume.gc" => match volume_gc(state, req.volume.as_deref()) {
             Ok(v) => ok(v),
             Err(e) => err(e),
         },
@@ -684,11 +688,28 @@ fn volume_wipe(state: &AdminState, selector: Option<&str>) -> Result<serde_json:
     let snap = state.snapshot.lock().clone();
     let vol = find_volume(&snap.volumes, selector)?.clone();
     let handle = find_volume_store(&state.volume_stores, &vol)?;
-    let result = wipe_volume(handle.store.as_ref()).map_err(|e| e.to_string())?;
+    handle
+        .store
+        .discard_dirty()
+        .map_err(|e| format!("discard write cache: {e}"))?;
+    handle.store.lock_io();
+    let result = (|| {
+        let wiped = wipe_volume(handle.store.as_ref())?;
+        let (objects_deleted, snapshots_deleted) = handle
+            .store
+            .s3()
+            .wipe_objects_and_snapshots()
+            .map_err(|e| e.to_string())?;
+        Ok::<_, String>((wiped, objects_deleted, snapshots_deleted))
+    })();
+    handle.store.unlock_io();
+    let (wiped, objects_deleted, snapshots_deleted) = result?;
 
     info!(
         volume = %vol.name,
-        chunks_deleted = result.chunks_deleted,
+        chunks_deleted = wiped.chunks_deleted,
+        objects_deleted,
+        snapshots_deleted,
         "volume wipe complete"
     );
 
@@ -696,8 +717,34 @@ fn volume_wipe(state: &AdminState, selector: Option<&str>) -> Result<serde_json:
         "volume": vol.name,
         "iqn": vol.iqn,
         "prefix": vol.prefix,
-        "chunks_deleted": result.chunks_deleted,
-        "note": "all chunk objects deleted; meta.json kept (volume geometry unchanged)",
+        "chunks_deleted": wiped.chunks_deleted,
+        "objects_deleted": objects_deleted,
+        "snapshots_deleted": snapshots_deleted,
+        "note": "live data, objects, and snapshots deleted; meta.json kept",
+    }))
+}
+
+fn volume_gc(state: &AdminState, selector: Option<&str>) -> Result<serde_json::Value, String> {
+    let snap = state.snapshot.lock().clone();
+    let vol = find_volume(&snap.volumes, selector)?.clone();
+    let handle = find_volume_store(&state.volume_stores, &vol)?;
+    handle.store.lock_io();
+    let gc = handle.store.s3().gc_unreferenced_objects();
+    handle.store.unlock_io();
+    let gc = gc.map_err(|e| e.to_string())?;
+
+    info!(
+        volume = %vol.name,
+        objects_deleted = gc.objects_deleted,
+        objects_referenced = gc.objects_referenced,
+        "volume gc complete"
+    );
+
+    Ok(json!({
+        "volume": vol.name,
+        "iqn": vol.iqn,
+        "objects_deleted": gc.objects_deleted,
+        "objects_referenced": gc.objects_referenced,
     }))
 }
 
