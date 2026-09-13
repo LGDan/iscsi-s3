@@ -321,6 +321,46 @@ pub struct VolumeConfig {
     /// Optional per-volume CHAP override (inherits unset fields from `[auth]`).
     #[serde(default)]
     pub auth: Option<AuthSettings>,
+    /// Optional write-back cache (default `none` = write-through to S3).
+    #[serde(default)]
+    pub write_cache: WriteCacheConfig,
+}
+
+/// Where SCSI writes are acknowledged before S3.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum WriteCacheMode {
+    #[default]
+    None,
+    Memory,
+    Disk,
+}
+
+impl WriteCacheMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Memory => "memory",
+            Self::Disk => "disk",
+        }
+    }
+}
+
+fn default_write_cache_max() -> u64 {
+    0
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WriteCacheConfig {
+    #[serde(default)]
+    pub mode: WriteCacheMode,
+    /// Directory for dirty chunk files (`mode = "disk"`).
+    #[serde(default)]
+    pub path: Option<PathBuf>,
+    /// Dirty-data budget. `0` = unlimited. When set, oldest dirty chunks
+    /// flush to S3 until the set fits.
+    #[serde(default = "default_write_cache_max", with = "bytesize_serde")]
+    pub max_bytes: u64,
 }
 
 fn default_block_size() -> u32 {
@@ -506,6 +546,7 @@ impl Config {
         let mut names = std::collections::HashSet::new();
         let mut iqns = std::collections::HashSet::new();
         let mut prefixes = std::collections::HashSet::new();
+        let mut disk_paths = std::collections::HashSet::new();
         for vol in &self.volumes {
             if vol.name.is_empty() {
                 return Err(ConfigError::Invalid("volume name must not be empty".into()));
@@ -552,6 +593,35 @@ impl Config {
                 }
                 other => other,
             })?;
+            if matches!(
+                vol.write_cache.mode,
+                WriteCacheMode::Memory | WriteCacheMode::Disk
+            ) && vol.write_cache.max_bytes > 0
+                && vol.write_cache.max_bytes < vol.chunk_size
+            {
+                return Err(ConfigError::Invalid(format!(
+                    "volume {}: write_cache.max_bytes ({}) must be 0 (unlimited) or at least chunk_size ({})",
+                    vol.name, vol.write_cache.max_bytes, vol.chunk_size
+                )));
+            }
+            match vol.write_cache.mode {
+                WriteCacheMode::Disk => {
+                    let path = vol.write_cache.path.as_ref().filter(|p| !p.as_os_str().is_empty());
+                    let Some(path) = path else {
+                        return Err(ConfigError::Invalid(format!(
+                            "volume {}: write_cache.mode=disk requires write_cache.path",
+                            vol.name
+                        )));
+                    };
+                    if !disk_paths.insert(path.clone()) {
+                        return Err(ConfigError::Invalid(format!(
+                            "volume {}: write_cache.path {:?} is used by another volume",
+                            vol.name, path
+                        )));
+                    }
+                }
+                WriteCacheMode::None | WriteCacheMode::Memory => {}
+            }
         }
         Ok(())
     }
@@ -795,5 +865,80 @@ capacity = "1GiB"
             no_metrics: false,
         };
         assert!(Config::load(&cli).is_err());
+    }
+
+    #[test]
+    fn config_rejects_disk_write_cache_without_path() {
+        let mut file = NamedTempFile::new().unwrap();
+        writeln!(
+            file,
+            r#"
+bind = "0.0.0.0:3260"
+[s3]
+bucket = "iscsi"
+[[volumes]]
+name = "disk0"
+iqn = "iqn.2026-09.local:disk0"
+prefix = "disks/disk0"
+capacity = "1GiB"
+write_cache = {{ mode = "disk" }}
+"#
+        )
+        .unwrap();
+        let cli = Cli {
+            config: Some(file.path().to_path_buf()),
+            bind: None,
+            advertise: None,
+            bucket: None,
+            endpoint: None,
+            region: None,
+            force_path_style: None,
+            log: "info".into(),
+            metrics_bind: None,
+            no_metrics: false,
+        };
+        let err = Config::load(&cli).unwrap_err();
+        assert!(
+            err.to_string().contains("write_cache.path"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn config_rejects_write_cache_max_below_chunk() {
+        let mut file = NamedTempFile::new().unwrap();
+        writeln!(
+            file,
+            r#"
+bind = "0.0.0.0:3260"
+[s3]
+bucket = "iscsi"
+[[volumes]]
+name = "disk0"
+iqn = "iqn.2026-09.local:disk0"
+prefix = "disks/disk0"
+capacity = "1GiB"
+chunk_size = "4MiB"
+write_cache = {{ mode = "memory", max_bytes = "1KiB" }}
+"#
+        )
+        .unwrap();
+        let cli = Cli {
+            config: Some(file.path().to_path_buf()),
+            bind: None,
+            advertise: None,
+            bucket: None,
+            endpoint: None,
+            region: None,
+            force_path_style: None,
+            log: "info".into(),
+            metrics_bind: None,
+            no_metrics: false,
+        };
+        let err = Config::load(&cli).unwrap_err();
+        assert!(
+            err.to_string().contains("write_cache.max_bytes"),
+            "{err}"
+        );
     }
 }

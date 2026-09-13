@@ -11,3 +11,4 @@ pub mod snapshot;
 pub mod storage_mode;
 pub mod store;
 pub mod volume;
+pub mod write_cache;

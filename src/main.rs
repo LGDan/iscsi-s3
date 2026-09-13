@@ -157,7 +157,7 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             vol,
         )?;
         let capacity = opened.store.capacity();
-        let storage = opened.store.inner().storage_mode().as_str().to_string();
+        let storage = opened.store.s3().storage_mode().as_str().to_string();
         volume_labels.push(opened.labels.clone());
         volume_stores.push(AdminVolumeHandle {
             name: opened.name.clone(),
@@ -175,6 +175,8 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             chunk_size: vol.chunk_size,
             compression: vol.compression.as_str().to_string(),
             storage,
+            write_cache: vol.write_cache.mode.as_str().to_string(),
+            write_cache_max_bytes: vol.write_cache.max_bytes,
         });
         info!(
             name = %opened.name,
@@ -185,6 +187,7 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             capacity,
             auth = auth.mode.as_str(),
             chap_user = auth.username.as_deref().unwrap_or("-"),
+            write_cache = vol.write_cache.mode.as_str(),
             "volume ready"
         );
         builder = builder.add_target_with_auth(

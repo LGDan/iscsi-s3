@@ -55,6 +55,12 @@ capacity = "10GiB"
 # block_size = 512
 # chunk_size = "4MiB"
 # compression = "none"   # or "lz4" | "zstd" | "deflate" (locked in meta.json)
+# Write-back cache (default none = write-through to S3). Memory is lost on crash.
+# Disk survives restart until SYNCHRONIZE CACHE / shutdown flush.
+# max_bytes = 0 (default) is unlimited; otherwise oldest dirty chunks flush to S3.
+# write_cache = { mode = "none" }
+# write_cache = { mode = "memory", max_bytes = "64MiB" }
+# write_cache = { mode = "disk", path = "/var/cache/iscsi-s3/disk0", max_bytes = "1GiB" }
 
 [[volumes]]
 name = "disk1"

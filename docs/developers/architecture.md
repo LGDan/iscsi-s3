@@ -56,6 +56,7 @@ Implementation: `portal_addrs` / `advertise_addr` on `IscsiServer` / `IscsiTarge
 - Optional per-volume chunk compression (`none` / `lz4` / `zstd` / `deflate`); compressed objects use an `ISC3` header. Locked in `meta.json`.
 - Optional `storage` (`legacy` | `cow`); locked in `meta.json`. COW volumes store pointers under `live/chunks/` and payloads under `objects/`.
 - Writes RMW partial chunks as needed.
+- Optional per-volume write-back (`write_cache.mode = none\|memory\|disk`, optional `max_bytes`).
 - `meta.json` locks capacity/geometry grow-only rules (see user configuration docs).
 
 ## Sessions and digests

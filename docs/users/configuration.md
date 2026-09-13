@@ -64,6 +64,7 @@ capacity = "10GiB"
 | `volumes[].chunk_size` | S3 object size (default 4 MiB; locked after first meta write). |
 | `volumes[].compression` | Chunk compression: `none` (default), `lz4`, `zstd`, or `deflate`. Locked in `meta.json` like geometry; change requires a new prefix. |
 | `volumes[].storage` | On-disk layout: `legacy` (default — flat chunks, no snapshots) or `cow` (content-addressed; snapshots). Locked in `meta.json`. See [snapshots](snapshots.md). |
+| `volumes[].write_cache` | Optional write-back: `mode = "none"` (default, write-through), `"memory"`, or `"disk"` with `path` (directory for dirty chunk files). Optional `max_bytes` (human size or integer; `0` = unlimited) flushes the oldest dirty chunks to S3 when the budget is exceeded. Must be `0` or at least `chunk_size`. Changing mode/path/`max_bytes` requires a restart. Flushed on SCSI SYNCHRONIZE CACHE, admin copy/wipe, snapshot create, process shutdown, and budget eviction. Memory mode is lost on crash. See [chunk cache](../developers/cache.md#write-cache). |
 | `volumes[].auth` | Optional per-volume CHAP override (unset fields inherit from `[auth]`). |
 
 Sizes accept human strings (`64KiB`, `4MiB`, `10GiB`) or raw byte integers.

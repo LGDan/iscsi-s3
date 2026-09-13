@@ -1,11 +1,10 @@
 //! Local Unix-domain admin control plane for `iscsi-s3-ctl`.
 
-use crate::cache::{CachedStore, ChunkCache};
+use crate::cache::ChunkCache;
 use crate::config::{parse_byte_size, Config};
 use crate::metrics::{Metrics, SessionMetricsSink};
-use crate::store::{
-    list_prefix_stats, BlockStore, S3ChunkStore, PrefixObjectStats,
-};
+use crate::store::{list_prefix_stats, BlockStore, PrefixObjectStats};
+use crate::volume::VolumeStore;
 use crate::storage_mode::StorageMode;
 use iscsi_target::IscsiServer;
 use parking_lot::Mutex;
@@ -29,13 +28,15 @@ pub struct VolumeSummary {
     pub chunk_size: u64,
     pub compression: String,
     pub storage: String,
+    pub write_cache: String,
+    pub write_cache_max_bytes: u64,
 }
 
 /// Live store handle used by admin write paths (same Arc as the iSCSI device).
 pub struct AdminVolumeHandle {
     pub name: String,
     pub iqn: String,
-    pub store: Arc<CachedStore<S3ChunkStore>>,
+    pub store: Arc<VolumeStore>,
 }
 
 pub struct AdminState {
@@ -766,10 +767,14 @@ fn volume_snapshot_create(
                 .unwrap_or(0);
             format!("snap-{ts}")
         });
+    handle
+        .store
+        .flush()
+        .map_err(|e| format!("flush write cache: {e}"))?;
     handle.store.cache().invalidate_volume(&vol.name);
     let manifest = handle
         .store
-        .inner()
+        .s3()
         .snapshot_create(&id, &vol.name)
         .map_err(|e| e.to_string())?;
     Ok(json!({
@@ -787,7 +792,7 @@ fn volume_snapshot_list(
     let handle = find_volume_store(&state.volume_stores, &vol)?;
     let list = handle
         .store
-        .inner()
+        .s3()
         .snapshot_list()
         .map_err(|e| e.to_string())?;
     Ok(json!({
@@ -811,7 +816,7 @@ fn volume_snapshot_delete(
     let handle = find_volume_store(&state.volume_stores, &vol)?;
     let gc = handle
         .store
-        .inner()
+        .s3()
         .snapshot_delete(id)
         .map_err(|e| e.to_string())?;
     Ok(json!({
@@ -833,10 +838,14 @@ fn volume_snapshot_restore(
         .as_deref()
         .ok_or_else(|| "snapshot id is required".to_string())?;
     let handle = find_volume_store(&state.volume_stores, &vol)?;
+    handle
+        .store
+        .discard_dirty()
+        .map_err(|e| format!("discard write cache: {e}"))?;
     handle.store.cache().invalidate_volume(&vol.name);
     let stats = handle
         .store
-        .inner()
+        .s3()
         .snapshot_restore(id)
         .map_err(|e| e.to_string())?;
     handle.store.cache().invalidate_volume(&vol.name);
@@ -870,11 +879,19 @@ fn volume_snapshot_clone(
         .ok_or_else(|| "snapshot id is required".to_string())?;
     let src_h = find_volume_store(&state.volume_stores, &src)?;
     let dst_h = find_volume_store(&state.volume_stores, &dst)?;
+    src_h
+        .store
+        .flush()
+        .map_err(|e| format!("flush source write cache: {e}"))?;
+    dst_h
+        .store
+        .discard_dirty()
+        .map_err(|e| format!("discard dest write cache: {e}"))?;
     dst_h.store.cache().invalidate_volume(&dst.name);
     let stats = src_h
         .store
-        .inner()
-        .snapshot_clone_into(dst_h.store.inner(), id)
+        .s3()
+        .snapshot_clone_into(dst_h.store.s3(), id)
         .map_err(|e| e.to_string())?;
     {
         let mut snap = state.snapshot.lock();
@@ -898,7 +915,7 @@ fn volume_migrate_cow(
     let vol = find_volume(&snap.volumes, selector)?.clone();
     require_quiesced(state, &vol.name, &vol.iqn, false)?;
     let handle = find_volume_store(&state.volume_stores, &vol)?;
-    if handle.store.inner().storage_mode() != StorageMode::Legacy {
+    if handle.store.s3().storage_mode() != StorageMode::Legacy {
         return Err(format!(
             "volume {} is already storage=cow",
             vol.name
@@ -908,7 +925,7 @@ fn volume_migrate_cow(
     // Lock initiator I/O for the whole migration. Stays locked on failure so
     // clients cannot read zeros for chunks already deleted from the legacy layout.
     handle.store.lock_io();
-    let stats = match handle.store.inner().migrate_to_cow() {
+    let stats = match handle.store.s3().migrate_to_cow() {
         Ok(s) => s,
         Err(e) => {
             return Err(format!(
@@ -1362,6 +1379,8 @@ fn volumes_structurally_changed(current: &AdminSnapshot, new_cfg: &Config) -> bo
             || cur.chunk_size != vol.chunk_size
             || cur.compression != vol.compression.as_str()
             || cur.storage != vol.storage.as_str()
+            || cur.write_cache != vol.write_cache.mode.as_str()
+            || cur.write_cache_max_bytes != vol.write_cache.max_bytes
         {
             return true;
         }
@@ -1513,6 +1532,8 @@ mod tests {
                 chunk_size: 4096,
                 compression: "none".into(),
                 storage: "legacy".into(),
+                write_cache: "none".into(),
+                write_cache_max_bytes: 0,
             }],
             cache_max_bytes: 1024,
             s3_bucket: None,
@@ -1540,6 +1561,7 @@ mod tests {
                 auth: None,
                 compression: Default::default(),
                 storage: Default::default(),
+                write_cache: Default::default(),
             }],
         };
         let r = apply_safe_reload(&snap, &cfg, &cache).unwrap();

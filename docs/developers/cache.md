@@ -24,7 +24,31 @@ SCSI WRITE → CachedStore.write_at → inner.write_at (S3 Put, must succeed fir
                                   → else: invalidate that chunk key (no insert)
 ```
 
-Writes never complete as “cached only.” A successful SCSI write means the inner store accepted the data (for S3: `PutObject`, with CAS retries on partial-chunk RMW).
+With the default **write cache** (`volumes[].write_cache.mode = "none"`), writes never complete as “cached only.” A successful SCSI write means the inner store accepted the data (for S3: `PutObject`, with CAS retries on partial-chunk RMW).
+
+## Write cache
+
+Optional **per-volume write-back** (`WriteCachedStore` in [`src/write_cache.rs`](../../src/write_cache.rs)), in front of the read LRU.
+
+| `mode` | Behavior | Crash |
+|--------|----------|--------|
+| `none` (default) | Write-through to S3 | No extra loss |
+| `memory` | Dirty whole chunks in RAM; SCSI write returns after the patch | Dirty data lost |
+| `disk` | Same plus atomic files under `write_cache.path` | Recovered on reopen, then flushed |
+
+Optional `write_cache.max_bytes` (default `0` = unlimited) caps dirty data. When the set would exceed the budget, the **oldest** dirty chunks flush to S3 (and disk files are removed) until it fits. A non-zero budget must be at least `chunk_size` — the cache stores whole chunks.
+
+Partial SCSI writes still RMW a full chunk, but the Get/Put to S3 is deferred until:
+
+- SCSI SYNCHRONIZE CACHE (`flush`)
+- admin copy / wipe / snapshot create
+- I/O lock (e.g. migrate-cow)
+- process shutdown (`Drop`)
+- dirty size exceeds `max_bytes` (oldest first)
+
+Reads serve dirty chunks first. Snapshot **restore/clone dest** discards dirty data so it cannot overlay restored pointers.
+
+`mode = "disk"` requires a unique `path` per volume. Do not share a write-cache directory across volumes or hosts. Multi-instance MPIO plus write-back is **unsafe** (same as a hot read cache).
 
 ## What “data loss” means here
 

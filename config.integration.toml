@@ -25,6 +25,7 @@ prefix = "disks/disk0"
 capacity = "64GiB"
 chunk_size = "8MiB"
 storage = "cow"
+write_cache = { mode = "memory", max_bytes = "512MiB" }
 
 [[volumes]]
 name = "disk1"
