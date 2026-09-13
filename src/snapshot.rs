@@ -115,6 +115,37 @@ pub fn hash_hex(hash: &[u8; HASH_LEN]) -> String {
     hash.iter().map(|b| format!("{b:02x}")).collect()
 }
 
+/// Two directory levels so a large `objects/` pool does not land in one prefix.
+/// `abcdef112233` becomes `ab/cd/ef112233`. Names shorter than 4 characters are unchanged.
+pub fn shard_object_name(name: &str) -> String {
+    if name.len() < 4 {
+        return name.to_string();
+    }
+    format!("{}/{}/{}", &name[..2], &name[2..4], &name[4..])
+}
+
+/// Relative key under `{prefix}/objects/` for a content-addressed payload.
+pub fn object_relpath(hash: &[u8; HASH_LEN]) -> String {
+    shard_object_name(&hash_hex(hash))
+}
+
+/// Recover a BLAKE3 hash from a sharded key relative to `{prefix}/objects/` (`ab/cd/…`).
+pub fn hash_from_object_relpath(rel: &str) -> Option<[u8; HASH_LEN]> {
+    let (a, b, rest) = split_sharded_name(rel)?;
+    parse_hash_hex(&format!("{a}{b}{rest}")).ok()
+}
+
+fn split_sharded_name(rel: &str) -> Option<(&str, &str, &str)> {
+    let b = rel.as_bytes();
+    if b.len() < 6 || b[2] != b'/' || b[5] != b'/' {
+        return None;
+    }
+    if rel[6..].contains('/') {
+        return None;
+    }
+    Some((&rel[..2], &rel[3..5], &rel[6..]))
+}
+
 pub fn parse_hash_hex(s: &str) -> Result<[u8; HASH_LEN], StoreError> {
     if s.len() != HASH_LEN * 2 {
         return Err(StoreError::Other(format!("invalid blake3 hex length {}", s.len())));
@@ -218,5 +249,17 @@ mod tests {
         write_chunks_bin(&mut buf, &refs).unwrap();
         let got = read_chunks_bin(&mut Cursor::new(buf)).unwrap();
         assert_eq!(got, refs);
+    }
+
+    #[test]
+    fn object_name_is_sharded_two_levels() {
+        assert_eq!(shard_object_name("abcdef112233"), "ab/cd/ef112233");
+        let hash = hash_object_bytes(b"payload");
+        let hex = hash_hex(&hash);
+        let rel = object_relpath(&hash);
+        assert_eq!(rel, format!("{}/{}/{}", &hex[..2], &hex[2..4], &hex[4..]));
+        assert_eq!(hash_from_object_relpath(&rel), Some(hash));
+        assert_eq!(hash_from_object_relpath(&hex), None);
+        assert_eq!(hash_from_object_relpath("ab/not-a-hash"), None);
     }
 }

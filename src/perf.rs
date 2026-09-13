@@ -546,10 +546,18 @@ mod tests {
         let started = std::time::Instant::now() - Duration::from_millis(40);
         metrics.observe_scsi(&labels, "read", 512, started, true);
         metrics.observe_s3(&labels, "get", 4096, started, true);
+        metrics.observe_s3(&labels, "get_pointer", 37, started, true);
         metrics.observe_cache(&labels, false);
         let c = metrics.perf_counters();
         assert_eq!(c.scsi_read.count, 1);
         assert_eq!(c.s3_get.count, 1);
+        let text = metrics.gather_text();
+        assert!(
+            text.contains(
+                "iscsi_s3_s3_op_duration_seconds_count{iqn=\"iqn.test:disk0\",op=\"get_pointer\",volume=\"disk0\"} 1"
+            ),
+            "{text}"
+        );
         assert!(c.s3_get.sum_us >= 40_000);
         assert_eq!(c.cache_misses, 1);
         assert_eq!(c.cache_hits, 0);

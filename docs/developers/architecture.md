@@ -16,7 +16,7 @@ ChunkCache (optional hit)
     │
     ▼
 S3ChunkStore  →  legacy: `{prefix}/chunks/{index:016x}` + `{prefix}/meta.json`
-              →  cow:    `{prefix}/live/…` + `{prefix}/objects/{blake3}` + snapshots
+              →  cow:    `{prefix}/live/…` + `{prefix}/objects/{ab}/{cd}/{blake3rest}` + snapshots
 ```
 
 S3 I/O runs on a dedicated Tokio runtime. iSCSI connection threads call into the store via a spawn + channel pattern so they never nest `block_on` on the runtime.

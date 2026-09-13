@@ -7,7 +7,7 @@ Application-level snapshots for volumes configured with **`storage = "cow"`**. L
 | Mode | Layout | Snapshots | I/O |
 |------|--------|-----------|-----|
 | **`legacy`** (default) | `{prefix}/meta.json` + `{prefix}/chunks/{016x}` full payloads | Refused | No hashing / pointer puts |
-| **`cow`** | `{prefix}/live/` + `{prefix}/objects/{blake3}` + `{prefix}/snapshots/` | Full set | BLAKE3 + pointer object per present chunk |
+| **`cow`** | `{prefix}/live/` + `{prefix}/objects/{ab}/{cd}/{rest}` + `{prefix}/snapshots/` | Full set | BLAKE3 + pointer object per present chunk |
 
 ```toml
 [[volumes]]
@@ -24,12 +24,14 @@ Mode is locked in `meta.json` on first write. Changing `cow` → `legacy` is ref
 ```text
 {family}/live/meta.json
 {family}/live/chunks/{016x}          # thin binary pointers (BLAKE3)
-{family}/objects/{blake3hex}         # immutable chunk payloads (post-compression bytes)
+{family}/objects/{ab}/{cd}/{rest}    # immutable chunk payloads (blake3 hex, two-level shard)
 {family}/snapshots/{id}/manifest.json
 {family}/snapshots/{id}/chunks.bin   # compact present-chunk index
 ```
 
 Snapshot create builds `chunks.bin` from live pointers (metadata only — not a full data copy). Later writes allocate new objects and update live pointers; snapshot objects stay immutable.
+
+Object names are the lowercase BLAKE3 hex, split into two directory levels (`abcdef…` → `ab/cd/ef…`) so a large pool is not one S3 prefix.
 
 ## Commands
 

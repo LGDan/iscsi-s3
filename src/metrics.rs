@@ -211,7 +211,7 @@ impl Metrics {
         let s3_ops = IntCounterVec::new(
             Opts::new(
                 "iscsi_s3_s3_ops_total",
-                "S3 GetObject/PutObject (and meta) operations",
+                "S3 operations (get, put, get_pointer, get_meta, put_meta, delete)",
             ),
             &["volume", "iqn", "op", "result"],
         )?;
@@ -225,7 +225,7 @@ impl Metrics {
         let s3_duration = HistogramVec::new(
             HistogramOpts::new(
                 "iscsi_s3_s3_op_duration_seconds",
-                "S3 operation latency",
+                "S3 operation latency; op=get_pointer is the COW pointer-file GetObject",
             )
             .buckets(latency_buckets()),
             &["volume", "iqn", "op"],

@@ -4,8 +4,9 @@ use super::{check_range, BlockStore, StoreError};
 use crate::compression::{decode_chunk, encode_chunk, Compression};
 use crate::metrics::{Metrics, VolumeLabels};
 use crate::snapshot::{
-    decode_pointer, encode_pointer, hash_hex, hash_object_bytes, read_chunks_bin, require_cow,
-    write_chunks_bin, ChunkRef, SnapshotManifest, SnapshotState, HASH_LEN,
+    decode_pointer, encode_pointer, hash_from_object_relpath, hash_hex, hash_object_bytes,
+    object_relpath, read_chunks_bin, require_cow, write_chunks_bin, ChunkRef, SnapshotManifest,
+    SnapshotState, HASH_LEN,
 };
 use crate::storage_mode::StorageMode;
 use aws_sdk_s3::error::SdkError;
@@ -343,7 +344,14 @@ impl S3ChunkStore {
     }
 
     fn object_key(&self, hash: &[u8; HASH_LEN]) -> String {
-        format!("{}/objects/{}", self.prefix, hash_hex(hash))
+        format!("{}/objects/{}", self.prefix, object_relpath(hash))
+    }
+
+    fn get_object(
+        &self,
+        hash: &[u8; HASH_LEN],
+    ) -> Result<Option<(Vec<u8>, Option<String>)>, StoreError> {
+        self.get_bytes(self.object_key(hash))
     }
 
     fn snapshot_prefix(&self, id: &str) -> String {
@@ -523,6 +531,22 @@ impl S3ChunkStore {
     }
 
     fn get_bytes(&self, key: String) -> Result<Option<(Vec<u8>, Option<String>)>, StoreError> {
+        self.get_bytes_as(key, "get")
+    }
+
+    /// GetObject of a COW pointer file (`live/chunks/{index}`), timed as `get_pointer`.
+    fn get_pointer_bytes(
+        &self,
+        key: String,
+    ) -> Result<Option<(Vec<u8>, Option<String>)>, StoreError> {
+        self.get_bytes_as(key, "get_pointer")
+    }
+
+    fn get_bytes_as(
+        &self,
+        key: String,
+        op: &str,
+    ) -> Result<Option<(Vec<u8>, Option<String>)>, StoreError> {
         let started = Instant::now();
         let client = self.client.clone();
         let bucket = self.bucket.clone();
@@ -566,7 +590,7 @@ impl S3ChunkStore {
             .map(|(v, _)| v.len() as u64)
             .unwrap_or(0);
         self.metrics
-            .observe_s3(&self.labels, "get", bytes, started, result.is_ok());
+            .observe_s3(&self.labels, op, bytes, started, result.is_ok());
         result
     }
 
@@ -620,12 +644,11 @@ impl S3ChunkStore {
             }
             StorageMode::Cow => {
                 let ptr_key = self.chunk_key(index);
-                match self.get_bytes(ptr_key)? {
+                match self.get_pointer_bytes(ptr_key)? {
                     None => Ok((vec![0u8; chunk_size], None)),
                     Some((ptr_bytes, etag)) => {
                         let hash = decode_pointer(&ptr_bytes)?;
-                        let obj_key = self.object_key(&hash);
-                        let Some((body, _)) = self.get_bytes(obj_key)? else {
+                        let Some((body, _)) = self.get_object(&hash)? else {
                             return Err(StoreError::Other(format!(
                                 "missing cow object for chunk {index}"
                             )));
@@ -681,7 +704,7 @@ impl S3ChunkStore {
     }
 
     fn read_pointer_hash(&self, index: u64) -> Result<Option<[u8; HASH_LEN]>, StoreError> {
-        match self.get_bytes(self.chunk_key(index))? {
+        match self.get_pointer_bytes(self.chunk_key(index))? {
             None => Ok(None),
             Some((bytes, _)) => Ok(Some(decode_pointer(&bytes)?)),
         }
@@ -918,10 +941,9 @@ impl S3ChunkStore {
         let mut objects_copied = 0u64;
         let mut pointers_written = 0u64;
         for r in &refs {
-            let src_key = self.object_key(&r.hash);
             let dst_key = dest.object_key(&r.hash);
-            if dest.get_bytes(dst_key.clone())?.is_none() {
-                let Some((body, _)) = self.get_bytes(src_key)? else {
+            if dest.get_object(&r.hash)?.is_none() {
+                let Some((body, _)) = self.get_object(&r.hash)? else {
                     return Err(StoreError::Other(format!(
                         "missing object for hash {}",
                         hash_hex(&r.hash)
@@ -1027,6 +1049,7 @@ impl S3ChunkStore {
         }
 
         let obj_prefix = format!("{}/objects/", self.prefix);
+        let list_prefix = obj_prefix.clone();
         let client = self.client.clone();
         let bucket = self.bucket.clone();
         let keys: Vec<String> = self.run_async_long(
@@ -1037,7 +1060,7 @@ impl S3ChunkStore {
                     let mut req = client
                         .list_objects_v2()
                         .bucket(&bucket)
-                        .prefix(&obj_prefix);
+                        .prefix(&list_prefix);
                     if let Some(t) = token.take() {
                         req = req.continuation_token(t);
                     }
@@ -1066,10 +1089,10 @@ impl S3ChunkStore {
 
         let mut deleted = 0u64;
         for key in keys {
-            let Some(hex) = key.rsplit('/').next() else {
+            let Some(rel) = key.strip_prefix(&obj_prefix) else {
                 continue;
             };
-            let Ok(hash) = crate::snapshot::parse_hash_hex(hex) else {
+            let Some(hash) = hash_from_object_relpath(rel) else {
                 continue;
             };
             if !referenced.contains(&hash) {
