@@ -37,6 +37,10 @@ max_bytes = "256MiB"
 # max_bytes = 0
 # Or live: iscsi-s3-ctl cache disable  (see docs/users/admin-ctl.md)
 
+# Name the current bottleneck as iscsi_s3_bottleneck (off by default).
+# Also: ISCSI_S3_PERFORMANCE_OPTIMISER=true or --performance-optimiser true
+# performance_optimiser = false
+
 [metrics]
 # Prometheus scrape endpoint (GET /metrics). Disable with enabled = false.
 enabled = true

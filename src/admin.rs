@@ -65,6 +65,7 @@ pub struct AdminSnapshot {
     pub s3_endpoint: Option<String>,
     pub s3_region: String,
     pub s3_force_path_style: bool,
+    pub performance_optimiser: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1321,6 +1322,13 @@ pub fn apply_safe_reload(
         });
     }
 
+    if new_cfg.performance_optimiser != current.performance_optimiser {
+        rejected.push(RejectedChange {
+            field: "performance_optimiser".into(),
+            reason: "performance optimiser changes require restart".into(),
+        });
+    }
+
     if new_cfg.auth.is_some()
         || new_cfg.volumes.iter().any(|v| v.auth.is_some())
         || current.volumes.iter().any(|v| v.auth != "none")
@@ -1540,6 +1548,7 @@ mod tests {
             s3_endpoint: None,
             s3_region: "us-east-1".into(),
             s3_force_path_style: false,
+            performance_optimiser: false,
         };
         let mut cfg = Config {
             bind: "0.0.0.0:3260".into(),
@@ -1551,6 +1560,7 @@ mod tests {
             cache: crate::config::CacheConfig { max_bytes: 0 },
             metrics: Default::default(),
             admin: Default::default(),
+            performance_optimiser: false,
             volumes: vec![crate::config::VolumeConfig {
                 name: "disk0".into(),
                 iqn: "iqn.test:disk0".into(),
@@ -1567,6 +1577,11 @@ mod tests {
         let r = apply_safe_reload(&snap, &cfg, &cache).unwrap();
         assert!(r.applied.iter().any(|a| a.contains("cache.max_bytes=0")));
         assert_eq!(cache.max_bytes(), 0);
+
+        cfg.performance_optimiser = true;
+        let r = apply_safe_reload(&snap, &cfg, &cache).unwrap();
+        assert!(r.rejected.iter().any(|x| x.field == "performance_optimiser"));
+        cfg.performance_optimiser = false;
 
         cfg.bind = "0.0.0.0:9999".into();
         cfg.cache.max_bytes = DEFAULT_CACHE_MAX;

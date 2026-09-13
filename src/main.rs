@@ -232,7 +232,7 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         info!("prometheus metrics disabled");
     }
 
-    if cli.performance_optimiser {
+    if cfg.performance_optimiser {
         let stores = volume_stores
             .iter()
             .map(|handle| Arc::clone(&handle.store))
@@ -265,6 +265,7 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 s3_endpoint: cfg.s3.endpoint.clone(),
                 s3_region: cfg.s3.region.clone(),
                 s3_force_path_style: cfg.s3.force_path_style,
+                performance_optimiser: cfg.performance_optimiser,
             }),
             volume_stores,
         });
@@ -331,6 +332,7 @@ mod tests {
             cache: Default::default(),
             metrics: Default::default(),
             admin: Default::default(),
+            performance_optimiser: false,
             volumes: vec![],
         };
         assert_eq!(

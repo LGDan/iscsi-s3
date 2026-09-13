@@ -52,6 +52,9 @@ pub struct Config {
     pub metrics: MetricsConfig,
     #[serde(default)]
     pub admin: AdminConfig,
+    /// Name the current performance bottleneck (`iscsi_s3_bottleneck`). Off by default.
+    #[serde(default)]
+    pub performance_optimiser: bool,
     #[serde(default)]
     pub volumes: Vec<VolumeConfig>,
 }
@@ -416,9 +419,9 @@ pub struct Cli {
     #[arg(long)]
     pub no_metrics: bool,
 
-    /// Sample latency and cache fill, and export `iscsi_s3_bottleneck` (process lifetime; not reloadable).
+    /// Enable the performance bottleneck analyser (overrides config/env when set).
     #[arg(long)]
-    pub performance_optimiser: bool,
+    pub performance_optimiser: Option<bool>,
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
@@ -431,6 +434,8 @@ struct CliOverrides {
     s3: Option<CliS3Overrides>,
     #[serde(skip_serializing_if = "Option::is_none")]
     metrics: Option<CliMetricsOverrides>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    performance_optimiser: Option<bool>,
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
@@ -472,6 +477,7 @@ impl Config {
             cache: CacheConfig::default(),
             metrics: MetricsConfig::default(),
             admin: AdminConfig::default(),
+            performance_optimiser: false,
             volumes: Vec::new(),
         };
 
@@ -497,6 +503,7 @@ impl Config {
                 enabled: if cli.no_metrics { Some(false) } else { None },
                 bind: cli.metrics_bind.clone(),
             }),
+            performance_optimiser: cli.performance_optimiser,
         };
         figment = figment.merge(Serialized::defaults(overrides));
 
@@ -524,6 +531,7 @@ impl Config {
             cache: CacheConfig::default(),
             metrics: MetricsConfig::default(),
             admin: AdminConfig::default(),
+            performance_optimiser: false,
             volumes: Vec::new(),
         };
         let figment = Figment::new()
@@ -706,7 +714,7 @@ capacity = "1GiB"
             log: "info".into(),
             metrics_bind: None,
             no_metrics: false,
-            performance_optimiser: false,
+            performance_optimiser: None,
         };
         let cfg = Config::load(&cli).unwrap();
         assert_eq!(cfg.s3.bucket.as_deref(), Some("from-env"));
@@ -720,6 +728,53 @@ capacity = "1GiB"
         assert_eq!(cfg.s3.bucket.as_deref(), Some("from-cli"));
 
         std::env::remove_var("ISCSI_S3_S3__BUCKET");
+    }
+
+    #[test]
+    fn performance_optimiser_file_env_cli() {
+        let mut file = NamedTempFile::new().unwrap();
+        writeln!(
+            file,
+            r#"
+bind = "0.0.0.0:3260"
+performance_optimiser = true
+[s3]
+bucket = "iscsi"
+[[volumes]]
+name = "disk0"
+iqn = "iqn.2026-09.local:disk0"
+prefix = "disks/disk0"
+capacity = "1GiB"
+"#
+        )
+        .unwrap();
+        let cli = Cli {
+            config: Some(file.path().to_path_buf()),
+            bind: None,
+            advertise: None,
+            bucket: None,
+            endpoint: None,
+            region: None,
+            force_path_style: None,
+            log: "info".into(),
+            metrics_bind: None,
+            no_metrics: false,
+            performance_optimiser: None,
+        };
+        let cfg = Config::load(&cli).unwrap();
+        assert!(cfg.performance_optimiser);
+
+        std::env::set_var("ISCSI_S3_PERFORMANCE_OPTIMISER", "false");
+        let cfg = Config::load(&cli).unwrap();
+        assert!(!cfg.performance_optimiser);
+
+        let cli = Cli {
+            performance_optimiser: Some(true),
+            ..cli
+        };
+        let cfg = Config::load(&cli).unwrap();
+        assert!(cfg.performance_optimiser);
+        std::env::remove_var("ISCSI_S3_PERFORMANCE_OPTIMISER");
     }
 
     #[test]
@@ -831,7 +886,7 @@ capacity = "1GiB"
             log: "info".into(),
             metrics_bind: None,
             no_metrics: false,
-            performance_optimiser: false,
+            performance_optimiser: None,
         };
         let cfg = Config::load(&cli).unwrap();
         let r = resolve_auth(&cfg.auth, &cfg.volumes[0].auth).unwrap();
@@ -869,7 +924,7 @@ capacity = "1GiB"
             log: "info".into(),
             metrics_bind: None,
             no_metrics: false,
-            performance_optimiser: false,
+            performance_optimiser: None,
         };
         assert!(Config::load(&cli).is_err());
     }
@@ -903,7 +958,7 @@ write_cache = {{ mode = "disk" }}
             log: "info".into(),
             metrics_bind: None,
             no_metrics: false,
-            performance_optimiser: false,
+            performance_optimiser: None,
         };
         let err = Config::load(&cli).unwrap_err();
         assert!(
@@ -942,7 +997,7 @@ write_cache = {{ mode = "memory", max_bytes = "1KiB" }}
             log: "info".into(),
             metrics_bind: None,
             no_metrics: false,
-            performance_optimiser: false,
+            performance_optimiser: None,
         };
         let err = Config::load(&cli).unwrap_err();
         assert!(

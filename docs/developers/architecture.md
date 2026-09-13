@@ -73,7 +73,7 @@ Header/data digests use CRC32C in little-endian wire order for open-iscsi/tgt in
 
 See **[Chunk cache: behavior and safety](cache.md)** for the full model (write-through, LRU, multi-instance risks).
 
-Optional `--performance-optimiser` names the current bottleneck (`s3_read`, `s3_write`, `read_cache`, `write_cache`, or `iscsi`) as `iscsi_s3_bottleneck`. See **[Performance bottleneck analyser](performance.md)**.
+Optional `performance_optimiser` (config, env, or `--performance-optimiser`) names the current bottleneck (`s3_read`, `s3_write`, `read_cache`, `write_cache`, or `iscsi`) as `iscsi_s3_bottleneck`. See **[Performance bottleneck analyser](performance.md)**.
 
 Short version: process-wide whole-chunk LRU (`cache.max_bytes`), shared across volumes. Writes hit S3 first, then patch or invalidate the local entry. **Safe for a single daemon** (including dual-portal / dual-NIC on one process). **Unsafe across multi-instance peers** — use `cache.max_bytes = 0` when multiple processes share a volume prefix.
 

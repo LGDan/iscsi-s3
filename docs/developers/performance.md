@@ -2,10 +2,15 @@
 
 Optional diagnostic thread. It does **not** change cache sizes, flush policy, or iSCSI settings. It names the single component most worth chasing and exports that as a Prometheus gauge.
 
-Enable with `--performance-optimiser` (process lifetime; not a config field and not reloadable). The series is on the existing metrics endpoint. If metrics are disabled (`--no-metrics`), the thread still logs but Grafana cannot scrape it.
+Off by default. Same precedence as other settings: TOML, then `ISCSI_S3_PERFORMANCE_OPTIMISER`, then `--performance-optimiser true|false`. Changing it requires a restart (`reload` reports it as rejected). The series is on the existing metrics endpoint. If metrics are disabled (`--no-metrics` / `metrics.enabled = false`), the thread still logs but Grafana cannot scrape it.
+
+```toml
+performance_optimiser = true
+```
 
 ```bash
-iscsi-s3 --config config.toml --performance-optimiser
+export ISCSI_S3_PERFORMANCE_OPTIMISER=true
+iscsi-s3 --config config.toml --performance-optimiser true
 ```
 
 ## Grafana
