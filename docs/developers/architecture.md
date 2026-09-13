@@ -15,7 +15,7 @@ S3BlockDevice
 ChunkCache (optional hit)
     │
     ▼
-S3ChunkStore  →  legacy: `{prefix}/chunks/{index:016x}` + `{prefix}/meta.json`
+S3ChunkStore  →  legacy: `{prefix}/chunks/{lo}/{hi}/{rest}` + `{prefix}/meta.json`
               →  cow:    `{prefix}/live/…` + `{prefix}/objects/{ab}/{cd}/{blake3rest}` + snapshots
 ```
 

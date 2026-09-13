@@ -162,11 +162,40 @@ pub fn list_chunk_indices(
 }
 
 fn parse_chunk_index_from_key(chunks_prefix: &str, key: &str) -> Option<u64> {
-    let name = key.strip_prefix(chunks_prefix)?;
-    if name.is_empty() || name.contains('/') {
+    let rel = key.strip_prefix(chunks_prefix)?;
+    index_from_chunk_relpath(rel)
+}
+
+/// Two directory levels from the low-order hex of a sequential chunk index.
+/// Index `0x1a` (`000000000000001a`) becomes `1a/00/000000000000`, so adjacent
+/// chunks do not all land in one prefix. Hashes are random, so COW shards the
+/// other way (high hex first).
+fn shard_chunk_index(index: u64) -> String {
+    let hex = format!("{index:016x}");
+    format!("{}/{}/{}", &hex[14..16], &hex[12..14], &hex[..12])
+}
+
+/// Sharded `ll/mm/high12` or the previous flat `{index:016x}`.
+fn index_from_chunk_relpath(rel: &str) -> Option<u64> {
+    let hex = if let Some((low, mid, rest)) = split_legacy_shard(rel) {
+        format!("{rest}{mid}{low}")
+    } else if !rel.is_empty() && !rel.contains('/') {
+        rel.to_string()
+    } else {
+        return None;
+    };
+    if hex.len() != 16 {
         return None;
     }
-    u64::from_str_radix(name, 16).ok()
+    u64::from_str_radix(&hex, 16).ok()
+}
+
+fn split_legacy_shard(rel: &str) -> Option<(&str, &str, &str)> {
+    let b = rel.as_bytes();
+    if b.len() != 2 + 1 + 2 + 1 + 12 || b[2] != b'/' || b[5] != b'/' {
+        return None;
+    }
+    Some((&rel[..2], &rel[3..5], &rel[6..]))
 }
 
 /// Lightweight connectivity check used by admin `health`.
@@ -340,7 +369,37 @@ impl S3ChunkStore {
     }
 
     fn chunk_key(&self, index: u64) -> String {
-        format!("{}{index:016x}", self.chunks_prefix())
+        match self.storage_mode() {
+            StorageMode::Legacy => self.legacy_chunk_key(index),
+            StorageMode::Cow => format!("{}{index:016x}", self.chunks_prefix()),
+        }
+    }
+
+    fn legacy_chunk_key(&self, index: u64) -> String {
+        format!("{}/chunks/{}", self.prefix, shard_chunk_index(index))
+    }
+
+    fn legacy_flat_chunk_key(&self, index: u64) -> String {
+        format!("{}/chunks/{index:016x}", self.prefix)
+    }
+
+    /// Prefer the sharded key. `etag` is set only when it belongs to that key,
+    /// so a CAS write does not If-Match a newly created sharded object against
+    /// a flat object's etag.
+    fn get_legacy_chunk(
+        &self,
+        index: u64,
+    ) -> Result<(Vec<u8>, Option<String>), StoreError> {
+        let chunk_size = self.chunk_size as usize;
+        if let Some((bytes, etag)) = self.get_bytes(self.legacy_chunk_key(index))? {
+            let plain = decode_chunk(self.compression, &bytes, chunk_size)?;
+            return Ok((plain, etag));
+        }
+        if let Some((bytes, _)) = self.get_bytes(self.legacy_flat_chunk_key(index))? {
+            let plain = decode_chunk(self.compression, &bytes, chunk_size)?;
+            return Ok((plain, None));
+        }
+        Ok((vec![0u8; chunk_size], None))
     }
 
     fn object_key(&self, hash: &[u8; HASH_LEN]) -> String {
@@ -398,7 +457,13 @@ impl S3ChunkStore {
     }
 
     fn delete_chunk_object(&self, index: u64) -> Result<(), StoreError> {
-        self.delete_object_key(self.chunk_key(index))
+        match self.storage_mode() {
+            StorageMode::Legacy => {
+                self.delete_object_key(self.legacy_chunk_key(index))?;
+                self.delete_object_key(self.legacy_flat_chunk_key(index))
+            }
+            StorageMode::Cow => self.delete_object_key(self.chunk_key(index)),
+        }
     }
 
     /// Run an async S3 op on the Tokio runtime without nesting `block_on` on the
@@ -632,16 +697,7 @@ impl S3ChunkStore {
     fn get_chunk(&self, index: u64) -> Result<(Vec<u8>, Option<String>), StoreError> {
         let chunk_size = self.chunk_size as usize;
         match self.storage_mode() {
-            StorageMode::Legacy => {
-                let key = self.chunk_key(index);
-                match self.get_bytes(key)? {
-                    Some((bytes, etag)) => {
-                        let plain = decode_chunk(self.compression, &bytes, chunk_size)?;
-                        Ok((plain, etag))
-                    }
-                    None => Ok((vec![0u8; chunk_size], None)),
-                }
-            }
+            StorageMode::Legacy => self.get_legacy_chunk(index),
             StorageMode::Cow => {
                 let ptr_key = self.chunk_key(index);
                 match self.get_pointer_bytes(ptr_key)? {
@@ -676,9 +732,12 @@ impl S3ChunkStore {
         }
         match self.storage_mode() {
             StorageMode::Legacy => {
-                let key = self.chunk_key(index);
                 let body = encode_chunk(self.compression, data)?;
-                self.put_bytes(key, body, None, if_match)
+                self.put_bytes(self.legacy_chunk_key(index), body, None, if_match)?;
+                // Drop a pre-sharding object so a later delete of the sharded key
+                // cannot resurrect the old payload via the read fallback.
+                let _ = self.delete_object_key(self.legacy_flat_chunk_key(index));
+                Ok(())
             }
             StorageMode::Cow => {
                 let body = encode_chunk(self.compression, data)?;
@@ -993,8 +1052,13 @@ impl S3ChunkStore {
         let mut chunks_migrated = 0u64;
         let mut chunks_deleted = 0u64;
         for idx in &indices {
-            let key = format!("{}/chunks/{:016x}", self.prefix, idx);
-            let Some((body, _)) = self.get_bytes(key.clone())? else {
+            let sharded = self.legacy_chunk_key(*idx);
+            let flat = self.legacy_flat_chunk_key(*idx);
+            let body = if let Some((body, _)) = self.get_bytes(sharded.clone())? {
+                body
+            } else if let Some((body, _)) = self.get_bytes(flat.clone())? {
+                body
+            } else {
                 continue;
             };
             let hash = hash_object_bytes(&body);
@@ -1002,7 +1066,8 @@ impl S3ChunkStore {
             self.put_bytes(self.object_key(&hash), body, None, None)?;
             let ptr_key = format!("{}/live/chunks/{:016x}", self.prefix, idx);
             self.put_bytes(ptr_key, encode_pointer(&hash), None, None)?;
-            self.delete_object_key(key)?;
+            let _ = self.delete_object_key(sharded);
+            let _ = self.delete_object_key(flat);
             chunks_migrated += 1;
             chunks_deleted += 1;
         }
@@ -1464,6 +1529,11 @@ mod tests {
 
     #[test]
     fn parse_chunk_index_hex() {
+        assert_eq!(shard_chunk_index(0x1a), "1a/00/000000000000");
+        assert_eq!(
+            parse_chunk_index_from_key("disks/a/chunks/", "disks/a/chunks/1a/00/000000000000"),
+            Some(0x1a)
+        );
         assert_eq!(
             parse_chunk_index_from_key("disks/a/chunks/", "disks/a/chunks/000000000000000a"),
             Some(10)

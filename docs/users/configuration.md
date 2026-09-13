@@ -157,12 +157,12 @@ iscsi-s3 -c config.toml --performance-optimiser true
 
 ```text
 {prefix}/meta.json
-{prefix}/chunks/0000000000000000
-{prefix}/chunks/0000000000000001
+{prefix}/chunks/00/00/000000000000    # chunk 0
+{prefix}/chunks/01/00/000000000000    # chunk 1
 …
 ```
 
-`meta.json` stores `capacity_bytes`, `chunk_size`, and `block_size`.
+`meta.json` stores `capacity_bytes`, `chunk_size`, and `block_size`. Legacy chunk keys are sharded two levels deep from the low-order hex of the chunk index (`…001a` → `1a/00/000000000000`) so sequential chunks do not share one prefix. Objects written before sharding, as a flat `{index:016x}` name, are still read.
 
 | On open | Behavior |
 |---------|----------|

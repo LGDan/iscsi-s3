@@ -6,7 +6,7 @@ Application-level snapshots for volumes configured with **`storage = "cow"`**. L
 
 | Mode | Layout | Snapshots | I/O |
 |------|--------|-----------|-----|
-| **`legacy`** (default) | `{prefix}/meta.json` + `{prefix}/chunks/{016x}` full payloads | Refused | No hashing / pointer puts |
+| **`legacy`** (default) | `{prefix}/meta.json` + `{prefix}/chunks/{lo}/{hi}/{rest}` full payloads | Refused | No hashing / pointer puts |
 | **`cow`** | `{prefix}/live/` + `{prefix}/objects/{ab}/{cd}/{rest}` + `{prefix}/snapshots/` | Full set | BLAKE3 + pointer object per present chunk |
 
 ```toml

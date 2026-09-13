@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum StorageMode {
-    /// Flat `{prefix}/chunks/{index}` full payloads — max performance, no snapshots.
+    /// `{prefix}/chunks/{lo}/{hi}/{rest}` full payloads — no snapshots.
     #[default]
     Legacy,
     /// Content-addressed objects + live pointers — snapshots enabled.
